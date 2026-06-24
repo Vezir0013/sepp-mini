@@ -1,0 +1,26 @@
+[package]
+name = "sepp-session"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Baumstrukturierte, persistente Sessions (JSONL) für sepp mini"
+
+[features]
+# Optionales SQLite-Backend; `bundled` kompiliert SQLite statisch (keine System-Lib).
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { version = "=1.23.1", features = ["v4"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

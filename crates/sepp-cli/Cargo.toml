@@ -1,0 +1,38 @@
+[package]
+name = "sepp-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "sepp mini — CLI (Phase 1: One-shot)"
+
+[[bin]]
+name = "sepp"
+path = "src/main.rs"
+
+[features]
+default = []
+# Optionales SQLite-Session-Backend (für `-p`/`--rpc` via `--sqlite`).
+sqlite = ["sepp-session/sqlite"]
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+sepp-provider = { path = "../sepp-provider", features = ["anthropic", "openai"] }
+sepp-tools = { path = "../sepp-tools" }
+sepp-agent = { path = "../sepp-agent" }
+sepp-session = { path = "../sepp-session" }
+sepp-hooks = { path = "../sepp-hooks" }
+sepp-mcp = { path = "../sepp-mcp" }
+sepp-wasm = { path = "../sepp-wasm" }
+
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = "=5.0.1"
+ratatui = "=0.29.0"
+crossterm = { version = "=0.28.1", features = ["event-stream"] }

@@ -1,0 +1,60 @@
+# Workspace-Root für sepp mini.
+# Versionen sind exakt gepinnt (Reproduzierbarkeit, AGENTS.md Rule). Cargo.lock wird committet.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/sepp-core",
+    "crates/sepp-provider",
+    "crates/sepp-tools",
+    "crates/sepp-session",
+    "crates/sepp-hooks",
+    "crates/sepp-policy",
+    "crates/sepp-mcp",
+    "crates/sepp-wasm",
+    "crates/sepp-agent",
+    "crates/sepp-cli",
+]
+# Die Doku-Quelle ist kein Cargo-Projekt.
+exclude = ["sepp-mini-docs"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Vezir0013/sepp-mini"
+homepage = "https://github.com/Vezir0013/sepp-mini"
+authors = ["Vezir0013"]
+
+[workspace.dependencies]
+# --- Kern / Serialisierung / Fehler ---
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+thiserror = "=2.0.18"
+anyhow = "=1.0.102"
+schemars = "=1.2.1"
+
+# --- Async ---
+tokio = { version = "=1.52.1", features = ["full"] }
+tokio-util = "=0.7.18"
+futures = "=0.3.32"
+async-trait = "=0.1.89"
+
+# --- HTTP / Streaming (Provider) ---
+reqwest = { version = "=0.12.28", features = ["json", "stream", "rustls-tls"], default-features = false }
+bytes = "=1.11.1"
+
+# --- Plattform (Prozess-Gruppen für bash-Tool, nur unix) ---
+libc = "=0.2.186"
+
+# --- Logging / Tracing ---
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+# --- Test-Utilities ---
+tempfile = "=3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"     # kleinere, schnellere Binary; entfernen, falls Unwind gebraucht wird

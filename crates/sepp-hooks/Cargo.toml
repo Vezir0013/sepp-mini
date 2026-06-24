@@ -1,0 +1,20 @@
+[package]
+name = "sepp-hooks"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tier-1-Hooks (eingebettetes Rhai-Scripting) für sepp mini"
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# sync: Engine/AST Send+Sync (Aufruf aus dem Agenten). serde: Value <-> Dynamic.
+rhai = { version = "=1.25.1", features = ["sync", "serde"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

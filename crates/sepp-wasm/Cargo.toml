@@ -1,0 +1,26 @@
+[package]
+name = "sepp-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WASM-Plugin-Host (Tier 2) für sepp mini — capability-gated, in-process"
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+sepp-tools = { path = "../sepp-tools" }
+sepp-policy = { path = "../sepp-policy" }
+
+# wasmi: reiner Rust-WASM-Interpreter (leicht, keine C-Abhängigkeit, memory-sandboxed).
+# Bewusst statt wasmtime/extism — passt zum „leichtgewichtig"-Ziel; gleiches Sicherheitsmodell.
+wasmi = "=1.1.0"
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true } # spawn_blocking: wasmi synchron aus dem Reactor auslagern
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wat = "=1.252.0"

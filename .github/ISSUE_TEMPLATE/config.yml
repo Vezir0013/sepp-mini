@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Sicherheitslücke melden
+    url: https://github.com/Vezir0013/sepp-mini/security/advisories/new
+    about: Bitte Schwachstellen NICHT als öffentliches Issue melden — siehe SECURITY.md.

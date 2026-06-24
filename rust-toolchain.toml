@@ -1,0 +1,5 @@
+# Feste Toolchain für reproduzierbare Builds.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "default"

@@ -1,0 +1,32 @@
+[package]
+name = "sepp-provider"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Provider-Abstraktion und LLM-Adapter für sepp mini"
+
+[features]
+default = ["anthropic"]
+anthropic = []
+openai = []          # OpenAI-kompatibel (Chat-Completions)
+local = ["openai"]   # lokale Endpunkte (Ollama/vLLM) — gleicher Adapter via base_url
+google = []          # Phase 5 (offen)
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

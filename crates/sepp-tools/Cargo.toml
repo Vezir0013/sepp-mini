@@ -1,0 +1,27 @@
+[package]
+name = "sepp-tools"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Built-in Tools und Tool-Helfer (Truncation, File-Mutation-Queue) für sepp mini"
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

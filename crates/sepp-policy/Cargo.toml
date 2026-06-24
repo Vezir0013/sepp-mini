@@ -1,0 +1,24 @@
+[package]
+name = "sepp-policy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Capabilities, Policy-Auswertung und OS-Sandbox für sepp mini (Phase 4)"
+
+[dependencies]
+sepp-core = { path = "../sepp-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "=0.8.23"
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.5"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,32 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+*.pdb
+# Cargo.lock wird bewusst committet (reproduzierbare Builds für das Binary-Projekt).
+
+# Secrets / Auth — niemals committen
+auth.json
+**/auth.json
+*.key
+*.pem
+*.token
+.env
+.env.*
+secrets.toml
+
+# Lokale Laufzeitdaten
+.sepp/sessions/
+.sepp/trust.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs / Temp
+*.log
+/tmp-*
