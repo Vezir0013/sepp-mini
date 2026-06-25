@@ -4,9 +4,11 @@
 
 <h1>sepp mini</h1>
 
-<p><strong>Ein leichtgewichtiger, beliebig erweiterbarer Agent-Harness in Rust —<br>
-ausgeliefert als eine statische Binary. Sicher by default: jede Erweiterung<br>
-deklariert ihre Rechte, der Kern erzwingt sie auf OS-Ebene.</strong></p>
+<p><em>„Etwas in deinem Terminal ist gerade aufgewacht."</em></p>
+
+<p><strong>Ein leichtgewichtiger, erweiterbarer Agent-Harness in Rust — eine statische Binary,<br>
+kein Ballast. Sicher by default: Erweiterungen bekommen nur die Rechte, die sie<br>
+deklarieren — vom Kern auf OS-Ebene erzwungen.</strong></p>
 
 <p>
   <a href="https://github.com/Vezir0013/sepp-mini/actions/workflows/ci.yml"><img src="https://github.com/Vezir0013/sepp-mini/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
