@@ -52,20 +52,23 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
 
 ## Installation
 
-### Aus dem Quellcode (empfohlen, solange es noch keine Release-Binaries gibt)
+### Vorgebaute statische Binary (empfohlen)
 
-```bash
-cargo install --git https://github.com/Vezir0013/sepp-mini --features sqlite sepp-cli
-# oder bequem:
-sh install.sh --from-source
-```
-
-### Vorgebaute statische Binary
-
-Sobald ein Release getaggt ist, lädt der Installer die passende Binary aus den GitHub-Releases:
+Der Installer lädt die passende Binary aus den GitHub-Releases und legt sie nach `~/.local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vezir0013/sepp-mini/main/install.sh | sh
+sepp --version          # prüfen
+```
+
+Unterstützte Plattformen: Linux (`x86_64`, `aarch64`, statisch via musl) und macOS (`x86_64`,
+`aarch64`). Auf anderen Systemen weicht der Installer mit `sh install.sh --from-source` auf den
+Quellcode-Build aus.
+
+### Mit Cargo
+
+```bash
+cargo install --git https://github.com/Vezir0013/sepp-mini --features sqlite sepp-cli
 ```
 
 ### Selbst bauen
