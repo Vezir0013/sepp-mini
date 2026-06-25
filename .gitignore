@@ -30,3 +30,7 @@ secrets.toml
 # Logs / Temp
 *.log
 /tmp-*
+
+# Lokale Doku & Screenshots, nicht committen
+handbuch.html
+/image*.png
