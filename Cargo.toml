@@ -20,7 +20,7 @@ exclude = ["sepp-mini-docs"]
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/Vezir0013/sepp-mini"
 homepage = "https://github.com/Vezir0013/sepp-mini"
 authors = ["Vezir0013"]

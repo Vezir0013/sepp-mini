@@ -12,7 +12,7 @@ deklarieren — vom Kern auf OS-Ebene erzwungen.</strong></p>
 
 <p>
   <a href="https://github.com/Vezir0013/sepp-mini/actions/workflows/ci.yml"><img src="https://github.com/Vezir0013/sepp-mini/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg" alt="License: PolyForm Noncommercial 1.0.0"></a>
   <img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust">
 </p>
 
@@ -203,5 +203,8 @@ Beiträge sind willkommen — siehe [`CONTRIBUTING.md`](./CONTRIBUTING.md) und d
 
 ## Lizenz
 
-Lizenziert unter der [Apache License 2.0](./LICENSE). Sofern nicht anders angegeben, werden
-beigesteuerte Beiträge unter denselben Bedingungen aufgenommen.
+Lizenziert unter der [PolyForm Noncommercial License 1.0.0](./LICENSE) — eine
+**source-available**-Lizenz, die **ausschließlich nicht-kommerzielle Nutzung** erlaubt. Der
+Patent-Grant gilt nur für diese erlaubte (nicht-kommerzielle) Nutzung; ein kommerzieller
+Patent-Grant wird nicht gewährt. Für kommerzielle Nutzung bitte den Autor kontaktieren. Sofern
+nicht anders angegeben, werden beigesteuerte Beiträge unter denselben Bedingungen aufgenommen.

@@ -60,4 +60,4 @@ Schwachstellen **nicht** über öffentliche Issues melden — siehe [`SECURITY.m
 ## Lizenz
 
 Mit dem Einreichen eines Beitrags stimmst du zu, dass dieser unter der
-[Apache License 2.0](./LICENSE) lizenziert wird.
+[PolyForm Noncommercial License 1.0.0](./LICENSE) lizenziert wird.
