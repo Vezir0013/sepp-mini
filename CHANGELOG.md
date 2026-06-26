@@ -13,6 +13,21 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.3] - 2026-06-26
+
+### Geändert
+- **Lizenz von Apache-2.0 auf PolyForm Noncommercial 1.0.0 umgestellt.** `sepp mini` ist damit
+  *source-available* und darf **ausschließlich für nicht-kommerzielle Zwecke** genutzt werden.
+  Der Patent-Grant gilt nur für diese erlaubte Nutzung; ein kommerzieller Patent-Grant wird nicht
+  gewährt. Betrifft `LICENSE`, `NOTICE`, die `Cargo.toml`-Metadaten, `README.md` und
+  `CONTRIBUTING.md`. Für kommerzielle Nutzung bitte den Autor kontaktieren.
+- `cargo-deny`-Allowlist um `PolyForm-Noncommercial-1.0.0` ergänzt (für die eigenen
+  Workspace-Crates), damit das Supply-Chain-Gate grün bleibt. Die Allowlist für
+  Abhängigkeits-Lizenzen (u. a. `Apache-2.0`) bleibt unverändert.
+
+> Hinweis: Der frühere Release `v0.1.0` bleibt unter Apache-2.0 lizenziert. Die Umstellung gilt
+> ab `v0.1.3`.
+
 ## [0.1.0] - 2026-06-24
 
 Erste öffentliche Version. Funktional vollständig und getestet.
@@ -46,5 +61,6 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/Vezir0013/sepp-mini/releases/tag/v0.1.0
