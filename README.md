@@ -60,7 +60,12 @@ Der Installer lädt die passende Binary aus den GitHub-Releases und legt sie nac
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Vezir0013/sepp-mini/main/install.sh | sh
-sepp --version          # prüfen
+```
+
+Installation prüfen:
+
+```bash
+sepp --version
 ```
 
 Unterstützte Plattformen: Linux (`x86_64`, `aarch64`, statisch via musl) und macOS (`x86_64`,
