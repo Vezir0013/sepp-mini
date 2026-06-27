@@ -91,6 +91,30 @@ Installation prüfen:
 sepp --version
 ```
 
+### Vorgebaute Binary für Linux ARM (aarch64)
+
+Für ARM64-Linux (Raspberry Pi OS 64-bit, ARM-VPS/Cloud, ARM-SBCs). Die Binary ist
+statisch via musl gelinkt — keine Systemabhängigkeiten:
+
+```bash
+curl -fL "https://github.com/Vezir0013/sepp-mini/releases/latest/download/sepp-aarch64-unknown-linux-musl" -o /tmp/sepp
+chmod +x /tmp/sepp
+mkdir -p ~/.local/bin
+mv /tmp/sepp ~/.local/bin/sepp
+```
+
+Liegt `~/.local/bin` nicht im `PATH`, einmalig ergänzen:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+Installation prüfen:
+
+```bash
+sepp --version
+```
+
 ### Mit Cargo
 
 ```bash
