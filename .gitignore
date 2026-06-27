@@ -33,5 +33,6 @@ secrets.toml
 
 # Lokale Doku & Screenshots, nicht committen
 handbuch.html
+/.docs/
 /image*.png
 /update*.md
