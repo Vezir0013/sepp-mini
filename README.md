@@ -62,6 +62,12 @@ Der Installer lädt die passende Binary aus den GitHub-Releases und legt sie nac
 curl -fsSL https://raw.githubusercontent.com/Vezir0013/sepp-mini/main/install.sh | sh
 ```
 
+Liegt `~/.local/bin` nicht im `PATH`, einmalig ergänzen:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
 Installation prüfen:
 
 ```bash
