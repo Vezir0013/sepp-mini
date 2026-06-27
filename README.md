@@ -74,21 +74,22 @@ Quellcode-Build aus.
 
 ### Vorgebaute Binary für macOS (empfohlen)
 
-Falls der allgemeine Installer auf macOS abbricht (z. B. ein Schreibfehler beim Ziel), installiert
-dieser **arch-übergreifende** Befehl die passende Binary direkt — Apple Silicon (`arm64`) **und**
-Intel (`x86_64`):
+Dieser **arch-übergreifende** Befehl lädt die passende Binary — Apple Silicon (`arm64`) **und**
+Intel (`x86_64`) — und legt sie nach `/usr/local/bin` (liegt bereits im `PATH`):
 
 ```bash
-mkdir -p ~/.local/bin
 ARCH=$([ "$(uname -m)" = "arm64" ] && echo aarch64 || echo x86_64)
-curl -fL "https://github.com/Vezir0013/sepp-mini/releases/latest/download/sepp-${ARCH}-apple-darwin" \
-  -o ~/.local/bin/sepp
-chmod +x ~/.local/bin/sepp
-~/.local/bin/sepp --version
+curl -fL "https://github.com/Vezir0013/sepp-mini/releases/latest/download/sepp-${ARCH}-apple-darwin" -o /tmp/sepp
+chmod +x /tmp/sepp
+sudo mkdir -p /usr/local/bin
+sudo mv /tmp/sepp /usr/local/bin/sepp
 ```
 
-Liegt `~/.local/bin` nicht im `PATH`, ergänze in `~/.zshrc`:
-`export PATH="$HOME/.local/bin:$PATH"`.
+Installation prüfen:
+
+```bash
+sepp --version
+```
 
 ### Mit Cargo
 
