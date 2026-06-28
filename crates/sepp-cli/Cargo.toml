@@ -1,6 +1,6 @@
 [package]
 name = "sepp-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -36,3 +36,6 @@ tracing-subscriber = { workspace = true }
 directories = "=5.0.1"
 ratatui = "=0.29.0"
 crossterm = { version = "=0.28.1", features = ["event-stream"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
