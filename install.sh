@@ -7,6 +7,9 @@
 #   curl -fsSL <raw-url>/install.sh | sh
 #   SEPP_REPO=owner/repo SEPP_BIN_DIR=~/.local/bin sh install.sh
 #   sh install.sh --from-source        # via `cargo install` (braucht Rust-Toolchain)
+#   sh install.sh --uninstall          # Binary entfernen (~/.sepp bleibt)
+#   sh install.sh --uninstall --purge  # zusätzlich ~/.sepp (Sessions + Config) löschen
+#   curl -fsSL <raw-url>/install.sh | sh -s -- --uninstall --purge   # via Pipe
 #
 # Umgebung:
 #   SEPP_REPO     GitHub "owner/repo" (Default: aus dem Repo-Override unten)
@@ -21,6 +24,15 @@ BIN_DIR="${SEPP_BIN_DIR:-$HOME/.local/bin}"
 log() { printf '%s\n' "$*" >&2; }
 die() { log "Fehler: $*"; exit 1; }
 
+usage() {
+    log "sepp mini Installer — Optionen:"
+    log "  (ohne)            Vorgebaute Binary nach \$SEPP_BIN_DIR (Default ~/.local/bin) installieren"
+    log "  --from-source     Via 'cargo install' aus dem Quellcode bauen (braucht Rust)"
+    log "  --uninstall       Binary entfernen (~/.sepp bleibt erhalten)"
+    log "  --uninstall --purge   zusätzlich ~/.sepp (Sessions + Config) löschen"
+    log "  -h, --help        Diese Hilfe"
+}
+
 from_source() {
     command -v cargo >/dev/null 2>&1 || die "cargo nicht gefunden (Rust-Toolchain nötig für --from-source)"
     log "Baue aus dem Quellcode via cargo install (Feature sqlite)…"
@@ -29,7 +41,52 @@ from_source() {
     exit 0
 }
 
-[ "${1:-}" = "--from-source" ] && from_source
+uninstall() {
+    target="${BIN_DIR}/sepp"
+    if [ -e "$target" ]; then
+        rm -f "$target"
+        log "Entfernt: $target"
+    else
+        log "Nicht gefunden (übersprungen): $target"
+    fi
+
+    config_dir="$HOME/.sepp"
+    if [ "$do_purge" = 1 ]; then
+        if [ -d "$config_dir" ]; then
+            rm -rf "$config_dir"
+            log "Entfernt (--purge): $config_dir"
+        else
+            log "Nicht gefunden (übersprungen): $config_dir"
+        fi
+    elif [ -d "$config_dir" ]; then
+        log "Hinweis: Nutzerdaten unter $config_dir bleiben erhalten."
+        log "         Zum vollständigen Entfernen erneut mit --purge ausführen."
+    fi
+    log "Deinstallation abgeschlossen."
+}
+
+# Argumente einsammeln (echte Schleife, damit --uninstall --purge in beliebiger Reihenfolge geht).
+mode=install
+do_purge=0
+do_from_source=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from-source) do_from_source=1 ;;
+        --uninstall)   mode=uninstall ;;
+        --purge)       do_purge=1 ;;
+        -h|--help)     usage; exit 0 ;;
+        *) die "unbekannte Option: $1 (erlaubt: --from-source, --uninstall, --purge, --help)" ;;
+    esac
+    shift
+done
+
+[ "$do_purge" = 1 ] && [ "$mode" != uninstall ] && die "--purge ist nur zusammen mit --uninstall gültig"
+
+if [ "$mode" = uninstall ]; then
+    uninstall
+    exit 0
+fi
+[ "$do_from_source" = 1 ] && from_source
 
 # Plattform erkennen.
 os="$(uname -s)"; arch="$(uname -m)"
