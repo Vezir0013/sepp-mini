@@ -12,6 +12,7 @@ mod tui;
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -34,6 +35,12 @@ antworte knapp.";
 enum Cmd {
     Version,
     Help,
+    /// `sepp init` — legt das `~/.sepp`-Skelett + Beispiel-`settings.toml` an.
+    Init,
+    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` auch `~/.sepp`).
+    Uninstall {
+        purge: bool,
+    },
     Run(RunOpts),
 }
 
@@ -62,6 +69,8 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
+        Ok(Cmd::Init) => run_init(),
+        Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
             eprintln!("Fehler: {e}\n");
@@ -72,6 +81,23 @@ fn main() -> ExitCode {
 }
 
 fn parse(args: &[String]) -> Result<Cmd, String> {
+    // Subcommands werden nur als **erstes** Positions-Token erkannt, damit Bare-Prompts wie
+    // `sepp -p "init …"` unverändert bleiben und nicht im Prompt-Fallback unten landen.
+    match args.first().map(String::as_str) {
+        Some("init") => return Ok(Cmd::Init),
+        Some("uninstall") => {
+            let mut purge = false;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--purge" => purge = true,
+                    other => return Err(format!("uninstall: unbekannte Option: {other}")),
+                }
+            }
+            return Ok(Cmd::Uninstall { purge });
+        }
+        _ => {}
+    }
+
     let mut prompt: Option<String> = None;
     let mut model: Option<String> = None;
     let mut max_tokens: Option<u64> = None;
@@ -155,7 +181,9 @@ fn print_help() {
          Verwendung:\n\
          \x20 sepp                      Interaktive TUI (neue Session)\n\
          \x20 sepp -c                   TUI, jüngste Session fortsetzen\n\
-         \x20 sepp -p \"<prompt>\"        Einen Prompt nicht-interaktiv ausführen\n\n\
+         \x20 sepp -p \"<prompt>\"        Einen Prompt nicht-interaktiv ausführen\n\
+         \x20 sepp init                 ~/.sepp-Skelett + Beispiel-settings.toml anlegen\n\
+         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch ~/.sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
          \x20 -c, --continue            Jüngste Session des Projekts fortsetzen\n\
@@ -177,6 +205,122 @@ fn print_help() {
          \x20 RUST_LOG                  Log-Level (One-shot/RPC; Logs nach stderr)",
         default = models::DEFAULT_MODEL_ID
     );
+}
+
+/// Vorlage für eine frische `~/.sepp/settings.toml` — **komplett auskommentiert** und damit gültig
+/// (parst zu „keine Server"). Zeigt je einen `stdio`- und `http`-MCP-Server samt Capabilities.
+const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sepp/settings.toml)
+#
+# Hier werden MCP-Server als Tool-Quellen deklariert. Jeder Server braucht capabilities
+# (Default DENY). Entferne die Kommentarzeichen und passe an. Doppelte `name` sind ein Fehler;
+# eine leere/komplett auskommentierte Datei ist gültig.
+#
+# Beispiel: stdio-Server (lokaler Subprozess)
+# [[mcp.servers]]
+# name = "git"
+# transport = "stdio"
+# command = ["uvx", "mcp-server-git"]
+# [mcp.servers.capabilities]
+# fs_read  = ["./"]
+# fs_write = ["./"]
+# exec     = ["git"]
+#
+# Beispiel: http-Server (entfernter Endpunkt)
+# [[mcp.servers]]
+# name = "example"
+# transport = "http"
+# url = "https://mcp.example.com"
+# [mcp.servers.capabilities]
+# net = ["mcp.example.com"]
+"#;
+
+/// `sepp init` — legt das `~/.sepp`-Skelett samt kommentierter Beispiel-`settings.toml` an
+/// (idempotent: vorhandene Dateien/Verzeichnisse bleiben unangetastet). Läuft ohne Tokio/Provider.
+fn run_init() -> ExitCode {
+    let root = match session::sepp_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Fehler: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match init_config_at(&root) {
+        Ok(()) => {
+            println!("sepp init abgeschlossen: {}", root.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Fehler: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Erzeugt das Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`) und eine kommentierte
+/// `settings.toml` unterhalb `root`; vorhandene Pfade bleiben unverändert. Die Subdir-Namen müssen
+/// **exakt** den Lese-Literalen in `session.rs` entsprechen, sonst wird das Angelegte nie gelesen.
+fn init_config_at(root: &Path) -> anyhow::Result<()> {
+    ensure_dir(root)?;
+    for sub in ["skills", "prompts", "hooks", "plugins"] {
+        ensure_dir(&root.join(sub))?;
+    }
+    let settings = root.join("settings.toml");
+    if settings.exists() {
+        println!("übersprungen (existiert): {}", settings.display());
+    } else {
+        std::fs::write(&settings, SETTINGS_TEMPLATE)?;
+        println!("angelegt: {}", settings.display());
+    }
+    Ok(())
+}
+
+/// Legt ein Verzeichnis an, falls es noch nicht existiert, und meldet „angelegt"/„übersprungen".
+fn ensure_dir(p: &Path) -> anyhow::Result<()> {
+    if p.is_dir() {
+        println!("übersprungen (existiert): {}", p.display());
+    } else {
+        std::fs::create_dir_all(p)?;
+        println!("angelegt: {}", p.display());
+    }
+    Ok(())
+}
+
+/// `sepp uninstall [--purge]` — entfernt die laufende Binary (Unix: Selbstlöschung ist erlaubt,
+/// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich `~/.sepp`.
+fn run_uninstall(purge: bool) -> ExitCode {
+    match uninstall(purge) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Fehler: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn uninstall(purge: bool) -> anyhow::Result<()> {
+    // Hinweis: Unter `cargo run` zeigt current_exe() auf die Dev-Binary in target/ — die würde dann
+    // entfernt. Für den Distributions-Fall (~/.local/bin/sepp) ist genau das gewollt.
+    let exe = std::env::current_exe()?;
+    std::fs::remove_file(&exe)?;
+    println!("Entfernt: {}", exe.display());
+
+    let root = session::sepp_root()?;
+    if purge {
+        if root.is_dir() {
+            std::fs::remove_dir_all(&root)?;
+            println!("Entfernt (--purge): {}", root.display());
+        } else {
+            println!("Nicht gefunden (übersprungen): {}", root.display());
+        }
+    } else if root.is_dir() {
+        println!(
+            "Hinweis: Nutzerdaten unter {} bleiben erhalten.",
+            root.display()
+        );
+        println!("         Zum vollständigen Entfernen: sepp uninstall --purge");
+    }
+    println!("Deinstallation abgeschlossen.");
+    Ok(())
 }
 
 fn run(opts: RunOpts) -> ExitCode {
@@ -238,6 +382,24 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         anyhow::bail!(
             "OPENAI_API_KEY nicht gesetzt — setze den Key, oder nutze --provider local \
              (bzw. OPENAI_BASE_URL) für lokale Endpunkte"
+        );
+    }
+    // Anthropic braucht ANTHROPIC_API_KEY — hier früh + hilfreich scheitern statt mit dem nackten
+    // "ANTHROPIC_API_KEY nicht gesetzt" aus AnthropicProvider::from_env(). Die Prüfung spiegelt
+    // bewusst from_env (anthropic.rs): einzige Quelle ist ANTHROPIC_API_KEY, leer/Whitespace zählt
+    // als fehlend. Zieht from_env künftig auch ~/.sepp/auth.json heran, muss dieser Check mit.
+    if provider_kind == "anthropic"
+        && std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .is_none()
+    {
+        anyhow::bail!(
+            "ANTHROPIC_API_KEY nicht gesetzt — eine der Optionen:\n  \
+             - Key setzen:     export ANTHROPIC_API_KEY=…\n  \
+             - lokales Modell: --provider local  (bzw. OPENAI_BASE_URL für Ollama/vLLM)\n  \
+             - OpenAI:         --provider openai  (mit OPENAI_API_KEY)\n\
+             Konfiguration liegt unter ~/.sepp — anlegen mit `sepp init`."
         );
     }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
@@ -562,5 +724,47 @@ mod tests {
         // Lifecycle-Events erzeugen keine RPC-Zeile.
         assert!(rpc_event(&AgentEvent::TurnStart).is_none());
         assert!(rpc_event(&AgentEvent::Done).is_none());
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_init_only_as_first_arg() {
+        assert!(matches!(parse(&args(&["init"])).unwrap(), Cmd::Init));
+        // Nicht erstes Token → bleibt Prompt, nicht Subcommand.
+        let cmd = parse(&args(&["-p", "init"])).unwrap();
+        assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "init"));
+    }
+
+    #[test]
+    fn parse_uninstall_flags() {
+        assert!(matches!(
+            parse(&args(&["uninstall"])).unwrap(),
+            Cmd::Uninstall { purge: false }
+        ));
+        assert!(matches!(
+            parse(&args(&["uninstall", "--purge"])).unwrap(),
+            Cmd::Uninstall { purge: true }
+        ));
+        assert!(parse(&args(&["uninstall", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn init_config_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".sepp");
+
+        init_config_at(&root).unwrap();
+        let settings = root.join("settings.toml");
+        let first = std::fs::read_to_string(&settings).unwrap();
+        for sub in ["skills", "prompts", "hooks", "plugins"] {
+            assert!(root.join(sub).is_dir(), "{sub} sollte existieren");
+        }
+
+        // Zweiter Lauf: kein Fehler, settings.toml unverändert (Nutzerinhalt wird nie überschrieben).
+        init_config_at(&root).unwrap();
+        assert_eq!(first, std::fs::read_to_string(&settings).unwrap());
     }
 }
