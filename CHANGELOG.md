@@ -13,6 +13,21 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.4] - 2026-06-28
+
+### Hinzugefügt
+- **`sepp uninstall`** entfernt die installierte Binary direkt aus sich selbst; mit `--purge`
+  zusätzlich `~/.sepp` (Sessions + Config). Ohne `--purge` bleiben die Nutzerdaten bewusst stehen.
+- **`install.sh --uninstall`** (optional `--purge`) als Shell-Weg für denselben Zweck — nützlich,
+  wenn die Binary bereits entfernt wurde. Der Installer parst Argumente jetzt über eine echte
+  Schleife (Kombinationen wie `--uninstall --purge` in beliebiger Reihenfolge); unbekannte Flags
+  werden nun als Fehler gemeldet statt ignoriert.
+- **`sepp init`** legt das Konfigurations-Skelett `~/.sepp/{skills,prompts,hooks,plugins}/` samt
+  kommentierter Beispiel-`settings.toml` an. Idempotent — vorhandene Dateien bleiben unberührt.
+- **Erst-Start-Hinweis:** Fehlt bei Default-Provider Anthropic der `ANTHROPIC_API_KEY`, erklärt eine
+  mehrzeilige Meldung jetzt die Optionen (Key setzen · `--provider local`/`OPENAI_BASE_URL` · OpenAI)
+  und verweist auf `~/.sepp` bzw. `sepp init`.
+
 ## [0.1.3] - 2026-06-26
 
 ### Geändert
@@ -61,6 +76,7 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/Vezir0013/sepp-mini/releases/tag/v0.1.0

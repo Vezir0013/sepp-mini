@@ -136,6 +136,31 @@ cargo build --release -p sepp-cli --features sqlite
 # Binary: target/release/sepp
 ```
 
+## Deinstallation
+
+Direkt aus der installierten Binary:
+
+```bash
+sepp uninstall            # entfernt die Binary; ~/.sepp (Sessions + Config) bleibt erhalten
+sepp uninstall --purge    # entfernt zusätzlich ~/.sepp
+```
+
+Alternativ über den Installer (z. B. wenn die Binary schon weg ist) — `install.sh` liegt nach
+einer `curl`-Installation nicht lokal vor, daher erneut durch die Pipe:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Vezir0013/sepp-mini/main/install.sh | sh -s -- --uninstall
+# mit zusätzlichem --purge auch ~/.sepp löschen:
+# … | sh -s -- --uninstall --purge
+```
+
+Oder vollständig von Hand:
+
+```bash
+rm ~/.local/bin/sepp      # bzw. /usr/local/bin/sepp (macOS-Installationsweg)
+rm -rf ~/.sepp            # nur, falls Sessions + Config ebenfalls entfernt werden sollen
+```
+
 ## Schnellstart
 
 ```bash
@@ -170,6 +195,10 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 Globale Konfiguration und Erweiterungen liegen unter `~/.sepp/` (Sessions, `settings.toml` für
 MCP-Server, `plugins/` für WASM, `skills/`, `prompts/`, `hooks/`). Projektlokale Erweiterungen
 (`<repo>/.sepp/…`) laden erst, nachdem das Projekt **getrustet** wurde.
+
+**Erstkonfiguration:** `sepp init` legt das Skelett `~/.sepp/{skills,prompts,hooks,plugins}/` samt
+kommentierter Beispiel-`settings.toml` an. Der Befehl ist idempotent — vorhandene Dateien und
+Verzeichnisse bleiben unangetastet.
 
 ## Erweiterungen
 
