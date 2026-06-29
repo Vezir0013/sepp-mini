@@ -9,7 +9,7 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use sepp_core::{ContentBlock, Message, Result, Role, SeppError, Usage};
+use sepp_core::{ContentBlock, Message, Result, Role, SeppError, ThinkingLevel, Usage};
 
 use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
@@ -20,6 +20,19 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// internationale Default-Host. Über `ZAI_BASE_URL` überschreibbar (z. B. die China-Region
 /// `https://open.bigmodel.cn/api/paas/v4`).
 const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+
+/// Welcher OpenAI-kompatible Dialekt gesprochen wird. Steuert anbieterspezifische Body-Felder:
+/// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
+/// würde. Default ist [`OpenAiDialect::OpenAi`] (auch für lokale Endpunkte); nur `from_zai_env`
+/// setzt [`OpenAiDialect::Zai`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenAiDialect {
+    /// Striktes OpenAI/Chat-Completions (OpenAI, Ollama, vLLM, …) — keine Zusatzfelder.
+    #[default]
+    OpenAi,
+    /// z.ai / Zhipu-GLM — akzeptiert zusätzlich `thinking:{type:…}`.
+    Zai,
+}
 
 /// Übersetzt OpenAI-SSE-Deltas (zustandsbehaftet) in [`StreamEvent`].
 #[derive(Debug, Default)]
@@ -181,16 +194,26 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: Option<String>,
     base_url: String,
+    dialect: OpenAiDialect,
 }
 
 impl OpenAiProvider {
     /// Neuer Provider mit optionalem API-Key und base_url (z. B. lokal für Ollama/vLLM).
+    /// Dialekt ist per Default [`OpenAiDialect::OpenAi`]; via [`Self::with_dialect`] änderbar.
     pub fn new(api_key: Option<String>, base_url: impl Into<String>) -> Self {
         OpenAiProvider {
             client: reqwest::Client::new(),
             api_key,
             base_url: base_url.into(),
+            dialect: OpenAiDialect::default(),
         }
+    }
+
+    /// Setzt den Dialekt (anbieterspezifische Body-Felder). Builder-Stil, damit die `new`-Signatur
+    /// stabil bleibt.
+    pub fn with_dialect(mut self, dialect: OpenAiDialect) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// `OPENAI_API_KEY` (optional für lokale Server) + `OPENAI_BASE_URL` (Default OpenAI).
@@ -209,7 +232,7 @@ impl OpenAiProvider {
     pub fn from_zai_env() -> Result<Self> {
         let base = std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| ZAI_BASE_URL.to_string());
         let key = std::env::var("ZAI_API_KEY").ok().filter(|k| !k.is_empty());
-        Ok(Self::new(key, base))
+        Ok(Self::new(key, base).with_dialect(OpenAiDialect::Zai))
     }
 
     fn build_body(&self, req: &CompletionRequest) -> Value {
@@ -250,7 +273,19 @@ impl OpenAiProvider {
                 .collect();
             body["tools"] = json!(tools);
         }
-        // req.thinking (OpenAI-Reasoning-Parameter) ist ein Phase-5-Ausbau.
+        // z.ai/GLM nimmt ein binäres `thinking`-Objekt; echtes OpenAI/local NICHT (würde das
+        // unbekannte Feld mit 400 ablehnen) — daher streng auf den Zai-Dialekt + reasoning-fähiges
+        // Modell gegated. `Off` → explizit "disabled" (GLM denkt sonst per Default weiter und das
+        // kostet ein Vielfaches an completion_tokens); jede andere Stufe → "enabled". GLM ist binär,
+        // daher kein Budget (anders als Anthropic, anthropic.rs).
+        if self.dialect == OpenAiDialect::Zai && req.model.supports_reasoning {
+            let mode = if req.thinking == ThinkingLevel::Off {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            body["thinking"] = json!({ "type": mode });
+        }
         body
     }
 }
@@ -506,5 +541,61 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn test_model(reasoning: bool) -> sepp_core::Model {
+        sepp_core::Model {
+            id: "glm-5.2".into(),
+            provider: "zai".into(),
+            display_name: "GLM-5.2".into(),
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            supports_reasoning: reasoning,
+            supports_images: false,
+        }
+    }
+
+    fn test_req(model: &sepp_core::Model, thinking: ThinkingLevel) -> CompletionRequest<'_> {
+        CompletionRequest {
+            model,
+            system: None,
+            messages: &[],
+            tools: &[],
+            thinking,
+            max_tokens: 8192,
+        }
+    }
+
+    #[test]
+    fn zai_thinking_enabled_for_nonoff_level() {
+        let p = OpenAiProvider::new(None, "x").with_dialect(OpenAiDialect::Zai);
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn zai_thinking_disabled_for_off() {
+        let p = OpenAiProvider::new(None, "x").with_dialect(OpenAiDialect::Zai);
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Off));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+    }
+
+    #[test]
+    fn zai_thinking_absent_when_model_unsupported() {
+        let p = OpenAiProvider::new(None, "x").with_dialect(OpenAiDialect::Zai);
+        let m = test_model(false);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn openai_dialect_never_emits_thinking() {
+        // Default-Dialekt (echtes OpenAI/local) darf das Feld nie senden — würde 400en.
+        let p = OpenAiProvider::new(None, "x");
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
+        assert!(body.get("thinking").is_none());
     }
 }

@@ -40,6 +40,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 enum Kind {
     User,
     Assistant,
+    Thinking,
     Info,
     Error,
 }
@@ -97,6 +98,8 @@ struct App {
     session: Arc<Mutex<AgentSession>>,
     transcript: Vec<DisplayMsg>,
     streaming: Option<String>,
+    streaming_thinking: Option<String>,
+    show_thinking: bool,
     input: String,
     status: String,
     running: bool,
@@ -118,6 +121,7 @@ pub async fn run(
     agent: AgentSession,
     prompt_templates: Vec<(String, String)>,
     base_prompt: String,
+    show_thinking: bool,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -131,6 +135,7 @@ pub async fn run(
         tx,
         prompt_templates,
         base_prompt,
+        show_thinking,
     );
     app.rebuild_transcript().await;
 
@@ -179,11 +184,14 @@ impl App {
         tx: mpsc::UnboundedSender<UiMsg>,
         prompt_templates: Vec<(String, String)>,
         base_prompt: String,
+        show_thinking: bool,
     ) -> Self {
         App {
             session,
             transcript: Vec::new(),
             streaming: None,
+            streaming_thinking: None,
+            show_thinking,
             input: String::new(),
             status: "bereit · /help für Befehle".into(),
             running: false,
@@ -203,7 +211,7 @@ impl App {
 
     async fn rebuild_transcript(&mut self) {
         let g = self.session.lock().await;
-        self.transcript = transcript_from_messages(g.messages());
+        self.transcript = transcript_from_messages(g.messages(), self.show_thinking);
         self.status = idle_status(&g);
     }
 
@@ -344,6 +352,7 @@ impl App {
                     drop(g);
                     self.transcript.clear();
                     self.streaming = None;
+                    self.streaming_thinking = None;
                     self.scroll_back = 0;
                     self.status = "neue Session".into();
                 }
@@ -496,10 +505,11 @@ impl App {
                     let mut g = self.session.lock().await;
                     let err = g.session_mut().and_then(|s| s.branch(&id).err());
                     g.reload_from_session();
-                    let t = transcript_from_messages(g.messages());
+                    let t = transcript_from_messages(g.messages(), self.show_thinking);
                     drop(g);
                     self.transcript = t;
                     self.streaming = None;
+                    self.streaming_thinking = None;
                     self.mode = Mode::Chat;
                     self.scroll_back = 0;
                     self.status = match err {
@@ -526,10 +536,11 @@ impl App {
                         Ok(store) => {
                             let mut g = self.session.lock().await;
                             g.set_session(Box::new(store));
-                            let t = transcript_from_messages(g.messages());
+                            let t = transcript_from_messages(g.messages(), self.show_thinking);
                             drop(g);
                             self.transcript = t;
                             self.streaming = None;
+                            self.streaming_thinking = None;
                             self.scroll_back = 0;
                             self.mode = Mode::Chat;
                             self.status = format!("Session {} geladen", short_id(&info.id));
@@ -571,6 +582,12 @@ impl App {
                 self.streaming.get_or_insert_with(String::new).push_str(&s);
                 self.scroll_back = 0;
             }
+            AgentEvent::ThinkingDelta(s) if self.show_thinking => {
+                self.streaming_thinking
+                    .get_or_insert_with(String::new)
+                    .push_str(&s);
+                self.scroll_back = 0;
+            }
             AgentEvent::ToolStart { name, .. } => {
                 self.finalize_streaming();
                 self.transcript.push(DisplayMsg {
@@ -595,6 +612,15 @@ impl App {
     }
 
     fn finalize_streaming(&mut self) {
+        // Reihenfolge wie in der Nachricht: Thinking VOR Text.
+        if let Some(t) = self.streaming_thinking.take() {
+            if !t.trim().is_empty() {
+                self.transcript.push(DisplayMsg {
+                    kind: Kind::Thinking,
+                    text: t,
+                });
+            }
+        }
         if let Some(s) = self.streaming.take() {
             if !s.trim().is_empty() {
                 self.transcript.push(DisplayMsg {
@@ -658,6 +684,15 @@ impl App {
                 lines.push(Line::styled(row, style));
             }
         }
+        // Live streamendes Reasoning gedimmt VOR dem streamenden Antworttext.
+        if let Some(t) = &self.streaming_thinking {
+            let style = Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM);
+            for row in wrap(t, inner_w) {
+                lines.push(Line::styled(row, style));
+            }
+        }
         if let Some(s) = &self.streaming {
             for row in wrap(s, inner_w) {
                 lines.push(Line::styled(row, Style::default()));
@@ -705,6 +740,12 @@ fn styled(m: &DisplayMsg) -> (String, Style) {
                 .add_modifier(Modifier::BOLD),
         ),
         Kind::Assistant => (m.text.clone(), Style::default()),
+        Kind::Thinking => (
+            m.text.clone(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
         Kind::Info => (m.text.clone(), Style::default().fg(Color::DarkGray)),
         Kind::Error => (m.text.clone(), Style::default().fg(Color::Red)),
     }
@@ -755,7 +796,7 @@ fn custom_model(id: &str) -> Model {
     }
 }
 
-fn transcript_from_messages(msgs: &[Message]) -> Vec<DisplayMsg> {
+fn transcript_from_messages(msgs: &[Message], show_thinking: bool) -> Vec<DisplayMsg> {
     let mut out = Vec::new();
     for m in msgs {
         match m.role {
@@ -785,6 +826,14 @@ fn transcript_from_messages(msgs: &[Message]) -> Vec<DisplayMsg> {
                 let mut text = String::new();
                 for b in &m.content {
                     match b {
+                        ContentBlock::Thinking { text: t, .. }
+                            if show_thinking && !t.trim().is_empty() =>
+                        {
+                            out.push(DisplayMsg {
+                                kind: Kind::Thinking,
+                                text: t.clone(),
+                            });
+                        }
                         ContentBlock::Text { text: t } => push_line(&mut text, t),
                         ContentBlock::ToolUse { name, .. } => out.push(DisplayMsg {
                             kind: Kind::Info,
@@ -947,9 +996,29 @@ mod tests {
             Message::user_text("hi"),
             Message::assistant(vec![ContentBlock::text("hallo")]),
         ];
-        let t = transcript_from_messages(&msgs);
+        let t = transcript_from_messages(&msgs, true);
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].kind, Kind::User);
         assert_eq!(t[1].kind, Kind::Assistant);
+    }
+
+    #[test]
+    fn transcript_includes_thinking_when_enabled() {
+        let msgs = vec![Message::assistant(vec![
+            ContentBlock::Thinking {
+                text: "kurz nachgedacht".into(),
+                signature: None,
+            },
+            ContentBlock::text("Antwort"),
+        ])];
+        // show_thinking=true → Thinking VOR Text.
+        let on = transcript_from_messages(&msgs, true);
+        assert_eq!(on.len(), 2);
+        assert_eq!(on[0].kind, Kind::Thinking);
+        assert_eq!(on[1].kind, Kind::Assistant);
+        // show_thinking=false → nur die Antwort.
+        let off = transcript_from_messages(&msgs, false);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].kind, Kind::Assistant);
     }
 }

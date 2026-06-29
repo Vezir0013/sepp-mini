@@ -41,9 +41,11 @@ pub fn builtin_models() -> Vec<Model> {
         anthropic("claude-opus-4-8", "Claude Opus 4.8", 200_000, 32_000),
         anthropic("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000, 64_000),
         anthropic("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 32_000),
-        // z.ai / Zhipu GLM (OpenAI-kompatibler Endpunkt). Kontextfenster/max-output bewusst
-        // konservativ gehalten (früher komprimieren statt überlaufen) und gegen die z.ai-Docs
-        // zu verifizieren — siehe HINWEIS oben.
+        // z.ai / Zhipu GLM (OpenAI-kompatibler Endpunkt). glm-5.2 ist das aktuelle Flaggschiff
+        // und der Default für --provider zai. Kontextfenster/max-output bewusst konservativ
+        // gehalten (früher komprimieren statt überlaufen) und gegen die z.ai-Docs zu
+        // verifizieren — siehe HINWEIS oben.
+        zai("glm-5.2", "GLM-5.2", 200_000, 32_000),
         zai("glm-4.6", "GLM-4.6", 200_000, 32_000),
         zai("glm-4.5-air", "GLM-4.5-Air", 128_000, 32_000),
         zai("glm-4.5-flash", "GLM-4.5-Flash", 128_000, 32_000),
@@ -72,9 +74,13 @@ mod tests {
 
     #[test]
     fn registry_includes_zai_glm_models() {
+        // Flaggschiff/Default für --provider zai.
+        let flagship = find_model("glm-5.2").expect("glm-5.2 ist registriert");
+        assert_eq!(flagship.provider, "zai");
+        assert_eq!(flagship.context_window, 200_000);
+
         let glm = find_model("glm-4.6").expect("glm-4.6 ist registriert");
         assert_eq!(glm.provider, "zai");
-        assert_eq!(glm.context_window, 200_000);
         assert!(!glm.supports_images);
         assert!(builtin_models().iter().any(|m| m.id == "glm-4.5-flash"));
     }

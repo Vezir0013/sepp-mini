@@ -7,23 +7,34 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-### Hinzugefügt
-- **z.ai / Zhipu-GLM als Provider** (`--provider zai` bzw. `SEPP_PROVIDER=zai`). Nutzt den
-  OpenAI-kompatiblen Endpunkt `https://api.z.ai/api/paas/v4` über den bestehenden OpenAI-Adapter —
-  kein neuer Parser. Key aus `ZAI_API_KEY` (Format `id.secret`), Endpunkt über `ZAI_BASE_URL`
-  überschreibbar (z. B. China-Region). GLM-4.6/4.5-Air/4.5-Flash sind in der Modell-Registry
-  hinterlegt (Default-Modell `glm-4.6`); Kontextfenster/Limits sind konservativ und gegen die
-  z.ai-Docs zu verifizieren. Fehlt der Key, scheitert der Start mit einem hilfreichen Hinweis.
-- **OpenAI-Adapter: `reasoning_content` → ThinkingDelta.** Reasoning-Modelle über
-  OpenAI-kompatible Endpunkte (z. B. GLM-4.6, DeepSeek-R1) streamen ihr Denken im Feld
-  `reasoning_content`; das wird jetzt als Thinking abgebildet statt verworfen (No-op für reine
-  Chat-Modelle).
-
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.5] - 2026-06-29
+
+### Hinzugefügt
+- **z.ai / Zhipu-GLM als Provider** (`--provider zai` bzw. `SEPP_PROVIDER=zai`). Nutzt den
+  OpenAI-kompatiblen Endpunkt `https://api.z.ai/api/paas/v4` über den bestehenden OpenAI-Adapter —
+  kein neuer Parser. Key aus `ZAI_API_KEY` (Format `id.secret`), Endpunkt über `ZAI_BASE_URL`
+  überschreibbar (z. B. China-Region). GLM-5.2/4.6/4.5-Air/4.5-Flash sind in der Modell-Registry
+  hinterlegt (Default-Modell `glm-5.2`, das aktuelle Flaggschiff); Kontextfenster/Limits sind
+  konservativ und gegen die z.ai-Docs zu verifizieren. Fehlt der Key, scheitert der Start mit
+  einem hilfreichen Hinweis.
+- **OpenAI-Adapter: `reasoning_content` → ThinkingDelta.** Reasoning-Modelle über
+  OpenAI-kompatible Endpunkte (z. B. GLM-5.2/4.6, DeepSeek-R1) streamen ihr Denken im Feld
+  `reasoning_content`; das wird jetzt als Thinking abgebildet statt verworfen (No-op für reine
+  Chat-Modelle).
+- **Reasoning-Steuerung.** `--think`/`--no-think` und `SEPP_THINK` (gelayert wie `SEPP_PROVIDER`,
+  Flag gewinnt) schalten das Denken ein/aus; bei `--provider zai` (GLM) ist Reasoning **per Default
+  an**, andere Provider bleiben unverändert. Der z.ai-Adapter sendet dafür `thinking:{type:…}`
+  (binär, nur am z.ai-Endpunkt; explizit `disabled` spart bei Trivialfragen ~Faktor 77
+  completion_tokens). Anzeige gedimmt sichtbar (Opt-out `--hide-thinking`): One-shot streamt das
+  Denken nach **STDERR** (stdout bleibt reiner Datenkanal), die TUI zeigt es gedimmt im Verlauf,
+  RPC liefert weiterhin `{"type":"thinking"}`. Hinweis: das Denken (Chain-of-Thought) wird wie die
+  Antwort in der Session-JSONL persistiert; an die Provider zurückgespielt wird es nicht.
 
 ## [0.1.4] - 2026-06-28
 

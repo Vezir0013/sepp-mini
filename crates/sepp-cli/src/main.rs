@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
-use sepp_core::{Model, SeppError};
+use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_provider::{models, AnthropicProvider, OpenAiProvider, Provider};
 use sepp_tools::{builtin_tools, Tool};
@@ -56,6 +56,11 @@ struct RunOpts {
     rpc: bool,
     /// SQLite-Session-Backend statt JSONL (nur `-p`/`--rpc`; braucht Feature `sqlite`).
     sqlite: bool,
+    /// `--think`/`--no-think`: `Some(true/false)` erzwingt Reasoning an/aus; `None` = Default
+    /// (z.ai an, sonst aus). Vorrang vor `SEPP_THINK`.
+    think: Option<bool>,
+    /// `--hide-thinking`: Reasoning nicht anzeigen (Default: gedimmt sichtbar).
+    hide_thinking: bool,
 }
 
 fn main() -> ExitCode {
@@ -105,6 +110,8 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     let mut provider: Option<String> = None;
     let mut rpc = false;
     let mut sqlite = false;
+    let mut think: Option<bool> = None;
+    let mut hide_thinking = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -113,6 +120,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             "-V" | "--version" => return Ok(Cmd::Version),
             "--rpc" => rpc = true,
             "--sqlite" => sqlite = true,
+            "--think" => think = Some(true),
+            "--no-think" => think = Some(false),
+            "--hide-thinking" => hide_thinking = true,
             "--provider" => {
                 i += 1;
                 provider = Some(
@@ -172,7 +182,38 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         provider,
         rpc,
         sqlite,
+        think,
+        hide_thinking,
     }))
+}
+
+/// `SEPP_THINK`-Wert → optionaler Bool (Unbekanntes ⇒ `None`, damit der Default greift).
+fn parse_think_env(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// CLI/Env → effektive Reasoning-Stufe. Default-AN ist **z.ai-spezifisch**; andere Provider
+/// bleiben Off, sofern nicht explizit `--think`/`SEPP_THINK` gesetzt wird. `--think`/`--no-think`
+/// haben Vorrang vor `SEPP_THINK` (wie `--provider` vor `SEPP_PROVIDER`). „An" = `Medium` (4096),
+/// nicht `High`: dieselbe Stufe fließt zu Anthropic, das `budget_tokens < max_tokens` verlangt —
+/// bei Default-`max_tokens=8192` wäre `High=8192` grenzwertig, `Medium` ist sicher. z.ai ignoriert
+/// das Budget (binär an/aus).
+fn resolve_thinking(flag: Option<bool>, env: Option<&str>, is_zai: bool) -> ThinkingLevel {
+    match flag.or_else(|| env.and_then(parse_think_env)) {
+        Some(true) => ThinkingLevel::Medium,
+        Some(false) => ThinkingLevel::Off,
+        None => {
+            if is_zai {
+                ThinkingLevel::Medium
+            } else {
+                ThinkingLevel::Off
+            }
+        }
+    }
 }
 
 fn print_help() {
@@ -191,6 +232,8 @@ fn print_help() {
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
          \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192)\n\
          \x20     --provider <name>     anthropic (Default) | openai | local | zai\n\
+         \x20     --think / --no-think  Reasoning erzwingen/abschalten (z.ai: Default an)\n\
+         \x20     --hide-thinking       Reasoning nicht anzeigen (Default: gedimmt sichtbar)\n\
          \x20     --rpc                 JSONL-RPC über stdin/stdout (statt TUI/One-shot)\n\
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
          \x20 -h, --help                Diese Hilfe\n\
@@ -204,6 +247,7 @@ fn print_help() {
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
          \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
          \x20 SEPP_PROVIDER             Default-Provider, wenn --provider fehlt\n\
+         \x20 SEPP_THINK                Default-Reasoning (on/off), wenn --think/--no-think fehlt\n\
          \x20 RUST_LOG                  Log-Level (One-shot/RPC; Logs nach stderr)",
         default = models::DEFAULT_MODEL_ID
     );
@@ -373,6 +417,12 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .unwrap_or_else(|| "anthropic".into());
     let is_openai = matches!(provider_kind.as_str(), "openai" | "local");
     let is_zai = provider_kind == "zai";
+    // Reasoning-Stufe auflösen: --think/--no-think > SEPP_THINK > Provider-Default (z.ai an, sonst aus).
+    let thinking = resolve_thinking(
+        opts.think,
+        std::env::var("SEPP_THINK").ok().as_deref(),
+        is_zai,
+    );
     // Echtes OpenAI braucht einen Key — früh + klar scheitern statt erst beim 401 (lokale
     // Endpunkte via --provider local / OPENAI_BASE_URL bleiben key-optional).
     if provider_kind == "openai"
@@ -445,7 +495,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         },
         // z.ai: aktuelles Flaggschiff als Default.
         None if is_zai => {
-            models::find_model("glm-4.6").unwrap_or_else(|| custom_model("glm-4.6".into(), "zai"))
+            models::find_model("glm-5.2").unwrap_or_else(|| custom_model("glm-5.2".into(), "zai"))
         }
         // OpenAI hat keine Modell-Registry hier → sinnvoller Default.
         None if is_openai => custom_model("gpt-4o-mini".into(), &provider_kind),
@@ -517,7 +567,8 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // edit/bash) Toolset, kein eigener `task` (keine Rekursion).
     let sub = SubAgentTool::new(Arc::clone(&provider), model.clone())
         .tools(builtin_tools())
-        .max_tokens(opts.max_tokens.unwrap_or(8192));
+        .max_tokens(opts.max_tokens.unwrap_or(8192))
+        .thinking(thinking);
     let sub_name = sepp_mcp::resolve_name(&taken, "agent", &sub.spec().name);
     taken.insert(sub_name.clone());
     tools.push(Arc::new(sub.name(sub_name)));
@@ -528,6 +579,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .system_prompt(system)
         .tools(tools)
         .max_tokens(opts.max_tokens.unwrap_or(8192))
+        .thinking(thinking)
         .session(store)
         .auto_compact_threshold(threshold);
     if let Some(h) = hooks {
@@ -552,11 +604,19 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 }
             });
 
+            // Reasoning gedimmt nach STDERR (Default sichtbar; --hide-thinking unterdrückt es).
+            // stdout bleibt strikt der Datenkanal (nur TextDelta) — Invariante des RPC/Pipe-Vertrags.
+            let show_thinking = !opts.hide_thinking;
             let on_event = |ev: AgentEvent| match ev {
                 AgentEvent::TextDelta(t) => {
                     let mut out = std::io::stdout().lock();
                     let _ = out.write_all(t.as_bytes());
                     let _ = out.flush();
+                }
+                AgentEvent::ThinkingDelta(t) if show_thinking => {
+                    let mut err = std::io::stderr().lock();
+                    let _ = write!(err, "\x1b[2m{t}\x1b[0m");
+                    let _ = err.flush();
                 }
                 AgentEvent::ToolStart { name, .. } => {
                     eprintln!("\x1b[2m· {name} …\x1b[0m");
@@ -578,7 +638,13 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 .into_iter()
                 .map(|p| (p.name, p.content))
                 .collect();
-            tui::run(agent, prompts, SYSTEM_PROMPT.to_string()).await
+            tui::run(
+                agent,
+                prompts,
+                SYSTEM_PROMPT.to_string(),
+                !opts.hide_thinking,
+            )
+            .await
         }
     }
 }
@@ -791,5 +857,76 @@ mod tests {
         // Zweiter Lauf: kein Fehler, settings.toml unverändert (Nutzerinhalt wird nie überschrieben).
         init_config_at(&root).unwrap();
         assert_eq!(first, std::fs::read_to_string(&settings).unwrap());
+    }
+
+    #[test]
+    fn resolve_thinking_defaults_and_precedence() {
+        // Provider-Default: z.ai an, sonst aus.
+        assert_eq!(resolve_thinking(None, None, true), ThinkingLevel::Medium);
+        assert_eq!(resolve_thinking(None, None, false), ThinkingLevel::Off);
+        // Explizite Flags überall.
+        assert_eq!(
+            resolve_thinking(Some(true), None, false),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            resolve_thinking(Some(false), None, true),
+            ThinkingLevel::Off
+        );
+        // Env greift, wenn kein Flag.
+        assert_eq!(resolve_thinking(None, Some("0"), true), ThinkingLevel::Off);
+        assert_eq!(
+            resolve_thinking(None, Some("on"), false),
+            ThinkingLevel::Medium
+        );
+        // Flag schlägt Env.
+        assert_eq!(
+            resolve_thinking(Some(false), Some("1"), true),
+            ThinkingLevel::Off
+        );
+        // Unbekannter Env-Wert → ignoriert → Provider-Default.
+        assert_eq!(
+            resolve_thinking(None, Some("vielleicht"), true),
+            ThinkingLevel::Medium
+        );
+    }
+
+    #[test]
+    fn parse_think_flags() {
+        let on = parse(&args(&["--think", "-p", "x"])).unwrap();
+        assert!(matches!(
+            on,
+            Cmd::Run(RunOpts {
+                think: Some(true),
+                ..
+            })
+        ));
+        let off = parse(&args(&["--no-think", "-p", "x"])).unwrap();
+        assert!(matches!(
+            off,
+            Cmd::Run(RunOpts {
+                think: Some(false),
+                ..
+            })
+        ));
+        let hide = parse(&args(&["--hide-thinking", "-p", "x"])).unwrap();
+        assert!(matches!(
+            hide,
+            Cmd::Run(RunOpts {
+                hide_thinking: true,
+                think: None,
+                ..
+            })
+        ));
+        // Default: kein Flag.
+        let def = parse(&args(&["-p", "x"])).unwrap();
+        assert!(matches!(
+            def,
+            Cmd::Run(RunOpts {
+                think: None,
+                hide_thinking: false,
+                ..
+            })
+        ));
     }
 }

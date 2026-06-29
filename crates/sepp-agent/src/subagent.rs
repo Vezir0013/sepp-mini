@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use sepp_core::{ContentBlock, Message, Model, Result, Role, SeppError, ToolResult, ToolSpec};
+use sepp_core::{
+    ContentBlock, Message, Model, Result, Role, SeppError, ThinkingLevel, ToolResult, ToolSpec,
+};
 use sepp_provider::Provider;
 use sepp_tools::Tool;
 
@@ -22,6 +24,7 @@ pub struct SubAgentTool {
     system_prompt: String,
     max_tokens: u64,
     max_turns: usize,
+    thinking: ThinkingLevel,
     name: String,
     description: String,
 }
@@ -38,6 +41,7 @@ impl SubAgentTool {
                 .into(),
             max_tokens: 4096,
             max_turns: 20,
+            thinking: ThinkingLevel::Off,
             name: "task".into(),
             description: "Delegiert eine in sich geschlossene Teilaufgabe an einen isolierten \
                           Sub-Agenten (eigener Kontext, eingeschränktes Toolset, eigenes Budget). \
@@ -64,6 +68,12 @@ impl SubAgentTool {
     /// Max. Anzahl Turns im Sub-Agent-Loop.
     pub fn max_turns(mut self, n: usize) -> Self {
         self.max_turns = n;
+        self
+    }
+    /// Reasoning-Stufe des Sub-Agenten (Default: Off; die Haupt-Session reicht ihre Stufe durch,
+    /// damit z. B. eine z.ai-Session durchgängig reasoning-AN läuft).
+    pub fn thinking(mut self, level: ThinkingLevel) -> Self {
+        self.thinking = level;
         self
     }
     /// Exponierter Tool-Name (für Kollisions-Präfixe).
@@ -134,6 +144,7 @@ impl Tool for SubAgentTool {
             .tools(self.tools.clone())
             .max_tokens(self.max_tokens)
             .max_turns(self.max_turns)
+            .thinking(self.thinking)
             .build()?;
 
         // Sub-Agent-Ereignisse werden bewusst NICHT an die Wurzel weitergereicht.
