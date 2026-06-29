@@ -297,6 +297,17 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # net = ["mcp.example.com"]
 "#;
 
+/// `.gitignore` für ein projektlokales `.sepp/`. Schließt lokale Laufzeitdaten (Session-Logs, Trust,
+/// SQLite) vom Versionsverwaltungs-Commit aus; das Config-Skelett (skills/, prompts/, settings.toml)
+/// bleibt teilbar. Die `.gitignore` selbst wird mitcommittet.
+const GITIGNORE_TEMPLATE: &str =
+    "# Von `sepp init` angelegt — lokale Laufzeitdaten nicht committen.\n\
+sessions/\n\
+trust.json\n\
+*.sqlite\n\
+*.sqlite-wal\n\
+*.sqlite-shm\n";
+
 /// `sepp init [--global]` — legt das Konfig-Skelett samt kommentierter Beispiel-`settings.toml` an
 /// (idempotent: vorhandene Dateien/Verzeichnisse bleiben unangetastet). Default ist projektlokal
 /// `<cwd>/.sepp`, das danach automatisch vertraut wird (sonst würde es beim Start nicht geladen);
@@ -342,7 +353,9 @@ fn run_init(global: bool) -> ExitCode {
 /// **exakt** den Lese-Literalen in `session.rs` entsprechen, sonst wird das Angelegte nie gelesen.
 fn init_config_at(root: &Path) -> anyhow::Result<()> {
     ensure_dir(root)?;
-    for sub in ["skills", "prompts", "hooks", "plugins"] {
+    // `sessions` wird mit angelegt, damit der Session-Log-Ordner schon nach `init` existiert
+    // (vorher entstand er erst lazy beim ersten Lauf).
+    for sub in ["skills", "prompts", "hooks", "plugins", "sessions"] {
         ensure_dir(&root.join(sub))?;
     }
     let settings = root.join("settings.toml");
@@ -351,6 +364,15 @@ fn init_config_at(root: &Path) -> anyhow::Result<()> {
     } else {
         std::fs::write(&settings, SETTINGS_TEMPLATE)?;
         println!("angelegt: {}", settings.display());
+    }
+    // `.gitignore`, damit projektlokale Session-Logs/Trust/SQLite nicht versehentlich committet
+    // werden (Sicherheit). Idempotent wie `settings.toml`.
+    let gitignore = root.join(".gitignore");
+    if gitignore.exists() {
+        println!("übersprungen (existiert): {}", gitignore.display());
+    } else {
+        std::fs::write(&gitignore, GITIGNORE_TEMPLATE)?;
+        println!("angelegt: {}", gitignore.display());
     }
     Ok(())
 }
@@ -468,6 +490,11 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         std::env::var("SEPP_THINK").ok().as_deref(),
         is_zai,
     );
+    // Session-Store VOR den Key-Checks bauen, damit jeder Start auditierbar ist: bricht ein
+    // Key-Check ab, hängen wir einen `aborted`-Eintrag an und fsyncen — die Datei existiert auch
+    // ohne erfolgreichen Provider-Start (Audit-Trail). `build_store` braucht weder Provider noch
+    // Modell. `mut`, weil der Abbruch-Pfad in den Store schreibt.
+    let mut store = build_store(opts.sqlite, opts.prompt.is_some(), opts.rpc, &opts.session)?;
     // Echtes OpenAI braucht einen Key — früh + klar scheitern statt erst beim 401 (lokale
     // Endpunkte via --provider local / OPENAI_BASE_URL bleiben key-optional).
     if provider_kind == "openai"
@@ -477,10 +504,14 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             .filter(|k| !k.is_empty())
             .is_none()
     {
-        anyhow::bail!(
-            "OPENAI_API_KEY nicht gesetzt — setze den Key, oder nutze --provider local \
-             (bzw. OPENAI_BASE_URL) für lokale Endpunkte"
-        );
+        let msg = "OPENAI_API_KEY nicht gesetzt — setze den Key, oder nutze --provider local \
+             (bzw. OPENAI_BASE_URL) für lokale Endpunkte";
+        return Err(abort_with_audit(
+            store.as_mut(),
+            msg,
+            serde_json::json!({ "reason": "missing_api_key", "provider": provider_kind }),
+        )
+        .await);
     }
     // Anthropic braucht ANTHROPIC_API_KEY — hier früh + hilfreich scheitern statt mit dem nackten
     // "ANTHROPIC_API_KEY nicht gesetzt" aus AnthropicProvider::from_env(). Die Prüfung spiegelt
@@ -492,13 +523,17 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             .filter(|k| !k.trim().is_empty())
             .is_none()
     {
-        anyhow::bail!(
-            "ANTHROPIC_API_KEY nicht gesetzt — eine der Optionen:\n  \
+        let msg = "ANTHROPIC_API_KEY nicht gesetzt — eine der Optionen:\n  \
              - Key setzen:     export ANTHROPIC_API_KEY=…\n  \
              - lokales Modell: --provider local  (bzw. OPENAI_BASE_URL für Ollama/vLLM)\n  \
              - OpenAI:         --provider openai  (mit OPENAI_API_KEY)\n\
-             Konfiguration liegt unter ~/.sepp — anlegen mit `sepp init`."
-        );
+             Konfiguration liegt unter ~/.sepp — anlegen mit `sepp init`.";
+        return Err(abort_with_audit(
+            store.as_mut(),
+            msg,
+            serde_json::json!({ "reason": "missing_api_key", "provider": provider_kind }),
+        )
+        .await);
     }
     // z.ai (Zhipu/GLM) braucht ZAI_API_KEY — anders als lokale OpenAI-Endpunkte ist der Key
     // Pflicht, daher hier früh + hilfreich scheitern statt erst beim 401.
@@ -508,11 +543,15 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             .filter(|k| !k.trim().is_empty())
             .is_none()
     {
-        anyhow::bail!(
-            "ZAI_API_KEY nicht gesetzt — Key auf https://z.ai holen (Format id.secret) und setzen:\n  \
+        let msg = "ZAI_API_KEY nicht gesetzt — Key auf https://z.ai holen (Format id.secret) und setzen:\n  \
              export ZAI_API_KEY=…\n  \
-             (optional ZAI_BASE_URL für einen abweichenden Endpunkt, z. B. die China-Region)"
-        );
+             (optional ZAI_BASE_URL für einen abweichenden Endpunkt, z. B. die China-Region)";
+        return Err(abort_with_audit(
+            store.as_mut(),
+            msg,
+            serde_json::json!({ "reason": "missing_api_key", "provider": provider_kind }),
+        )
+        .await);
     }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
         "anthropic" => Arc::new(AnthropicProvider::from_env()?),
@@ -550,7 +589,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         None => models::default_model(),
     };
     let threshold = model.context_window.saturating_mul(3) / 4;
-    let store = build_store(opts.sqlite, opts.prompt.is_some(), opts.rpc, &opts.session)?;
+    // `store` wurde bereits vor den Key-Checks gebaut (Audit jeden Start).
 
     // Tier 0: Resources (Skills → System-Prompt, Prompt-Templates → Slash-Commands).
     let trusted = session::is_project_trusted().unwrap_or(false);
@@ -675,8 +714,23 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 _ => {}
             };
 
-            agent.prompt(&text, &on_event, cancel).await?;
+            // Ergebnis fangen, NICHT sofort `?` — damit Finalize + Token-Tabelle in BEIDEN
+            // Armen (Erfolg wie Fehler) laufen und die Session durabel abgeschlossen wird.
+            let res = agent.prompt(&text, &on_event, cancel).await;
             println!();
+            if let Err(e) = agent.finalize().await {
+                eprintln!("Hinweis: Session-Abschluss fehlgeschlagen: {e}");
+            }
+            // Tabelle nach STDERR — stdout bleibt reiner Datenkanal (Pipe/RPC-Vertrag).
+            eprintln!(
+                "{}",
+                usage_table(
+                    &agent.total_usage(),
+                    agent.usage_turns(),
+                    model_label(agent.model())
+                )
+            );
+            res?;
             Ok(())
         }
         // Interaktiv: TUI (kein Tracing → stderr bleibt sauber).
@@ -707,10 +761,10 @@ async fn run_rpc(agent: &mut AgentSession) -> anyhow::Result<()> {
     loop {
         // Ctrl+C im Leerlauf (wartend auf stdin) oder EOF beendet den Server sauber.
         let line = tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => break,
             res = lines.next_line() => match res? {
                 Some(l) => l,
-                None => return Ok(()),
+                None => break,
             },
         };
         if line.trim().is_empty() {
@@ -747,7 +801,7 @@ async fn run_rpc(agent: &mut AgentSession) -> anyhow::Result<()> {
                     _ = tokio::signal::ctrl_c() => {
                         cancel.cancel();
                         emit_rpc(&serde_json::json!({ "type": "error", "message": "aborted" }));
-                        return Ok(());
+                        break;
                     }
                     r = agent.prompt(text, &on_event, cancel.clone()) => r,
                 };
@@ -764,6 +818,21 @@ async fn run_rpc(agent: &mut AgentSession) -> anyhow::Result<()> {
             })),
         }
     }
+    // Shutdown (EOF/Ctrl+C): Session abschließen (usage_summary + fsync) und eine maschinenlesbare
+    // Token-Zusammenfassung als letzte RPC-Zeile emittieren.
+    if let Err(e) = agent.finalize().await {
+        emit_rpc(&serde_json::json!({ "type": "error", "message": format!("finalize: {e}") }));
+    }
+    let u = agent.total_usage();
+    emit_rpc(&serde_json::json!({
+        "type": "usage_summary",
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "cache_read_tokens": u.cache_read_tokens,
+        "cache_write_tokens": u.cache_write_tokens,
+        "turns": agent.usage_turns(),
+    }));
+    Ok(())
 }
 
 fn emit_rpc(v: &serde_json::Value) {
@@ -787,6 +856,42 @@ fn rpc_event(ev: &AgentEvent) -> Option<serde_json::Value> {
         AgentEvent::Error(m) => Some(json!({ "type": "error", "message": m })),
         AgentEvent::TurnStart | AgentEvent::TurnEnd | AgentEvent::Done => None,
     }
+}
+
+/// Schreibt einen `aborted`-Audit-Eintrag in den Store, macht ihn durabel (fsync) und liefert den
+/// Abbruch-Fehler zurück. So existiert die Session-Datei auch dann, wenn der Start vor dem ersten
+/// Provider-Call scheitert (z. B. fehlender API-Key) — lückenloser Audit-Trail. Schreibfehler
+/// werden bewusst geschluckt, damit der eigentliche Abbruchgrund (`msg`) nicht verdeckt wird.
+async fn abort_with_audit(
+    store: &mut dyn sepp_session::SessionStore,
+    msg: &str,
+    detail: serde_json::Value,
+) -> anyhow::Error {
+    let _ = store.append(sepp_session::EntryPayload::Custom {
+        kind: "aborted".into(),
+        data: detail,
+    });
+    let _ = store.flush().await;
+    anyhow::anyhow!("{msg}")
+}
+
+/// Rendert eine kompakte Token-Verbrauchs-Tabelle für die Anzeige am Ende der Konversation.
+/// Felder spiegeln den `usage_summary`-Eintrag in der Session-Datei (Anzeige ↔ Datei konsistent).
+/// Cache-Werte sind bei OpenAI/z.ai 0 (die liefern keine Cache-Tokens) — schlicht als `0` gezeigt.
+pub(crate) fn usage_table(u: &sepp_core::Usage, turns: usize, model: &str) -> String {
+    let total = u.input_tokens.saturating_add(u.output_tokens);
+    format!(
+        "\n─ Token-Verbrauch ──────────────\n\
+         \x20 Modell        {model}\n\
+         \x20 Turns         {turns}\n\
+         \x20 Input         {}\n\
+         \x20 Output        {}\n\
+         \x20 Cache read    {}\n\
+         \x20 Cache write   {}\n\
+         \x20 Summe (I+O)   {total}\n\
+         ────────────────────────────────",
+        u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
+    )
 }
 
 /// Wählt das Session-Backend (JSONL-Default oder SQLite via `--sqlite`).
@@ -813,6 +918,17 @@ fn build_store(
         }
     }
     session::open_store(select)
+}
+
+/// Aussagekräftiges Modell-Label für die Anzeige: bevorzugt `display_name`, fällt aber auf die `id`
+/// zurück, wenn das Modell der generische Custom-Platzhalter `(custom)` ist (so erscheint z. B.
+/// `qwen3.5:9b` statt `(custom)` für lokale Ollama-Modelle).
+pub(crate) fn model_label(model: &Model) -> &str {
+    if model.display_name == "(custom)" {
+        &model.id
+    } else {
+        &model.display_name
+    }
 }
 
 fn custom_model(id: String, provider: &str) -> Model {
@@ -924,13 +1040,48 @@ mod tests {
         init_config_at(&root).unwrap();
         let settings = root.join("settings.toml");
         let first = std::fs::read_to_string(&settings).unwrap();
-        for sub in ["skills", "prompts", "hooks", "plugins"] {
+        for sub in ["skills", "prompts", "hooks", "plugins", "sessions"] {
             assert!(root.join(sub).is_dir(), "{sub} sollte existieren");
         }
+        // `.gitignore` schützt projektlokale Laufzeitdaten (Sessions/Trust/SQLite) vor Commits.
+        assert!(
+            root.join(".gitignore").is_file(),
+            ".gitignore sollte existieren"
+        );
 
         // Zweiter Lauf: kein Fehler, settings.toml unverändert (Nutzerinhalt wird nie überschrieben).
         init_config_at(&root).unwrap();
         assert_eq!(first, std::fs::read_to_string(&settings).unwrap());
+    }
+
+    #[tokio::test]
+    async fn abort_with_audit_writes_durable_aborted_entry() {
+        // Trait im Scope für `.entries()` auf dem konkreten Store. Der Abbruch-Pfad (z. B. fehlender
+        // API-Key) muss eine durabel geschriebene `aborted`-Spur hinterlassen — ohne Subprozess/
+        // Env-Gefummel, direkt auf dem Store getestet.
+        use sepp_session::SessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = sepp_session::JsonlSessionStore::create(dir.path()).unwrap();
+        let err = abort_with_audit(
+            &mut store,
+            "ANTHROPIC_API_KEY nicht gesetzt",
+            serde_json::json!({ "reason": "missing_api_key", "provider": "anthropic" }),
+        )
+        .await;
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY"));
+
+        // Datei reöffnen (Store lebt noch → prüft den fsync) und den Eintrag verifizieren.
+        let infos = sepp_session::JsonlSessionStore::list(dir.path()).unwrap();
+        let reopened = sepp_session::JsonlSessionStore::open(&infos[0].path).unwrap();
+        let aborted = reopened.entries().iter().find_map(|e| match &e.payload {
+            sepp_session::EntryPayload::Custom { kind, data } if kind == "aborted" => {
+                Some(data.clone())
+            }
+            _ => None,
+        });
+        let data = aborted.expect("ein `aborted`-Eintrag sollte persistiert sein");
+        assert_eq!(data["reason"], "missing_api_key");
+        assert_eq!(data["provider"], "anthropic");
     }
 
     #[test]

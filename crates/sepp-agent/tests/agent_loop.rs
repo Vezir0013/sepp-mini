@@ -10,8 +10,9 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use sepp_agent::{AgentEvent, AgentSession};
-use sepp_core::{Model, Result, ToolResult, ToolSpec, Usage};
+use sepp_core::{Model, Result, Role, ToolResult, ToolSpec, Usage};
 use sepp_provider::{CompletionRequest, Provider, StopReason, StreamEvent};
+use sepp_session::SessionStore; // Trait im Scope für `.entries()` auf konkretem JsonlSessionStore
 use sepp_tools::Tool;
 
 struct FakeProvider {
@@ -216,6 +217,207 @@ fn text_turn(text: &str) -> Vec<StreamEvent> {
             stop_reason: StopReason::EndTurn,
         },
     ]
+}
+
+fn text_turn_usage(text: &str, usage: Usage) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::MessageStart,
+        StreamEvent::TextDelta { text: text.into() },
+        StreamEvent::Usage(usage),
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn accumulates_total_usage_across_turns() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![
+            text_turn_usage(
+                "a",
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+            ),
+            text_turn_usage(
+                "b",
+                Usage {
+                    input_tokens: 50,
+                    output_tokens: 10,
+                    cache_read_tokens: 7,
+                    ..Default::default()
+                },
+            ),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .build()
+        .unwrap();
+
+    let noop = |_e: AgentEvent| {};
+    session
+        .prompt("1", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    session
+        .prompt("2", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let u = session.total_usage();
+    assert_eq!(u.input_tokens, 150);
+    assert_eq!(u.output_tokens, 30);
+    assert_eq!(u.cache_read_tokens, 7);
+    assert_eq!(session.usage_turns(), 2);
+}
+
+#[tokio::test]
+async fn total_usage_survives_compaction() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![
+            text_turn_usage(
+                "a",
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+            ),
+            text_turn("SUMMARY"), // compact() ruft den Provider — ohne Usage, zählt nicht mit
+            text_turn_usage(
+                "b",
+                Usage {
+                    input_tokens: 50,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            ),
+        ])),
+    });
+    let store = Box::new(sepp_session::InMemorySessionStore::new());
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .session(store)
+        .build()
+        .unwrap();
+
+    let noop = |_e: AgentEvent| {};
+    session
+        .prompt("erste", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    session.compact(None).await.unwrap();
+    session
+        .prompt("zweite", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // Summe übersteht die Compaction (anders als last_usage, das genullt wird).
+    let u = session.total_usage();
+    assert_eq!(u.input_tokens, 150);
+    assert_eq!(u.output_tokens, 30);
+    assert_eq!(session.usage_turns(), 2);
+}
+
+#[tokio::test]
+async fn finalize_writes_summary_and_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Box::new(sepp_session::JsonlSessionStore::create(dir.path()).unwrap());
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![text_turn_usage(
+            "hi",
+            Usage {
+                input_tokens: 42,
+                output_tokens: 7,
+                ..Default::default()
+            },
+        )])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .session(store)
+        .build()
+        .unwrap();
+
+    let noop = |_e: AgentEvent| {};
+    session
+        .prompt("frage", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    session.finalize().await.unwrap();
+    session.finalize().await.unwrap(); // idempotent: schreibt keinen zweiten Eintrag
+    drop(session);
+
+    let infos = sepp_session::JsonlSessionStore::list(dir.path()).unwrap();
+    assert_eq!(infos.len(), 1);
+    let reopened = sepp_session::JsonlSessionStore::open(&infos[0].path).unwrap();
+    let summaries: Vec<_> = reopened
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.payload {
+            sepp_session::EntryPayload::Custom { kind, data } if kind == "usage_summary" => {
+                Some(data.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "genau ein usage_summary erwartet (idempotent)"
+    );
+    assert_eq!(summaries[0]["input_tokens"], 42);
+    assert_eq!(summaries[0]["output_tokens"], 7);
+    assert_eq!(summaries[0]["turns"], 1);
+}
+
+#[tokio::test]
+async fn provider_error_flushes_recorded_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Box::new(sepp_session::JsonlSessionStore::create(dir.path()).unwrap());
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::MessageStart,
+            StreamEvent::Error {
+                message: "boom".into(),
+            },
+        ]])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .session(store)
+        .build()
+        .unwrap();
+
+    let noop = |_e: AgentEvent| {};
+    let res = session
+        .prompt("frage", &noop, CancellationToken::new())
+        .await;
+    assert!(res.is_err());
+
+    // Datei lesen, WÄHREND die Session noch lebt → prüft den fsync im Fehlerpfad (nicht erst beim
+    // Drop). Ohne den Fehlerpfad-Flush stünde die User-Message nur im BufWriter, nicht auf Platte.
+    let infos = sepp_session::JsonlSessionStore::list(dir.path()).unwrap();
+    let reopened = sepp_session::JsonlSessionStore::open(&infos[0].path).unwrap();
+    let has_user = reopened.entries().iter().any(|e| {
+        matches!(&e.payload, sepp_session::EntryPayload::Message { message } if message.role == Role::User)
+    });
+    assert!(
+        has_user,
+        "User-Message sollte trotz Provider-Fehler durabel persistiert sein"
+    );
 }
 
 #[tokio::test]

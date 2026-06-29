@@ -158,6 +158,23 @@ pub async fn run(
     };
 
     restore(&mut terminal);
+
+    // Konversation abschließen: usage_summary in die Session schreiben + fsync, dann die
+    // Token-Tabelle auf dem (wiederhergestellten) Normalbildschirm ausgeben. Ein evtl. laufender,
+    // beim Quit gecancelter Prompt-Task gibt den Lock frei → `lock().await` wartet sauber.
+    {
+        let mut g = app.session.lock().await;
+        if let Err(e) = g.finalize().await {
+            eprintln!("Hinweis: Session-Abschluss fehlgeschlagen: {e}");
+        }
+        let table = crate::usage_table(
+            &g.total_usage(),
+            g.usage_turns(),
+            crate::model_label(g.model()),
+        );
+        drop(g);
+        println!("{table}");
+    }
     result
 }
 
@@ -348,6 +365,8 @@ impl App {
             "new" => match session::new_store() {
                 Ok(store) => {
                     let mut g = self.session.lock().await;
+                    // Alte Session abschließen (usage_summary + fsync), bevor wir umschalten.
+                    let _ = g.finalize().await;
                     g.set_session(store);
                     drop(g);
                     self.transcript.clear();
@@ -535,6 +554,8 @@ impl App {
                     match sepp_session::JsonlSessionStore::open(&info.path) {
                         Ok(store) => {
                             let mut g = self.session.lock().await;
+                            // Alte Session abschließen, bevor wir auf die gewählte umschalten.
+                            let _ = g.finalize().await;
                             g.set_session(Box::new(store));
                             let t = transcript_from_messages(g.messages(), self.show_thinking);
                             drop(g);
@@ -773,11 +794,9 @@ fn render_list(f: &mut Frame, area: Rect, title: &str, items: &[String], selecte
 }
 
 fn idle_status(g: &AgentSession) -> String {
-    format!(
-        "bereit · ~{} tok · {} · /help",
-        g.estimated_tokens(),
-        g.model().display_name
-    )
+    // Bewusst ohne Live-Token-Zähler — nur Modell. Der detaillierte Token-Verbrauch erscheint als
+    // Mini-Tabelle am Ende der Konversation (beim Quit).
+    format!("bereit · {} · /help", crate::model_label(g.model()))
 }
 
 fn short_id(id: &str) -> String {

@@ -1,8 +1,6 @@
 //! Session-Ablage und Resource-/Trust-Wurzeln unter `~/.sepp` bzw. `<repo>/.sepp`.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -46,13 +44,11 @@ fn cwd_canon() -> Result<PathBuf> {
     Ok(cwd.canonicalize().unwrap_or(cwd))
 }
 
-/// `~/.sepp/sessions/<hash(cwd)>` — stabil über Prozessläufe (fester DefaultHasher).
+/// `<cwd>/.sepp/sessions` — projektlokal (kein `hash(cwd)`-Unterordner mehr). Sessions reisen mit
+/// dem Projekt; `sepp init` legt den Ordner vor an und schützt ihn per `.gitignore`. Entkoppelt von
+/// `SEPP_HOME` (das nur noch globale Config/Resources/Trust verschiebt).
 pub fn project_session_dir() -> Result<PathBuf> {
-    let mut h = DefaultHasher::new();
-    cwd_canon()?.hash(&mut h);
-    Ok(sepp_root()?
-        .join("sessions")
-        .join(format!("{:016x}", h.finish())))
+    Ok(project_root()?.join("sessions"))
 }
 
 /// Resource-Wurzeln (jede enthält optional `skills/`, `prompts/`, `themes/`): global immer,
@@ -194,5 +190,15 @@ mod tests {
         let root = project_root().unwrap();
         assert!(root.ends_with(".sepp"));
         assert_eq!(root, std::env::current_dir().unwrap().join(".sepp"));
+    }
+
+    #[test]
+    fn project_session_dir_is_project_local_no_hash() {
+        // Projektlokal direkt unter `<cwd>/.sepp/sessions` — kein hash(cwd)-Segment mehr.
+        let dir = project_session_dir().unwrap();
+        assert_eq!(dir, project_root().unwrap().join("sessions"));
+        assert!(dir.ends_with("sessions"));
+        // Letztes Segment ist „sessions", das Elternsegment „.sepp" — keine Hex-Hash-Ebene dazwischen.
+        assert_eq!(dir.parent().unwrap(), project_root().unwrap());
     }
 }
