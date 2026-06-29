@@ -7,6 +7,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.6] - 2026-06-29
+
 ### Geändert
 - **z.ai ist jetzt ein eigenständiger Connector** (`ZaiProvider`, Modul `sepp-provider::zai`,
   Feature `zai = ["openai"]`) statt eines Dialekt-Flags auf dem OpenAI-Adapter. `name()` liefert
@@ -20,18 +28,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   `api.openai.com` gesendet werden und scheiterte dort am 401 („You didn't provide an API key").
   Die Mismatch-Warnung greift jetzt auch für GLM-Modelle auf `--provider local/openai` (vorher
   stillschweigend unterdrückt).
+- **Sicherheits-Advisory `anyhow`** auf `1.0.103` angehoben (RUSTSEC-2026-0190: Unsoundness in
+  `Error::downcast_mut()`). `cargo deny check` ist damit wieder grün und der Release-Build läuft.
 
 ### Tests
 - **z.ai Live-Smoke-Test** (`crates/sepp-provider/tests/zai_live.rs`). Per Default `#[ignore]`;
   läuft nur über `just test-live` mit gesetztem `ZAI_API_KEY` und macht einen minimalen echten
   Call gegen api.z.ai (kein `Error`-Event, sauberer MessageStart…MessageStop, etwas Text). Ohne
   Schalter/Key ein stiller No-op.
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.5] - 2026-06-29
 
