@@ -12,7 +12,7 @@ mod tui;
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -40,7 +40,8 @@ enum Cmd {
     Init {
         global: bool,
     },
-    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` auch `~/.sepp`).
+    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` zusätzlich den globalen Root
+    /// `~/.sepp` und alle projektlokalen `.sepp` aus der Trust-Registry).
     Uninstall {
         purge: bool,
     },
@@ -239,7 +240,7 @@ fn print_help() {
          \x20 sepp -p \"<prompt>\"        Einen Prompt nicht-interaktiv ausführen\n\
          \x20 sepp init                 Konfig-Skelett in ./.sepp anlegen (+ Projekt vertrauen)\n\
          \x20 sepp init --global        stattdessen in ~/.sepp (bzw. $SEPP_HOME)\n\
-         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch ~/.sepp)\n\n\
+         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch ~/.sepp + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
          \x20 -c, --continue            Jüngste Session des Projekts fortsetzen\n\
@@ -389,7 +390,8 @@ fn ensure_dir(p: &Path) -> anyhow::Result<()> {
 }
 
 /// `sepp uninstall [--purge]` — entfernt die laufende Binary (Unix: Selbstlöschung ist erlaubt,
-/// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich `~/.sepp`.
+/// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich den globalen Root (`~/.sepp` bzw.
+/// `$SEPP_HOME`, enthält Keys/Trust) **und** alle projektlokalen `.sepp` aus der Trust-Registry.
 fn run_uninstall(purge: bool) -> ExitCode {
     match uninstall(purge) {
         Ok(()) => ExitCode::SUCCESS,
@@ -400,6 +402,26 @@ fn run_uninstall(purge: bool) -> ExitCode {
     }
 }
 
+/// Bestimmt die `.sepp`-Verzeichnisse, die `--purge` entfernt: jedes projektlokale
+/// `<trusted>/.sepp` (Anker via Trust-Registry) plus `<cwd>/.sepp`, gefolgt vom globalen Root.
+/// Dedupliziert; `global_root` steht **als letztes** (sauberes Reporting und damit `trust.json`
+/// darin erst nach dem Auslesen entfernt wird). Pure Funktion — ohne Env/FS testbar.
+fn purge_targets(global_root: &Path, trusted: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = trusted.iter().map(|p| p.join(".sepp")).collect();
+    if let Some(cwd) = cwd {
+        candidates.push(cwd.join(".sepp"));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in candidates {
+        // Den globalen Root NICHT als Projekt-Ziel doppeln (Fall: `init` aus dem Home).
+        if c != *global_root && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out.push(global_root.to_path_buf());
+    out
+}
+
 fn uninstall(purge: bool) -> anyhow::Result<()> {
     // Hinweis: Unter `cargo run` zeigt current_exe() auf die Dev-Binary in target/ — die würde dann
     // entfernt. Für den Distributions-Fall (~/.local/bin/sepp) ist genau das gewollt.
@@ -407,20 +429,37 @@ fn uninstall(purge: bool) -> anyhow::Result<()> {
     std::fs::remove_file(&exe)?;
     println!("Entfernt: {}", exe.display());
 
-    let root = session::sepp_root()?;
+    // Ziele VOR dem Löschen bestimmen: `trust.json` liegt im globalen Root und muss vorher gelesen
+    // werden (deshalb steht global in `purge_targets` zuletzt). cwd kanonisieren, damit es sauber
+    // gegen die kanonischen Trust-Keys dedupliziert.
+    let global = session::sepp_root()?;
+    let trusted = session::trusted_projects().unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|c| std::fs::canonicalize(&c).unwrap_or(c));
+    let targets = purge_targets(&global, &trusted, cwd.as_deref());
+
     if purge {
-        if root.is_dir() {
-            std::fs::remove_dir_all(&root)?;
-            println!("Entfernt (--purge): {}", root.display());
-        } else {
-            println!("Nicht gefunden (übersprungen): {}", root.display());
+        for target in &targets {
+            if target.is_dir() {
+                // Fehler je Ziel tolerieren — ein nicht löschbares Verzeichnis bricht nicht alles ab.
+                match std::fs::remove_dir_all(target) {
+                    Ok(()) => println!("Entfernt (--purge): {}", target.display()),
+                    Err(e) => eprintln!("Konnte {} nicht entfernen: {e}", target.display()),
+                }
+            } else {
+                println!("Nicht gefunden (übersprungen): {}", target.display());
+            }
         }
-    } else if root.is_dir() {
-        println!(
-            "Hinweis: Nutzerdaten unter {} bleiben erhalten.",
-            root.display()
-        );
-        println!("         Zum vollständigen Entfernen: sepp uninstall --purge");
+    } else {
+        let existing: Vec<&PathBuf> = targets.iter().filter(|t| t.is_dir()).collect();
+        if !existing.is_empty() {
+            println!("Hinweis: folgende Nutzerdaten bleiben erhalten:");
+            for t in existing {
+                println!("         {}", t.display());
+            }
+            println!("         Zum vollständigen Entfernen: sepp uninstall --purge");
+        }
     }
     println!("Deinstallation abgeschlossen.");
     Ok(())
@@ -1030,6 +1069,45 @@ mod tests {
             Cmd::Uninstall { purge: true }
         ));
         assert!(parse(&args(&["uninstall", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn purge_targets_collects_projects_then_global_last() {
+        let global = PathBuf::from("/root/.sepp");
+        let trusted = vec![PathBuf::from("/home/projA"), PathBuf::from("/srv/projB")];
+        let cwd = PathBuf::from("/home/projA"); // bereits in trusted → kein Duplikat
+        let t = purge_targets(&global, &trusted, Some(&cwd));
+        assert_eq!(
+            t,
+            vec![
+                PathBuf::from("/home/projA/.sepp"),
+                PathBuf::from("/srv/projB/.sepp"),
+                PathBuf::from("/root/.sepp"),
+            ]
+        );
+        assert_eq!(t.last().unwrap(), &global, "global steht immer zuletzt");
+    }
+
+    #[test]
+    fn purge_targets_dedups_global_when_init_from_home() {
+        // `sepp init` aus dem Home: <home>/.sepp == globaler Root → nur einmal (als global).
+        let global = PathBuf::from("/root/.sepp");
+        let trusted = vec![PathBuf::from("/root")];
+        let t = purge_targets(&global, &trusted, None);
+        assert_eq!(t, vec![PathBuf::from("/root/.sepp")]);
+    }
+
+    #[test]
+    fn purge_targets_adds_untrusted_cwd() {
+        let global = PathBuf::from("/root/.sepp");
+        let t = purge_targets(&global, &[], Some(Path::new("/tmp/here")));
+        assert_eq!(
+            t,
+            vec![
+                PathBuf::from("/tmp/here/.sepp"),
+                PathBuf::from("/root/.sepp"),
+            ]
+        );
     }
 
     #[test]

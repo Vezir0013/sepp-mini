@@ -107,6 +107,17 @@ pub fn is_project_trusted() -> Result<bool> {
     Ok(read_trust()?.get(&key).copied().unwrap_or(false))
 }
 
+/// Alle als vertraut markierten Projektpfade (kanonische cwd, in denen `sepp init` projektlokal
+/// lief). Dient `uninstall --purge` als Anker, um projektlokale `.sepp`-Verzeichnisse
+/// standortunabhängig zu finden. Leere/fehlende `trust.json` ⇒ leere Liste.
+pub fn trusted_projects() -> Result<Vec<PathBuf>> {
+    Ok(read_trust()?
+        .into_iter()
+        .filter(|(_, trusted)| *trusted)
+        .map(|(path, _)| PathBuf::from(path))
+        .collect())
+}
+
 /// Markiert das aktuelle Projekt als vertraut (persistiert in `~/.sepp/trust.json`).
 pub fn trust_current_project() -> Result<()> {
     let key = cwd_canon()?.display().to_string();
