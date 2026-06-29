@@ -12,6 +12,7 @@ default = ["anthropic"]
 anthropic = []
 openai = []          # OpenAI-kompatibel (Chat-Completions)
 local = ["openai"]   # lokale Endpunkte (Ollama/vLLM) — gleicher Adapter via base_url
+zai = ["openai"]     # z.ai / Zhipu-GLM — dedizierter Connector, teilt den OpenAI-SSE-Decoder
 google = []          # Phase 5 (offen)
 
 [dependencies]

@@ -1,8 +1,9 @@
 //! z.ai (Zhipu/GLM) spricht den OpenAI-kompatiblen Chat-Completions-Stream und teilt sich
-//! deshalb den Decoder mit dem OpenAI-Adapter (`--provider zai` baut einen `OpenAiProvider`
-//! mit z.ai-base_url). Dieses Fixture ist ein synthetischer, repräsentativer GLM-Stream
-//! (das Live-Test-Konto hatte kein Guthaben) und dient als Regressions-Anker dafür, dass
-//! z.ais Drahtformat über `decode_openai_sse` korrekt dekodiert.
+//! deshalb den Decoder mit dem OpenAI-Adapter. Der dedizierte Connector (`--provider zai` baut
+//! einen eigenständigen `ZaiProvider`) ruft denselben `decode_openai_sse`-Pfad auf; nur Identität
+//! und Fehlertexte sind getrennt. Dieses Fixture ist ein synthetischer, repräsentativer
+//! GLM-Stream (das Live-Test-Konto hatte kein Guthaben) und dient als Regressions-Anker dafür,
+//! dass z.ais Drahtformat über `decode_openai_sse` korrekt dekodiert.
 #![cfg(feature = "openai")]
 
 use sepp_provider::{decode_openai_sse, StopReason, StreamEvent};

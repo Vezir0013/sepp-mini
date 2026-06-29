@@ -16,15 +16,10 @@ use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-/// z.ai (Zhipu/GLM) spricht den OpenAI-kompatiblen Chat-Completions-Endpunkt; das ist der
-/// internationale Default-Host. Über `ZAI_BASE_URL` überschreibbar (z. B. die China-Region
-/// `https://open.bigmodel.cn/api/paas/v4`).
-const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
-
 /// Welcher OpenAI-kompatible Dialekt gesprochen wird. Steuert anbieterspezifische Body-Felder:
 /// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
-/// würde. Default ist [`OpenAiDialect::OpenAi`] (auch für lokale Endpunkte); nur `from_zai_env`
-/// setzt [`OpenAiDialect::Zai`].
+/// würde. Default ist [`OpenAiDialect::OpenAi`] (auch für lokale Endpunkte); der dedizierte
+/// z.ai-Connector ([`crate::zai::ZaiProvider`]) setzt [`OpenAiDialect::Zai`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenAiDialect {
     /// Striktes OpenAI/Chat-Completions (OpenAI, Ollama, vLLM, …) — keine Zusatzfelder.
@@ -226,68 +221,66 @@ impl OpenAiProvider {
         Ok(Self::new(key, base))
     }
 
-    /// z.ai (Zhipu/GLM) über den OpenAI-kompatiblen Endpunkt. Key aus `ZAI_API_KEY`
-    /// (Format `id.secret`), base_url aus `ZAI_BASE_URL` (Default `https://api.z.ai/api/paas/v4`).
-    /// Anders als bei lokalen Endpunkten ist der Key Pflicht — fehlt er, scheitert der Aufruf am 401.
-    pub fn from_zai_env() -> Result<Self> {
-        let base = std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| ZAI_BASE_URL.to_string());
-        let key = std::env::var("ZAI_API_KEY").ok().filter(|k| !k.is_empty());
-        Ok(Self::new(key, base).with_dialect(OpenAiDialect::Zai))
-    }
-
     fn build_body(&self, req: &CompletionRequest) -> Value {
-        let max = if req.max_tokens > 0 {
-            req.max_tokens
-        } else {
-            req.model.max_output_tokens
-        };
-        let mut messages: Vec<Value> = Vec::new();
-        if let Some(sys) = req.system {
-            if !sys.is_empty() {
-                messages.push(json!({ "role": "system", "content": sys }));
-            }
-        }
-        messages.extend(req.messages.iter().flat_map(message_to_openai));
-
-        let mut body = json!({
-            "model": req.model.id,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "max_tokens": max,
-            "messages": messages,
-        });
-        if !req.tools.is_empty() {
-            let tools: Vec<Value> = req
-                .tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = json!(tools);
-        }
-        // z.ai/GLM nimmt ein binäres `thinking`-Objekt; echtes OpenAI/local NICHT (würde das
-        // unbekannte Feld mit 400 ablehnen) — daher streng auf den Zai-Dialekt + reasoning-fähiges
-        // Modell gegated. `Off` → explizit "disabled" (GLM denkt sonst per Default weiter und das
-        // kostet ein Vielfaches an completion_tokens); jede andere Stufe → "enabled". GLM ist binär,
-        // daher kein Budget (anders als Anthropic, anthropic.rs).
-        if self.dialect == OpenAiDialect::Zai && req.model.supports_reasoning {
-            let mode = if req.thinking == ThinkingLevel::Off {
-                "disabled"
-            } else {
-                "enabled"
-            };
-            body["thinking"] = json!({ "type": mode });
-        }
-        body
+        build_chat_body(req, self.dialect)
     }
+}
+
+/// Baut den Chat-Completions-Request-Body für einen OpenAI-kompatiblen Endpunkt. Geteilt vom
+/// [`OpenAiProvider`] und dem dedizierten z.ai-Connector ([`crate::zai::ZaiProvider`]) — der
+/// einzige anbieterspezifische Unterschied steckt im `dialect`.
+pub(crate) fn build_chat_body(req: &CompletionRequest, dialect: OpenAiDialect) -> Value {
+    let max = if req.max_tokens > 0 {
+        req.max_tokens
+    } else {
+        req.model.max_output_tokens
+    };
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(sys) = req.system {
+        if !sys.is_empty() {
+            messages.push(json!({ "role": "system", "content": sys }));
+        }
+    }
+    messages.extend(req.messages.iter().flat_map(message_to_openai));
+
+    let mut body = json!({
+        "model": req.model.id,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+        "max_tokens": max,
+        "messages": messages,
+    });
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = json!(tools);
+    }
+    // z.ai/GLM nimmt ein binäres `thinking`-Objekt; echtes OpenAI/local NICHT (würde das
+    // unbekannte Feld mit 400 ablehnen) — daher streng auf den Zai-Dialekt + reasoning-fähiges
+    // Modell gegated. `Off` → explizit "disabled" (GLM denkt sonst per Default weiter und das
+    // kostet ein Vielfaches an completion_tokens); jede andere Stufe → "enabled". GLM ist binär,
+    // daher kein Budget (anders als Anthropic, anthropic.rs).
+    if dialect == OpenAiDialect::Zai && req.model.supports_reasoning {
+        let mode = if req.thinking == ThinkingLevel::Off {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        body["thinking"] = json!({ "type": mode });
+    }
+    body
 }
 
 /// Mappt eine sepp-`Message` auf 0..n OpenAI-Messages (Tool-Results werden zu eigenen
@@ -373,6 +366,9 @@ struct DecodeState {
     pending: std::collections::VecDeque<StreamEvent>,
     finished: bool,
     cancel: CancellationToken,
+    /// Anbieter-Label für Fehlertexte (`"openai"` bzw. `"zai"`), damit ein z.ai-Fehler nicht
+    /// fälschlich als OpenAI-Fehler erscheint.
+    label: &'static str,
 }
 
 #[async_trait::async_trait]
@@ -387,60 +383,85 @@ impl Provider for OpenAiProvider {
         cancel: CancellationToken,
     ) -> Result<BoxStream<'a, StreamEvent>> {
         let body = self.build_body(&req);
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut builder = self.client.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            builder = builder.bearer_auth(key);
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| SeppError::Provider(format!("openai request: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(SeppError::Provider(format!(
-                "openai: HTTP {status}: {}",
-                text.trim()
-            )));
-        }
-
-        let state = DecodeState {
-            bytes: Box::pin(resp.bytes_stream()),
-            decoder: SseDecoder::new(),
-            mapper: OpenAiMapper::default(),
-            pending: std::collections::VecDeque::new(),
-            finished: false,
+        stream_chat(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            body,
+            "openai",
             cancel,
-        };
-        let stream = futures::stream::unfold(state, |mut st| async move {
-            loop {
-                if let Some(ev) = st.pending.pop_front() {
-                    return Some((ev, st));
-                }
-                if st.finished {
-                    return None;
-                }
-                tokio::select! {
-                    _ = st.cancel.cancelled() => return None,
-                    chunk = st.bytes.next() => match chunk {
-                        Some(Ok(b)) => feed(&mut st, &b),
-                        Some(Err(e)) => {
-                            st.pending.push_back(StreamEvent::Error { message: format!("openai stream: {e}") });
-                            st.finished = true;
-                        }
-                        None => {
-                            let rest = st.decoder.finish();
-                            for p in rest { dispatch(&mut st, &p); }
-                            for ev in st.mapper.done() { st.pending.push_back(ev); }
-                            st.finished = true;
-                        }
+        )
+        .await
+    }
+}
+
+/// Führt einen Chat-Completions-Stream gegen einen OpenAI-kompatiblen Endpunkt aus: POST mit
+/// optionalem Bearer, Statusprüfung, dann SSE → [`StreamEvent`]. Geteilt vom [`OpenAiProvider`]
+/// und dem dedizierten z.ai-Connector ([`crate::zai::ZaiProvider`]). `label` taucht in allen
+/// Fehlertexten auf, damit ein Anbieter nicht unter dem Namen des anderen scheitert. Der Body
+/// hält die Antwort am Leben, deshalb ist der zurückgegebene Stream `'static`.
+pub(crate) async fn stream_chat(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    body: Value,
+    label: &'static str,
+    cancel: CancellationToken,
+) -> Result<BoxStream<'static, StreamEvent>> {
+    let url = format!("{base_url}/chat/completions");
+    let mut builder = client.post(&url).json(&body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| SeppError::Provider(format!("{label} request: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(SeppError::Provider(format!(
+            "{label}: HTTP {status}: {}",
+            text.trim()
+        )));
+    }
+
+    let state = DecodeState {
+        bytes: Box::pin(resp.bytes_stream()),
+        decoder: SseDecoder::new(),
+        mapper: OpenAiMapper::default(),
+        pending: std::collections::VecDeque::new(),
+        finished: false,
+        cancel,
+        label,
+    };
+    let stream = futures::stream::unfold(state, |mut st| async move {
+        loop {
+            if let Some(ev) = st.pending.pop_front() {
+                return Some((ev, st));
+            }
+            if st.finished {
+                return None;
+            }
+            tokio::select! {
+                _ = st.cancel.cancelled() => return None,
+                chunk = st.bytes.next() => match chunk {
+                    Some(Ok(b)) => feed(&mut st, &b),
+                    Some(Err(e)) => {
+                        st.pending.push_back(StreamEvent::Error { message: format!("{} stream: {e}", st.label) });
+                        st.finished = true;
+                    }
+                    None => {
+                        let rest = st.decoder.finish();
+                        for p in rest { dispatch(&mut st, &p); }
+                        for ev in st.mapper.done() { st.pending.push_back(ev); }
+                        st.finished = true;
                     }
                 }
             }
-        });
-        Ok(Box::pin(stream))
-    }
+        }
+    });
+    Ok(Box::pin(stream))
 }
 
 fn feed(st: &mut DecodeState, bytes: &[u8]) {

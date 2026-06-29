@@ -22,7 +22,7 @@ use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
 use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
-use sepp_provider::{models, AnthropicProvider, OpenAiProvider, Provider};
+use sepp_provider::{models, AnthropicProvider, OpenAiProvider, Provider, ZaiProvider};
 use sepp_tools::{builtin_tools, Tool};
 
 use crate::session::SessionSelect;
@@ -232,6 +232,7 @@ fn print_help() {
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
          \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192)\n\
          \x20     --provider <name>     anthropic (Default) | openai | local | zai\n\
+         \x20                           (ohne Angabe aus -m abgeleitet, z. B. glm-* → zai)\n\
          \x20     --think / --no-think  Reasoning erzwingen/abschalten (z.ai: Default an)\n\
          \x20     --hide-thinking       Reasoning nicht anzeigen (Default: gedimmt sichtbar)\n\
          \x20     --rpc                 JSONL-RPC über stdin/stdout (statt TUI/One-shot)\n\
@@ -410,10 +411,20 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         anyhow::bail!("--sqlite ist nur mit -p/--rpc nutzbar (die TUI nutzt JSONL)");
     }
 
+    // Provider-Auflösung: explizit (--provider > SEPP_PROVIDER) schlägt alles. Fehlt das, wird er
+    // aus dem gewählten Modell abgeleitet — `--model glm-5.2` landet so automatisch bei `zai` statt
+    // am OpenAI-Endpunkt (eine Hauptquelle der „falscher Endpunkt"-Fehler). Erst danach der
+    // Default `anthropic`.
     let provider_kind = opts
         .provider
         .clone()
         .or_else(|| std::env::var("SEPP_PROVIDER").ok())
+        .or_else(|| {
+            opts.model
+                .as_deref()
+                .and_then(models::find_model)
+                .map(|m| m.provider)
+        })
         .unwrap_or_else(|| "anthropic".into());
     let is_openai = matches!(provider_kind.as_str(), "openai" | "local");
     let is_zai = provider_kind == "zai";
@@ -472,20 +483,23 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
         "anthropic" => Arc::new(AnthropicProvider::from_env()?),
         "openai" | "local" => Arc::new(OpenAiProvider::from_env()?),
-        "zai" => Arc::new(OpenAiProvider::from_zai_env()?),
+        "zai" => Arc::new(ZaiProvider::from_env()?),
         other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai)"),
     };
 
     let model = match opts.model {
         Some(id) => match models::find_model(&id) {
             Some(m) => {
-                // Registriertes Modell beim „falschen" Provider: warnen, aber durchlassen (der
-                // Mensch weiß evtl., was er tut). Greift z. B. für ein Anthropic-Modell auf dem
-                // OpenAI-/z.ai-Endpunkt — nicht aber für ein GLM-Modell auf `--provider zai`.
-                if m.provider != provider_kind && !(is_openai && m.provider != "anthropic") {
+                // Registriertes Modell bei einem ABWEICHEND und EXPLIZIT gewählten Provider:
+                // warnen, aber durchlassen (der Mensch weiß evtl., was er tut). Ohne explizite
+                // Wahl wird der Provider oben aus dem Modell abgeleitet, dann greift das nie. Der
+                // früher unterdrückte Fall „GLM-Modell auf --provider local/openai" warnt jetzt
+                // bewusst — er sendet GLM an api.openai.com und scheitert dort am 401.
+                if m.provider != provider_kind {
                     eprintln!(
-                        "Hinweis: Modell '{}' ist für Provider '{}' gedacht, gewählt ist \
-                         '{provider_kind}' — es wird trotzdem an dessen Endpunkt gesendet.",
+                        "Hinweis: Modell '{}' gehört zu Provider '{}', gewählt ist \
+                         '{provider_kind}' — die Anfrage geht an dessen Endpunkt und schlägt fehl, \
+                         wenn die Endpunkte inkompatibel sind.",
                         m.id, m.provider
                     );
                 }

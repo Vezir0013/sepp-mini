@@ -16,11 +16,15 @@ pub mod models;
 #[cfg(feature = "openai")]
 pub mod openai;
 pub mod sse;
+#[cfg(feature = "zai")]
+pub mod zai;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::{decode_anthropic_sse, AnthropicProvider};
 #[cfg(feature = "openai")]
 pub use openai::{decode_openai_sse, OpenAiProvider};
+#[cfg(feature = "zai")]
+pub use zai::ZaiProvider;
 
 /// Ein normalisiertes Streaming-Ereignis. Die Reihenfolge-Invariante:
 /// `MessageStart (TextDelta|ThinkingDelta|ToolUse*)* Usage? MessageStop`.

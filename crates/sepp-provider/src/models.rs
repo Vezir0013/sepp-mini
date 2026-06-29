@@ -21,8 +21,9 @@ fn anthropic(id: &str, display_name: &str, context_window: u64, max_output_token
     }
 }
 
-/// z.ai / Zhipu-GLM-Modell. Läuft über den OpenAI-kompatiblen Adapter (`--provider zai`),
-/// daher reine Textmodelle hier (Vision-Variante GLM-4.5V ist separat und noch ungetestet).
+/// z.ai / Zhipu-GLM-Modell. Bedient vom dedizierten z.ai-Connector (`--provider zai`, der das
+/// OpenAI-kompatible Drahtformat teilt); daher reine Textmodelle hier (Vision-Variante GLM-4.5V
+/// ist separat und noch ungetestet).
 fn zai(id: &str, display_name: &str, context_window: u64, max_output_tokens: u64) -> Model {
     Model {
         id: id.to_string(),
