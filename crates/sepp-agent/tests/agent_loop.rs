@@ -219,127 +219,12 @@ fn text_turn(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
-fn text_turn_usage(text: &str, usage: Usage) -> Vec<StreamEvent> {
-    vec![
-        StreamEvent::MessageStart,
-        StreamEvent::TextDelta { text: text.into() },
-        StreamEvent::Usage(usage),
-        StreamEvent::MessageStop {
-            stop_reason: StopReason::EndTurn,
-        },
-    ]
-}
-
 #[tokio::test]
-async fn accumulates_total_usage_across_turns() {
-    let provider = Arc::new(FakeProvider {
-        scripts: Mutex::new(VecDeque::from(vec![
-            text_turn_usage(
-                "a",
-                Usage {
-                    input_tokens: 100,
-                    output_tokens: 20,
-                    ..Default::default()
-                },
-            ),
-            text_turn_usage(
-                "b",
-                Usage {
-                    input_tokens: 50,
-                    output_tokens: 10,
-                    cache_read_tokens: 7,
-                    ..Default::default()
-                },
-            ),
-        ])),
-    });
-    let mut session = AgentSession::builder()
-        .provider(provider)
-        .model(test_model())
-        .tools(vec![])
-        .build()
-        .unwrap();
-
-    let noop = |_e: AgentEvent| {};
-    session
-        .prompt("1", &noop, CancellationToken::new())
-        .await
-        .unwrap();
-    session
-        .prompt("2", &noop, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let u = session.total_usage();
-    assert_eq!(u.input_tokens, 150);
-    assert_eq!(u.output_tokens, 30);
-    assert_eq!(u.cache_read_tokens, 7);
-    assert_eq!(session.usage_turns(), 2);
-}
-
-#[tokio::test]
-async fn total_usage_survives_compaction() {
-    let provider = Arc::new(FakeProvider {
-        scripts: Mutex::new(VecDeque::from(vec![
-            text_turn_usage(
-                "a",
-                Usage {
-                    input_tokens: 100,
-                    output_tokens: 20,
-                    ..Default::default()
-                },
-            ),
-            text_turn("SUMMARY"), // compact() ruft den Provider — ohne Usage, zählt nicht mit
-            text_turn_usage(
-                "b",
-                Usage {
-                    input_tokens: 50,
-                    output_tokens: 10,
-                    ..Default::default()
-                },
-            ),
-        ])),
-    });
-    let store = Box::new(sepp_session::InMemorySessionStore::new());
-    let mut session = AgentSession::builder()
-        .provider(provider)
-        .model(test_model())
-        .tools(vec![])
-        .session(store)
-        .build()
-        .unwrap();
-
-    let noop = |_e: AgentEvent| {};
-    session
-        .prompt("erste", &noop, CancellationToken::new())
-        .await
-        .unwrap();
-    session.compact(None).await.unwrap();
-    session
-        .prompt("zweite", &noop, CancellationToken::new())
-        .await
-        .unwrap();
-
-    // Summe übersteht die Compaction (anders als last_usage, das genullt wird).
-    let u = session.total_usage();
-    assert_eq!(u.input_tokens, 150);
-    assert_eq!(u.output_tokens, 30);
-    assert_eq!(session.usage_turns(), 2);
-}
-
-#[tokio::test]
-async fn finalize_writes_summary_and_flushes() {
+async fn finalize_flushes_durably() {
     let dir = tempfile::tempdir().unwrap();
     let store = Box::new(sepp_session::JsonlSessionStore::create(dir.path()).unwrap());
     let provider = Arc::new(FakeProvider {
-        scripts: Mutex::new(VecDeque::from(vec![text_turn_usage(
-            "hi",
-            Usage {
-                input_tokens: 42,
-                output_tokens: 7,
-                ..Default::default()
-            },
-        )])),
+        scripts: Mutex::new(VecDeque::from(vec![text_turn("hi")])),
     });
     let mut session = AgentSession::builder()
         .provider(provider)
@@ -355,30 +240,21 @@ async fn finalize_writes_summary_and_flushes() {
         .await
         .unwrap();
     session.finalize().await.unwrap();
-    session.finalize().await.unwrap(); // idempotent: schreibt keinen zweiten Eintrag
+    session.finalize().await.unwrap(); // idempotent: mehrfaches Flushen ist erlaubt
+
     drop(session);
 
+    // Nach finalize() ist die Session durabel auf der Platte: erneutes Öffnen liefert die
+    // aufgezeichneten Nachrichten (User-Prompt + Assistant-Antwort).
     let infos = sepp_session::JsonlSessionStore::list(dir.path()).unwrap();
     assert_eq!(infos.len(), 1);
     let reopened = sepp_session::JsonlSessionStore::open(&infos[0].path).unwrap();
-    let summaries: Vec<_> = reopened
+    let messages = reopened
         .entries()
         .iter()
-        .filter_map(|e| match &e.payload {
-            sepp_session::EntryPayload::Custom { kind, data } if kind == "usage_summary" => {
-                Some(data.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        summaries.len(),
-        1,
-        "genau ein usage_summary erwartet (idempotent)"
-    );
-    assert_eq!(summaries[0]["input_tokens"], 42);
-    assert_eq!(summaries[0]["output_tokens"], 7);
-    assert_eq!(summaries[0]["turns"], 1);
+        .filter(|e| matches!(e.payload, sepp_session::EntryPayload::Message { .. }))
+        .count();
+    assert_eq!(messages, 2, "User-Prompt und Assistant-Antwort persistiert");
 }
 
 #[tokio::test]

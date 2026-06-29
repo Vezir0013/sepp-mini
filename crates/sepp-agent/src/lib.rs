@@ -62,13 +62,6 @@ pub struct AgentSession {
     session: Option<Box<dyn SessionStore>>,
     auto_compact_threshold: Option<u64>,
     last_usage: Option<Usage>,
-    /// Kumulative Token-Buchhaltung über die gesamte Session (überlebt Compaction, anders als
-    /// `last_usage`). Speist die `usage_summary` und die Mini-Tabelle beim Abschluss.
-    total_usage: Usage,
-    /// Anzahl abgeschlossener Provider-Streams (Modell-Roundtrips), nicht User-Prompts.
-    turns: usize,
-    /// Verhindert doppelte `usage_summary`-Einträge bei mehrfachem `finalize()`.
-    finalized: bool,
     hooks: Option<Box<dyn HookHost>>,
     hooks_started: bool,
 }
@@ -103,40 +96,11 @@ impl AgentSession {
         }
     }
 
-    /// Kumulativer Token-Verbrauch der Session (Summe über alle Provider-Streams). Hinweis:
-    /// Compaction-interne Provider-Calls und Sub-Agent-(`task`)-Tokens fließen NICHT ein, da deren
-    /// Usage nicht hochgereicht wird — bekannte, bewusste Lücke.
-    pub fn total_usage(&self) -> Usage {
-        self.total_usage
-    }
-
-    /// Anzahl abgeschlossener Modell-Roundtrips, die in [`Self::total_usage`] eingeflossen sind.
-    pub fn usage_turns(&self) -> usize {
-        self.turns
-    }
-
-    /// Schließt die Session ab: schreibt einmalig einen `usage_summary`-Eintrag (kumulative
-    /// Token-Buchhaltung) und macht den Store durabel (fsync). Idempotent — ein zweiter Aufruf
-    /// schreibt keinen weiteren Eintrag, flusht aber erneut. Frontends rufen dies beim Ende der
-    /// Konversation auf (One-shot nach dem Prompt, RPC beim Shutdown, TUI beim Quit).
+    /// Schließt die Session ab: macht den Store durabel (fsync). Idempotent — mehrfaches Aufrufen
+    /// flusht erneut. Frontends rufen dies beim Ende der Konversation auf (One-shot nach dem Prompt,
+    /// RPC beim Shutdown, TUI beim Quit).
     pub async fn finalize(&mut self) -> Result<()> {
-        if !self.finalized && self.turns > 0 {
-            let data = serde_json::json!({
-                "input_tokens": self.total_usage.input_tokens,
-                "output_tokens": self.total_usage.output_tokens,
-                "cache_read_tokens": self.total_usage.cache_read_tokens,
-                "cache_write_tokens": self.total_usage.cache_write_tokens,
-                "turns": self.turns,
-                "model": self.state.model.id,
-            });
-            self.record(EntryPayload::Custom {
-                kind: "usage_summary".into(),
-                data,
-            })?;
-            self.finalized = true;
-        }
-        self.flush_session().await?;
-        Ok(())
+        self.flush_session().await
     }
 
     /// Lesezugriff auf den Session-Store (für `/tree` etc.).
@@ -150,13 +114,10 @@ impl AgentSession {
     }
 
     /// Ersetzt den Session-Store und lädt dessen aktive Conversation (für `/new`, `/resume`).
-    /// Startet eine frische Token-Buchhaltung für die neue Session.
+    /// Setzt das Kontext-Budget (`last_usage`) für die neue Session zurück.
     pub fn set_session(&mut self, store: Box<dyn SessionStore>) {
         self.state.messages = store.path_messages();
         self.last_usage = None;
-        self.total_usage = Usage::default();
-        self.turns = 0;
-        self.finalized = false;
         self.session = Some(store);
     }
 
@@ -411,24 +372,9 @@ impl AgentSession {
             let mut assistant = Message::assistant(content);
             assistant.usage = usage;
             if let Some(u) = usage {
+                // Letzter Provider-Stream eicht das Kontext-Budget (Auto-Compaction-Schwelle).
                 self.last_usage = Some(u);
-                // Kumulativ aufaddieren (überlebt Compaction); saturating gegen u64-Überlauf.
-                self.total_usage.input_tokens =
-                    self.total_usage.input_tokens.saturating_add(u.input_tokens);
-                self.total_usage.output_tokens = self
-                    .total_usage
-                    .output_tokens
-                    .saturating_add(u.output_tokens);
-                self.total_usage.cache_read_tokens = self
-                    .total_usage
-                    .cache_read_tokens
-                    .saturating_add(u.cache_read_tokens);
-                self.total_usage.cache_write_tokens = self
-                    .total_usage
-                    .cache_write_tokens
-                    .saturating_add(u.cache_write_tokens);
             }
-            self.turns = self.turns.saturating_add(1);
             if let Some(h) = self.hooks.as_deref() {
                 let _ = h.dispatch(HookEvent::TurnEnd {
                     message: &assistant,
@@ -716,9 +662,6 @@ impl AgentSessionBuilder {
             session: self.session,
             auto_compact_threshold: self.auto_compact_threshold,
             last_usage: None,
-            total_usage: Usage::default(),
-            turns: 0,
-            finalized: false,
             hooks: self.hooks,
             hooks_started: false,
         })

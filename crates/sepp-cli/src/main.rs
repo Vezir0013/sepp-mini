@@ -780,22 +780,13 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 _ => {}
             };
 
-            // Ergebnis fangen, NICHT sofort `?` — damit Finalize + Token-Tabelle in BEIDEN
-            // Armen (Erfolg wie Fehler) laufen und die Session durabel abgeschlossen wird.
+            // Ergebnis fangen, NICHT sofort `?` — damit Finalize in BEIDEN Armen (Erfolg wie
+            // Fehler) läuft und die Session durabel abgeschlossen wird.
             let res = agent.prompt(&text, &on_event, cancel).await;
             println!();
             if let Err(e) = agent.finalize().await {
                 eprintln!("Hinweis: Session-Abschluss fehlgeschlagen: {e}");
             }
-            // Tabelle nach STDERR — stdout bleibt reiner Datenkanal (Pipe/RPC-Vertrag).
-            eprintln!(
-                "{}",
-                usage_table(
-                    &agent.total_usage(),
-                    agent.usage_turns(),
-                    model_label(agent.model())
-                )
-            );
             res?;
             Ok(())
         }
@@ -884,20 +875,10 @@ async fn run_rpc(agent: &mut AgentSession) -> anyhow::Result<()> {
             })),
         }
     }
-    // Shutdown (EOF/Ctrl+C): Session abschließen (usage_summary + fsync) und eine maschinenlesbare
-    // Token-Zusammenfassung als letzte RPC-Zeile emittieren.
+    // Shutdown (EOF/Ctrl+C): Session abschließen (fsync), damit der Audit-Trail durabel ist.
     if let Err(e) = agent.finalize().await {
         emit_rpc(&serde_json::json!({ "type": "error", "message": format!("finalize: {e}") }));
     }
-    let u = agent.total_usage();
-    emit_rpc(&serde_json::json!({
-        "type": "usage_summary",
-        "input_tokens": u.input_tokens,
-        "output_tokens": u.output_tokens,
-        "cache_read_tokens": u.cache_read_tokens,
-        "cache_write_tokens": u.cache_write_tokens,
-        "turns": agent.usage_turns(),
-    }));
     Ok(())
 }
 
@@ -939,25 +920,6 @@ async fn abort_with_audit(
     });
     let _ = store.flush().await;
     anyhow::anyhow!("{msg}")
-}
-
-/// Rendert eine kompakte Token-Verbrauchs-Tabelle für die Anzeige am Ende der Konversation.
-/// Felder spiegeln den `usage_summary`-Eintrag in der Session-Datei (Anzeige ↔ Datei konsistent).
-/// Cache-Werte sind bei OpenAI/z.ai 0 (die liefern keine Cache-Tokens) — schlicht als `0` gezeigt.
-pub(crate) fn usage_table(u: &sepp_core::Usage, turns: usize, model: &str) -> String {
-    let total = u.input_tokens.saturating_add(u.output_tokens);
-    format!(
-        "\n─ Token-Verbrauch ──────────────\n\
-         \x20 Modell        {model}\n\
-         \x20 Turns         {turns}\n\
-         \x20 Input         {}\n\
-         \x20 Output        {}\n\
-         \x20 Cache read    {}\n\
-         \x20 Cache write   {}\n\
-         \x20 Summe (I+O)   {total}\n\
-         ────────────────────────────────",
-        u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
-    )
 }
 
 /// Wählt das Session-Backend (JSONL-Default oder SQLite via `--sqlite`).
