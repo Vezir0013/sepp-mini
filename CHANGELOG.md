@@ -7,6 +7,18 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+- **z.ai / Zhipu-GLM als Provider** (`--provider zai` bzw. `SEPP_PROVIDER=zai`). Nutzt den
+  OpenAI-kompatiblen Endpunkt `https://api.z.ai/api/paas/v4` über den bestehenden OpenAI-Adapter —
+  kein neuer Parser. Key aus `ZAI_API_KEY` (Format `id.secret`), Endpunkt über `ZAI_BASE_URL`
+  überschreibbar (z. B. China-Region). GLM-4.6/4.5-Air/4.5-Flash sind in der Modell-Registry
+  hinterlegt (Default-Modell `glm-4.6`); Kontextfenster/Limits sind konservativ und gegen die
+  z.ai-Docs zu verifizieren. Fehlt der Key, scheitert der Start mit einem hilfreichen Hinweis.
+- **OpenAI-Adapter: `reasoning_content` → ThinkingDelta.** Reasoning-Modelle über
+  OpenAI-kompatible Endpunkte (z. B. GLM-4.6, DeepSeek-R1) streamen ihr Denken im Feld
+  `reasoning_content`; das wird jetzt als Thinking abgebildet statt verworfen (No-op für reine
+  Chat-Modelle).
+
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider

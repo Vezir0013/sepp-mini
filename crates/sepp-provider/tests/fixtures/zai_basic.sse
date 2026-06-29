@@ -1,0 +1,17 @@
+data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Der Nutzer "}}]}
+
+data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"will die Zeit."}}]}
+
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Hallo"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":" von GLM"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_zai_1","type":"function","function":{"name":"get_time","arguments":"{\"tz\": \"UTC\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":18,"completion_tokens":9,"total_tokens":27}}
+
+data: [DONE]

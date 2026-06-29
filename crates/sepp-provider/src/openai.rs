@@ -16,6 +16,11 @@ use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// z.ai (Zhipu/GLM) spricht den OpenAI-kompatiblen Chat-Completions-Endpunkt; das ist der
+/// internationale Default-Host. Über `ZAI_BASE_URL` überschreibbar (z. B. die China-Region
+/// `https://open.bigmodel.cn/api/paas/v4`).
+const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+
 /// Übersetzt OpenAI-SSE-Deltas (zustandsbehaftet) in [`StreamEvent`].
 #[derive(Debug, Default)]
 pub struct OpenAiMapper {
@@ -43,6 +48,20 @@ impl OpenAiMapper {
                     if !c.is_empty() {
                         out.push(StreamEvent::TextDelta {
                             text: c.to_string(),
+                        });
+                    }
+                }
+                // Reasoning-Modelle über OpenAI-kompatible Endpunkte (z. B. z.ai GLM-4.6,
+                // DeepSeek-R1) streamen ihr Denken in `reasoning_content` statt `content`.
+                // Als ThinkingDelta abbilden statt verwerfen; für reine Chat-Modelle (kein
+                // solches Feld) ist der Zweig ein No-op.
+                if let Some(rc) = delta
+                    .and_then(|d| d.get("reasoning_content"))
+                    .and_then(Value::as_str)
+                {
+                    if !rc.is_empty() {
+                        out.push(StreamEvent::ThinkingDelta {
+                            text: rc.to_string(),
                         });
                     }
                 }
@@ -181,6 +200,15 @@ impl OpenAiProvider {
         let key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
+        Ok(Self::new(key, base))
+    }
+
+    /// z.ai (Zhipu/GLM) über den OpenAI-kompatiblen Endpunkt. Key aus `ZAI_API_KEY`
+    /// (Format `id.secret`), base_url aus `ZAI_BASE_URL` (Default `https://api.z.ai/api/paas/v4`).
+    /// Anders als bei lokalen Endpunkten ist der Key Pflicht — fehlt er, scheitert der Aufruf am 401.
+    pub fn from_zai_env() -> Result<Self> {
+        let base = std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| ZAI_BASE_URL.to_string());
+        let key = std::env::var("ZAI_API_KEY").ok().filter(|k| !k.is_empty());
         Ok(Self::new(key, base))
     }
 

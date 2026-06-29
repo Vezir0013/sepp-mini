@@ -190,7 +190,7 @@ fn print_help() {
          \x20 -r, --resume [id]         Session per ID-Präfix wählen (ohne id: jüngste)\n\
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
          \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192)\n\
-         \x20     --provider <name>     anthropic (Default) | openai | local\n\
+         \x20     --provider <name>     anthropic (Default) | openai | local | zai\n\
          \x20     --rpc                 JSONL-RPC über stdin/stdout (statt TUI/One-shot)\n\
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
          \x20 -h, --help                Diese Hilfe\n\
@@ -201,6 +201,8 @@ fn print_help() {
          \x20 ANTHROPIC_API_KEY         Pflicht für Anthropic-Live-Aufrufe\n\
          \x20 OPENAI_API_KEY            OpenAI (optional bei lokalen Servern)\n\
          \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local)\n\
+         \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
+         \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
          \x20 SEPP_PROVIDER             Default-Provider, wenn --provider fehlt\n\
          \x20 RUST_LOG                  Log-Level (One-shot/RPC; Logs nach stderr)",
         default = models::DEFAULT_MODEL_ID
@@ -370,6 +372,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .or_else(|| std::env::var("SEPP_PROVIDER").ok())
         .unwrap_or_else(|| "anthropic".into());
     let is_openai = matches!(provider_kind.as_str(), "openai" | "local");
+    let is_zai = provider_kind == "zai";
     // Echtes OpenAI braucht einen Key — früh + klar scheitern statt erst beim 401 (lokale
     // Endpunkte via --provider local / OPENAI_BASE_URL bleiben key-optional).
     if provider_kind == "openai"
@@ -402,26 +405,48 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
              Konfiguration liegt unter ~/.sepp — anlegen mit `sepp init`."
         );
     }
+    // z.ai (Zhipu/GLM) braucht ZAI_API_KEY — anders als lokale OpenAI-Endpunkte ist der Key
+    // Pflicht, daher hier früh + hilfreich scheitern statt erst beim 401.
+    if provider_kind == "zai"
+        && std::env::var("ZAI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .is_none()
+    {
+        anyhow::bail!(
+            "ZAI_API_KEY nicht gesetzt — Key auf https://z.ai holen (Format id.secret) und setzen:\n  \
+             export ZAI_API_KEY=…\n  \
+             (optional ZAI_BASE_URL für einen abweichenden Endpunkt, z. B. die China-Region)"
+        );
+    }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
         "anthropic" => Arc::new(AnthropicProvider::from_env()?),
         "openai" | "local" => Arc::new(OpenAiProvider::from_env()?),
-        other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local)"),
+        "zai" => Arc::new(OpenAiProvider::from_zai_env()?),
+        other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai)"),
     };
 
     let model = match opts.model {
         Some(id) => match models::find_model(&id) {
             Some(m) => {
-                if is_openai {
+                // Registriertes Modell beim „falschen" Provider: warnen, aber durchlassen (der
+                // Mensch weiß evtl., was er tut). Greift z. B. für ein Anthropic-Modell auf dem
+                // OpenAI-/z.ai-Endpunkt — nicht aber für ein GLM-Modell auf `--provider zai`.
+                if m.provider != provider_kind && !(is_openai && m.provider != "anthropic") {
                     eprintln!(
-                        "Hinweis: Modell '{}' ist Anthropic-spezifisch, Provider ist {provider_kind} \
-                         — es wird trotzdem an den OpenAI-Endpunkt gesendet.",
-                        m.id
+                        "Hinweis: Modell '{}' ist für Provider '{}' gedacht, gewählt ist \
+                         '{provider_kind}' — es wird trotzdem an dessen Endpunkt gesendet.",
+                        m.id, m.provider
                     );
                 }
                 m
             }
             None => custom_model(id, &provider_kind),
         },
+        // z.ai: aktuelles Flaggschiff als Default.
+        None if is_zai => {
+            models::find_model("glm-4.6").unwrap_or_else(|| custom_model("glm-4.6".into(), "zai"))
+        }
         // OpenAI hat keine Modell-Registry hier → sinnvoller Default.
         None if is_openai => custom_model("gpt-4o-mini".into(), &provider_kind),
         None => models::default_model(),
