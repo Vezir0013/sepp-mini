@@ -7,6 +7,16 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+- FHS-Layout für System-Installationen (config_root `/etc/sepp` + state_root `/var/lib/sepp`,
+  `sepp init --system`, `install.sh --system`)
+
+## [0.1.8] - 2026-06-29
+
 ### Geändert
 - **`sepp uninstall --purge` entfernt jetzt auch projektlokale `.sepp`-Verzeichnisse.** Neben dem
   globalen Root (`~/.sepp`/`$SEPP_HOME`, enthält Keys/Trust) werden alle projektlokalen `.sepp`
@@ -33,12 +43,6 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   Ende der Konversation als `usage_summary`-Eintrag in der Session-Datei persistiert und als
   Mini-Tabelle angezeigt (One-shot/RPC → stderr, TUI → beim Quit). RPC emittiert beim Shutdown eine
   maschinenlesbare `usage_summary`-Zeile.
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.7] - 2026-06-29
 
