@@ -7,6 +7,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.7] - 2026-06-29
+
 ### Geändert
 - **`sepp init` legt die Konfig jetzt projektlokal an** (`<cwd>/.sepp`) statt global in `~/.sepp`
   und vertraut das Verzeichnis automatisch, damit es sofort geladen wird. Für die globale Wurzel:
@@ -17,12 +25,6 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - **`SEPP_HOME`** verlegt die globale Konfig-Wurzel konsistent für Anlegen, Laden und Trust
   (Default `~/.sepp`, Konvention wie `CARGO_HOME` — der Wert ist direkt die Wurzel). Behebt, dass
   die Konfig als root unter `/root/.sepp` landete.
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.6] - 2026-06-29
 
