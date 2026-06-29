@@ -35,8 +35,11 @@ antworte knapp.";
 enum Cmd {
     Version,
     Help,
-    /// `sepp init` — legt das `~/.sepp`-Skelett + Beispiel-`settings.toml` an.
-    Init,
+    /// `sepp init [--global]` — legt das Konfig-Skelett + Beispiel-`settings.toml` an: standardmäßig
+    /// projektlokal in `<cwd>/.sepp` (+ auto-trust); mit `--global` in `~/.sepp` (bzw. `$SEPP_HOME`).
+    Init {
+        global: bool,
+    },
     /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` auch `~/.sepp`).
     Uninstall {
         purge: bool,
@@ -74,7 +77,7 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Ok(Cmd::Init) => run_init(),
+        Ok(Cmd::Init { global }) => run_init(global),
         Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
@@ -89,7 +92,18 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     // Subcommands werden nur als **erstes** Positions-Token erkannt, damit Bare-Prompts wie
     // `sepp -p "init …"` unverändert bleiben und nicht im Prompt-Fallback unten landen.
     match args.first().map(String::as_str) {
-        Some("init") => return Ok(Cmd::Init),
+        Some("init") => {
+            let mut global = false;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--global" | "-g" => global = true,
+                    // expliziter Default — fürs Skripten/die Klarheit erlaubt.
+                    "--here" | "--local" => global = false,
+                    other => return Err(format!("init: unbekannte Option: {other}")),
+                }
+            }
+            return Ok(Cmd::Init { global });
+        }
         Some("uninstall") => {
             let mut purge = false;
             for a in &args[1..] {
@@ -223,7 +237,8 @@ fn print_help() {
          \x20 sepp                      Interaktive TUI (neue Session)\n\
          \x20 sepp -c                   TUI, jüngste Session fortsetzen\n\
          \x20 sepp -p \"<prompt>\"        Einen Prompt nicht-interaktiv ausführen\n\
-         \x20 sepp init                 ~/.sepp-Skelett + Beispiel-settings.toml anlegen\n\
+         \x20 sepp init                 Konfig-Skelett in ./.sepp anlegen (+ Projekt vertrauen)\n\
+         \x20 sepp init --global        stattdessen in ~/.sepp (bzw. $SEPP_HOME)\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch ~/.sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -247,6 +262,7 @@ fn print_help() {
          \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local)\n\
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
          \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
+         \x20 SEPP_HOME                 globale Konfig-Wurzel verlegen (Default ~/.sepp)\n\
          \x20 SEPP_PROVIDER             Default-Provider, wenn --provider fehlt\n\
          \x20 SEPP_THINK                Default-Reasoning (on/off), wenn --think/--no-think fehlt\n\
          \x20 RUST_LOG                  Log-Level (One-shot/RPC; Logs nach stderr)",
@@ -281,26 +297,44 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # net = ["mcp.example.com"]
 "#;
 
-/// `sepp init` — legt das `~/.sepp`-Skelett samt kommentierter Beispiel-`settings.toml` an
-/// (idempotent: vorhandene Dateien/Verzeichnisse bleiben unangetastet). Läuft ohne Tokio/Provider.
-fn run_init() -> ExitCode {
-    let root = match session::sepp_root() {
+/// `sepp init [--global]` — legt das Konfig-Skelett samt kommentierter Beispiel-`settings.toml` an
+/// (idempotent: vorhandene Dateien/Verzeichnisse bleiben unangetastet). Default ist projektlokal
+/// `<cwd>/.sepp`, das danach automatisch vertraut wird (sonst würde es beim Start nicht geladen);
+/// `--global` zielt auf `~/.sepp` bzw. `$SEPP_HOME`. Läuft ohne Tokio/Provider.
+fn run_init(global: bool) -> ExitCode {
+    let root = match if global {
+        session::sepp_root()
+    } else {
+        session::project_root()
+    } {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Fehler: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match init_config_at(&root) {
-        Ok(()) => {
-            println!("sepp init abgeschlossen: {}", root.display());
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("Fehler: {e}");
-            ExitCode::FAILURE
+    if let Err(e) = init_config_at(&root) {
+        eprintln!("Fehler: {e}");
+        return ExitCode::FAILURE;
+    }
+    // Projektlokale Erweiterungen werden nur nach Trust geladen — sonst legt `init` etwas an, das
+    // nie greift. Daher cwd direkt vertrauen; ein Fehler ist nicht fatal (manuell via `/trust`).
+    let mut trusted = false;
+    if !global {
+        match session::trust_current_project() {
+            Ok(()) => trusted = true,
+            Err(e) => {
+                eprintln!("Warnung: Projekt konnte nicht automatisch vertraut werden: {e}");
+                eprintln!("In der TUI nachholen mit: /trust");
+            }
         }
     }
+    println!(
+        "sepp init abgeschlossen: {}{}",
+        root.display(),
+        if trusted { " (vertraut)" } else { "" }
+    );
+    ExitCode::SUCCESS
 }
 
 /// Erzeugt das Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`) und eine kommentierte
@@ -837,10 +871,36 @@ mod tests {
 
     #[test]
     fn parse_init_only_as_first_arg() {
-        assert!(matches!(parse(&args(&["init"])).unwrap(), Cmd::Init));
+        // Ohne Flag: projektlokal (global == false).
+        assert!(matches!(
+            parse(&args(&["init"])).unwrap(),
+            Cmd::Init { global: false }
+        ));
         // Nicht erstes Token → bleibt Prompt, nicht Subcommand.
         let cmd = parse(&args(&["-p", "init"])).unwrap();
         assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "init"));
+    }
+
+    #[test]
+    fn parse_init_global_and_local_flags() {
+        assert!(matches!(
+            parse(&args(&["init", "--global"])).unwrap(),
+            Cmd::Init { global: true }
+        ));
+        assert!(matches!(
+            parse(&args(&["init", "-g"])).unwrap(),
+            Cmd::Init { global: true }
+        ));
+        // Explizite Default-Aliase.
+        assert!(matches!(
+            parse(&args(&["init", "--here"])).unwrap(),
+            Cmd::Init { global: false }
+        ));
+        assert!(matches!(
+            parse(&args(&["init", "--local"])).unwrap(),
+            Cmd::Init { global: false }
+        ));
+        assert!(parse(&args(&["init", "--bogus"])).is_err());
     }
 
     #[test]

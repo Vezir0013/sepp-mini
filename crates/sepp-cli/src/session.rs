@@ -24,9 +24,21 @@ fn home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Home-Verzeichnis nicht ermittelbar"))
 }
 
-/// `~/.sepp` — globale Wurzel für Sessions, Resources, Hooks, Trust.
+/// Globale Wurzel für Sessions, Resources, Hooks, Trust. Default `~/.sepp`; über die
+/// Umgebungsvariable `SEPP_HOME` direkt verlegbar (Konvention wie `CARGO_HOME` — der Wert IST die
+/// Wurzel, kein `.sepp` wird angehängt). Einzige Quelle für init/uninstall **und** alle Loader,
+/// daher zieht der Override überall konsistent mit (auch `trust.json`).
 pub fn sepp_root() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("SEPP_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     Ok(home()?.join(".sepp"))
+}
+
+/// Projektlokale Wurzel `<cwd>/.sepp` (Erweiterungen hier laden nur nach `/trust`). Nicht
+/// kanonisiert — spiegelt die Loader, damit `sepp init` und das Laden denselben Pfad treffen.
+pub fn project_root() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join(".sepp"))
 }
 
 fn cwd_canon() -> Result<PathBuf> {
@@ -48,7 +60,7 @@ pub fn project_session_dir() -> Result<PathBuf> {
 pub fn resource_roots(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut roots = vec![sepp_root()?];
     if project_trusted {
-        roots.push(std::env::current_dir()?.join(".sepp"));
+        roots.push(project_root()?);
     }
     Ok(roots)
 }
@@ -57,7 +69,7 @@ pub fn resource_roots(project_trusted: bool) -> Result<Vec<PathBuf>> {
 pub fn hook_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![sepp_root()?.join("hooks")];
     if project_trusted {
-        dirs.push(std::env::current_dir()?.join(".sepp").join("hooks"));
+        dirs.push(project_root()?.join("hooks"));
     }
     Ok(dirs)
 }
@@ -66,7 +78,7 @@ pub fn hook_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
 pub fn settings_paths(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut paths = vec![sepp_root()?.join("settings.toml")];
     if project_trusted {
-        paths.push(std::env::current_dir()?.join(".sepp").join("settings.toml"));
+        paths.push(project_root()?.join("settings.toml"));
     }
     Ok(paths)
 }
@@ -75,7 +87,7 @@ pub fn settings_paths(project_trusted: bool) -> Result<Vec<PathBuf>> {
 pub fn plugin_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![sepp_root()?.join("plugins")];
     if project_trusted {
-        dirs.push(std::env::current_dir()?.join(".sepp").join("plugins"));
+        dirs.push(project_root()?.join("plugins"));
     }
     Ok(dirs)
 }
@@ -159,4 +171,28 @@ pub fn sqlite_store(select: &SessionSelect) -> Result<Box<dyn SessionStore>> {
         SessionSelect::Resume(None) => Box::new(SqliteSessionStore::continue_recent(&dir)?),
     };
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sepp_root_honors_sepp_home_override() {
+        // Einziger Test im sepp-cli-Binary, der SEPP_HOME berührt → keine Race mit anderen.
+        std::env::set_var("SEPP_HOME", "/tmp/sepp-home-test");
+        assert_eq!(sepp_root().unwrap(), PathBuf::from("/tmp/sepp-home-test"));
+        // Leerer Wert zählt als nicht gesetzt → Default-Pfad endet auf ".sepp".
+        std::env::set_var("SEPP_HOME", "");
+        assert!(sepp_root().unwrap().ends_with(".sepp"));
+        std::env::remove_var("SEPP_HOME");
+        assert!(sepp_root().unwrap().ends_with(".sepp"));
+    }
+
+    #[test]
+    fn project_root_is_cwd_dot_sepp() {
+        let root = project_root().unwrap();
+        assert!(root.ends_with(".sepp"));
+        assert_eq!(root, std::env::current_dir().unwrap().join(".sepp"));
+    }
 }

@@ -7,6 +7,17 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geändert
+- **`sepp init` legt die Konfig jetzt projektlokal an** (`<cwd>/.sepp`) statt global in `~/.sepp`
+  und vertraut das Verzeichnis automatisch, damit es sofort geladen wird. Für die globale Wurzel:
+  `sepp init --global`. **Achtung: Default-Verhalten geändert** — wer das alte Verhalten will,
+  nutzt `--global`.
+
+### Hinzugefügt
+- **`SEPP_HOME`** verlegt die globale Konfig-Wurzel konsistent für Anlegen, Laden und Trust
+  (Default `~/.sepp`, Konvention wie `CARGO_HOME` — der Wert ist direkt die Wurzel). Behebt, dass
+  die Konfig als root unter `/root/.sepp` landete.
+
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
