@@ -7,6 +7,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.9] - 2026-06-29
+
 ### Geändert
 - **FHS-Layout: die globale Wurzel ist in `config_root` und `state_root` getrennt.** config_root
   (`settings.toml`, `skills/`, `prompts/`, `hooks/`, `plugins/`): `$SEPP_CONFIG_DIR` → `$SEPP_HOME`
@@ -28,12 +36,6 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - **`sepp uninstall --purge` räumt beide Wurzeln** (config_root + state_root) plus projektlokale
   `.sepp` via Trust-Registry. `install.sh --uninstall` delegiert nun an die Binary (behebt, dass es
   vorher `~/.sepp` hartkodierte und `SEPP_HOME` ignorierte).
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.8] - 2026-06-29
 
