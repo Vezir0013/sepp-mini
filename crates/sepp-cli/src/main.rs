@@ -35,13 +35,14 @@ antworte knapp.";
 enum Cmd {
     Version,
     Help,
-    /// `sepp init [--global]` — legt das Konfig-Skelett + Beispiel-`settings.toml` an: standardmäßig
-    /// projektlokal in `<cwd>/.sepp` (+ auto-trust); mit `--global` in `~/.sepp` (bzw. `$SEPP_HOME`).
+    /// `sepp init [--global|--system]` — legt das Konfig-Skelett an: projektlokal `<cwd>/.sepp`
+    /// (Default, + auto-trust), `--global` in `~/.sepp` (bzw. `$SEPP_HOME`), `--system` als
+    /// FHS-Layout (`/etc/sepp` config + `/var/lib/sepp` state).
     Init {
-        global: bool,
+        scope: session::InitScope,
     },
-    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` zusätzlich den globalen Root
-    /// `~/.sepp` und alle projektlokalen `.sepp` aus der Trust-Registry).
+    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` zusätzlich config- und
+    /// state-Root sowie alle projektlokalen `.sepp` aus der Trust-Registry).
     Uninstall {
         purge: bool,
     },
@@ -78,7 +79,7 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        Ok(Cmd::Init { global }) => run_init(global),
+        Ok(Cmd::Init { scope }) => run_init(scope),
         Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
@@ -94,16 +95,17 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     // `sepp -p "init …"` unverändert bleiben und nicht im Prompt-Fallback unten landen.
     match args.first().map(String::as_str) {
         Some("init") => {
-            let mut global = false;
+            let mut scope = session::InitScope::Project;
             for a in &args[1..] {
                 match a.as_str() {
-                    "--global" | "-g" => global = true,
+                    "--global" | "-g" => scope = session::InitScope::Global,
+                    "--system" => scope = session::InitScope::System,
                     // expliziter Default — fürs Skripten/die Klarheit erlaubt.
-                    "--here" | "--local" => global = false,
+                    "--here" | "--local" => scope = session::InitScope::Project,
                     other => return Err(format!("init: unbekannte Option: {other}")),
                 }
             }
-            return Ok(Cmd::Init { global });
+            return Ok(Cmd::Init { scope });
         }
         Some("uninstall") => {
             let mut purge = false;
@@ -240,7 +242,8 @@ fn print_help() {
          \x20 sepp -p \"<prompt>\"        Einen Prompt nicht-interaktiv ausführen\n\
          \x20 sepp init                 Konfig-Skelett in ./.sepp anlegen (+ Projekt vertrauen)\n\
          \x20 sepp init --global        stattdessen in ~/.sepp (bzw. $SEPP_HOME)\n\
-         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch ~/.sepp + projektlokale .sepp)\n\n\
+         \x20 sepp init --system        FHS-Layout: /etc/sepp (config) + /var/lib/sepp (state)\n\
+         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
          \x20 -c, --continue            Jüngste Session des Projekts fortsetzen\n\
@@ -298,41 +301,34 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # net = ["mcp.example.com"]
 "#;
 
-/// `.gitignore` für ein projektlokales `.sepp/`. Schließt lokale Laufzeitdaten (Session-Logs, Trust,
-/// SQLite) vom Versionsverwaltungs-Commit aus; das Config-Skelett (skills/, prompts/, settings.toml)
-/// bleibt teilbar. Die `.gitignore` selbst wird mitcommittet.
-const GITIGNORE_TEMPLATE: &str =
-    "# Von `sepp init` angelegt — lokale Laufzeitdaten nicht committen.\n\
-sessions/\n\
-trust.json\n\
-*.sqlite\n\
-*.sqlite-wal\n\
-*.sqlite-shm\n";
-
-/// `sepp init [--global]` — legt das Konfig-Skelett samt kommentierter Beispiel-`settings.toml` an
-/// (idempotent: vorhandene Dateien/Verzeichnisse bleiben unangetastet). Default ist projektlokal
-/// `<cwd>/.sepp`, das danach automatisch vertraut wird (sonst würde es beim Start nicht geladen);
-/// `--global` zielt auf `~/.sepp` bzw. `$SEPP_HOME`. Läuft ohne Tokio/Provider.
-fn run_init(global: bool) -> ExitCode {
-    let root = match if global {
-        session::sepp_root()
-    } else {
-        session::project_root()
-    } {
+/// `sepp init [--global|--system]` — legt das Konfig-Skelett samt kommentierter Beispiel-
+/// `settings.toml` an (idempotent). Default ist projektlokal `<cwd>/.sepp` (nur Config, danach
+/// auto-trust); `--global` zielt auf `~/.sepp` bzw. `$SEPP_HOME`; `--system` legt das FHS-Layout an
+/// (`/etc/sepp` config + `/var/lib/sepp` state, via `$SEPP_CONFIG_DIR`/`$SEPP_STATE_DIR` verlegbar).
+/// Sessions/Trust liegen zentral im state_root, daher legt der State-Teil `sessions/` an. Läuft ohne
+/// Tokio/Provider.
+fn run_init(scope: session::InitScope) -> ExitCode {
+    let (config, state) = match session::init_roots(scope) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Fehler: {e}");
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = init_config_at(&root) {
+    if let Err(e) = init_config_at(&config) {
         eprintln!("Fehler: {e}");
         return ExitCode::FAILURE;
+    }
+    if let Some(state) = &state {
+        if let Err(e) = init_state_at(state, scope == session::InitScope::System) {
+            eprintln!("Fehler: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     // Projektlokale Erweiterungen werden nur nach Trust geladen — sonst legt `init` etwas an, das
     // nie greift. Daher cwd direkt vertrauen; ein Fehler ist nicht fatal (manuell via `/trust`).
     let mut trusted = false;
-    if !global {
+    if scope == session::InitScope::Project {
         match session::trust_current_project() {
             Ok(()) => trusted = true,
             Err(e) => {
@@ -343,20 +339,32 @@ fn run_init(global: bool) -> ExitCode {
     }
     println!(
         "sepp init abgeschlossen: {}{}",
-        root.display(),
+        config.display(),
         if trusted { " (vertraut)" } else { "" }
     );
+    if let Some(state) = &state {
+        println!("  state: {}", state.display());
+    }
+    if scope == session::InitScope::System {
+        println!();
+        println!("Für eindeutige Laufzeit-Auflösung in die Shell-Umgebung aufnehmen");
+        println!("(z. B. /etc/profile.d/sepp.sh) — optional, da ein vorhandenes System-Setup auch");
+        println!("ohne Env gefunden wird:");
+        println!("  export SEPP_CONFIG_DIR={}", config.display());
+        if let Some(state) = &state {
+            println!("  export SEPP_STATE_DIR={}", state.display());
+        }
+        println!("Binary systemweit: SEPP_BIN_DIR=/usr/local/bin sh install.sh");
+    }
     ExitCode::SUCCESS
 }
 
-/// Erzeugt das Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`) und eine kommentierte
+/// Erzeugt das **Config**-Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`) und eine kommentierte
 /// `settings.toml` unterhalb `root`; vorhandene Pfade bleiben unverändert. Die Subdir-Namen müssen
 /// **exakt** den Lese-Literalen in `session.rs` entsprechen, sonst wird das Angelegte nie gelesen.
 fn init_config_at(root: &Path) -> anyhow::Result<()> {
     ensure_dir(root)?;
-    // `sessions` wird mit angelegt, damit der Session-Log-Ordner schon nach `init` existiert
-    // (vorher entstand er erst lazy beim ersten Lauf).
-    for sub in ["skills", "prompts", "hooks", "plugins", "sessions"] {
+    for sub in ["skills", "prompts", "hooks", "plugins"] {
         ensure_dir(&root.join(sub))?;
     }
     let settings = root.join("settings.toml");
@@ -366,15 +374,21 @@ fn init_config_at(root: &Path) -> anyhow::Result<()> {
         std::fs::write(&settings, SETTINGS_TEMPLATE)?;
         println!("angelegt: {}", settings.display());
     }
-    // `.gitignore`, damit projektlokale Session-Logs/Trust/SQLite nicht versehentlich committet
-    // werden (Sicherheit). Idempotent wie `settings.toml`.
-    let gitignore = root.join(".gitignore");
-    if gitignore.exists() {
-        println!("übersprungen (existiert): {}", gitignore.display());
-    } else {
-        std::fs::write(&gitignore, GITIGNORE_TEMPLATE)?;
-        println!("angelegt: {}", gitignore.display());
+    Ok(())
+}
+
+/// Legt die **State**-Wurzel an (`sessions/`). Bei `restrictive` (System-Installation) wird der
+/// State-Root auf `0700` gesetzt — hier landen künftig Trust und `auth.json`.
+fn init_state_at(root: &Path, restrictive: bool) -> anyhow::Result<()> {
+    ensure_dir(root)?;
+    ensure_dir(&root.join("sessions"))?;
+    #[cfg(unix)]
+    if restrictive {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = restrictive;
     Ok(())
 }
 
@@ -390,8 +404,9 @@ fn ensure_dir(p: &Path) -> anyhow::Result<()> {
 }
 
 /// `sepp uninstall [--purge]` — entfernt die laufende Binary (Unix: Selbstlöschung ist erlaubt,
-/// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich den globalen Root (`~/.sepp` bzw.
-/// `$SEPP_HOME`, enthält Keys/Trust) **und** alle projektlokalen `.sepp` aus der Trust-Registry.
+/// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich **beide** globalen Wurzeln
+/// (config_root und state_root, z. B. `/etc/sepp` und `/var/lib/sepp`) **und** alle projektlokalen
+/// `.sepp` aus der Trust-Registry.
 fn run_uninstall(purge: bool) -> ExitCode {
     match uninstall(purge) {
         Ok(()) => ExitCode::SUCCESS,
@@ -402,23 +417,34 @@ fn run_uninstall(purge: bool) -> ExitCode {
     }
 }
 
-/// Bestimmt die `.sepp`-Verzeichnisse, die `--purge` entfernt: jedes projektlokale
-/// `<trusted>/.sepp` (Anker via Trust-Registry) plus `<cwd>/.sepp`, gefolgt vom globalen Root.
-/// Dedupliziert; `global_root` steht **als letztes** (sauberes Reporting und damit `trust.json`
-/// darin erst nach dem Auslesen entfernt wird). Pure Funktion — ohne Env/FS testbar.
-fn purge_targets(global_root: &Path, trusted: &[PathBuf], cwd: Option<&Path>) -> Vec<PathBuf> {
+/// Bestimmt die Verzeichnisse, die `--purge` entfernt: jedes projektlokale `<trusted>/.sepp` (Anker
+/// via Trust-Registry) plus `<cwd>/.sepp`, gefolgt von den beiden globalen Wurzeln (config_root +
+/// state_root). Dedupliziert (config==state bei `~/.sepp`-Default ⇒ nur einmal); die globalen Roots
+/// stehen **am Ende** (sauberes Reporting und damit `trust.json` darin erst nach dem Auslesen
+/// entfernt wird). Pure Funktion — ohne Env/FS testbar.
+fn purge_targets(
+    config_root: &Path,
+    state_root: &Path,
+    trusted: &[PathBuf],
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = trusted.iter().map(|p| p.join(".sepp")).collect();
     if let Some(cwd) = cwd {
         candidates.push(cwd.join(".sepp"));
     }
+    let globals = [config_root.to_path_buf(), state_root.to_path_buf()];
     let mut out: Vec<PathBuf> = Vec::new();
     for c in candidates {
-        // Den globalen Root NICHT als Projekt-Ziel doppeln (Fall: `init` aus dem Home).
-        if c != *global_root && !out.contains(&c) {
+        // Eine globale Wurzel NICHT als Projekt-Ziel doppeln (Fall: `init` aus dem Home).
+        if !globals.contains(&c) && !out.contains(&c) {
             out.push(c);
         }
     }
-    out.push(global_root.to_path_buf());
+    for g in globals {
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
     out
 }
 
@@ -429,15 +455,16 @@ fn uninstall(purge: bool) -> anyhow::Result<()> {
     std::fs::remove_file(&exe)?;
     println!("Entfernt: {}", exe.display());
 
-    // Ziele VOR dem Löschen bestimmen: `trust.json` liegt im globalen Root und muss vorher gelesen
-    // werden (deshalb steht global in `purge_targets` zuletzt). cwd kanonisieren, damit es sauber
-    // gegen die kanonischen Trust-Keys dedupliziert.
-    let global = session::sepp_root()?;
+    // Ziele VOR dem Löschen bestimmen: `trust.json` liegt im state_root und muss vorher gelesen
+    // werden (deshalb stehen die globalen Roots in `purge_targets` zuletzt). cwd kanonisieren, damit
+    // es sauber gegen die kanonischen Trust-Keys dedupliziert.
+    let config = session::config_root()?;
+    let state = session::state_root()?;
     let trusted = session::trusted_projects().unwrap_or_default();
     let cwd = std::env::current_dir()
         .ok()
         .map(|c| std::fs::canonicalize(&c).unwrap_or(c));
-    let targets = purge_targets(&global, &trusted, cwd.as_deref());
+    let targets = purge_targets(&config, &state, &trusted, cwd.as_deref());
 
     if purge {
         for target in &targets {
@@ -1026,10 +1053,12 @@ mod tests {
 
     #[test]
     fn parse_init_only_as_first_arg() {
-        // Ohne Flag: projektlokal (global == false).
+        // Ohne Flag: projektlokal.
         assert!(matches!(
             parse(&args(&["init"])).unwrap(),
-            Cmd::Init { global: false }
+            Cmd::Init {
+                scope: session::InitScope::Project
+            }
         ));
         // Nicht erstes Token → bleibt Prompt, nicht Subcommand.
         let cmd = parse(&args(&["-p", "init"])).unwrap();
@@ -1037,24 +1066,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_init_global_and_local_flags() {
+    fn parse_init_scope_flags() {
+        use session::InitScope;
         assert!(matches!(
             parse(&args(&["init", "--global"])).unwrap(),
-            Cmd::Init { global: true }
+            Cmd::Init {
+                scope: InitScope::Global
+            }
         ));
         assert!(matches!(
             parse(&args(&["init", "-g"])).unwrap(),
-            Cmd::Init { global: true }
+            Cmd::Init {
+                scope: InitScope::Global
+            }
+        ));
+        assert!(matches!(
+            parse(&args(&["init", "--system"])).unwrap(),
+            Cmd::Init {
+                scope: InitScope::System
+            }
         ));
         // Explizite Default-Aliase.
-        assert!(matches!(
-            parse(&args(&["init", "--here"])).unwrap(),
-            Cmd::Init { global: false }
-        ));
-        assert!(matches!(
-            parse(&args(&["init", "--local"])).unwrap(),
-            Cmd::Init { global: false }
-        ));
+        for flag in ["--here", "--local"] {
+            assert!(matches!(
+                parse(&args(&["init", flag])).unwrap(),
+                Cmd::Init {
+                    scope: InitScope::Project
+                }
+            ));
+        }
         assert!(parse(&args(&["init", "--bogus"])).is_err());
     }
 
@@ -1072,64 +1112,81 @@ mod tests {
     }
 
     #[test]
-    fn purge_targets_collects_projects_then_global_last() {
-        let global = PathBuf::from("/root/.sepp");
+    fn purge_targets_projects_then_both_global_roots() {
+        // FHS-Fall: getrennte config/state-Roots, beide am Ende.
+        let config = PathBuf::from("/etc/sepp");
+        let state = PathBuf::from("/var/lib/sepp");
         let trusted = vec![PathBuf::from("/home/projA"), PathBuf::from("/srv/projB")];
         let cwd = PathBuf::from("/home/projA"); // bereits in trusted → kein Duplikat
-        let t = purge_targets(&global, &trusted, Some(&cwd));
+        let t = purge_targets(&config, &state, &trusted, Some(&cwd));
         assert_eq!(
             t,
             vec![
                 PathBuf::from("/home/projA/.sepp"),
                 PathBuf::from("/srv/projB/.sepp"),
-                PathBuf::from("/root/.sepp"),
+                PathBuf::from("/etc/sepp"),
+                PathBuf::from("/var/lib/sepp"),
             ]
         );
-        assert_eq!(t.last().unwrap(), &global, "global steht immer zuletzt");
     }
 
     #[test]
-    fn purge_targets_dedups_global_when_init_from_home() {
-        // `sepp init` aus dem Home: <home>/.sepp == globaler Root → nur einmal (als global).
-        let global = PathBuf::from("/root/.sepp");
+    fn purge_targets_dedups_single_root_default() {
+        // `~/.sepp`-Default: config == state → globale Wurzel nur einmal; `init` aus dem Home
+        // (<home>/.sepp == Wurzel) doppelt ebenfalls nicht.
+        let root = PathBuf::from("/root/.sepp");
         let trusted = vec![PathBuf::from("/root")];
-        let t = purge_targets(&global, &trusted, None);
+        let t = purge_targets(&root, &root, &trusted, None);
         assert_eq!(t, vec![PathBuf::from("/root/.sepp")]);
     }
 
     #[test]
     fn purge_targets_adds_untrusted_cwd() {
-        let global = PathBuf::from("/root/.sepp");
-        let t = purge_targets(&global, &[], Some(Path::new("/tmp/here")));
+        let root = PathBuf::from("/root/.sepp");
+        let t = purge_targets(&root, &root, &[], Some(Path::new("/tmp/here")));
         assert_eq!(
             t,
             vec![
                 PathBuf::from("/tmp/here/.sepp"),
-                PathBuf::from("/root/.sepp"),
+                PathBuf::from("/root/.sepp")
             ]
         );
     }
 
     #[test]
-    fn init_config_is_idempotent() {
+    fn init_config_is_idempotent_and_config_only() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(".sepp");
 
         init_config_at(&root).unwrap();
         let settings = root.join("settings.toml");
         let first = std::fs::read_to_string(&settings).unwrap();
-        for sub in ["skills", "prompts", "hooks", "plugins", "sessions"] {
+        for sub in ["skills", "prompts", "hooks", "plugins"] {
             assert!(root.join(sub).is_dir(), "{sub} sollte existieren");
         }
-        // `.gitignore` schützt projektlokale Laufzeitdaten (Sessions/Trust/SQLite) vor Commits.
+        // Config-only: KEIN sessions/ (zentral im state_root) und KEINE .gitignore mehr.
         assert!(
-            root.join(".gitignore").is_file(),
-            ".gitignore sollte existieren"
+            !root.join("sessions").exists(),
+            "sessions/ ist config-only nicht hier"
         );
+        assert!(!root.join(".gitignore").exists(), "keine .gitignore mehr");
 
         // Zweiter Lauf: kein Fehler, settings.toml unverändert (Nutzerinhalt wird nie überschrieben).
         init_config_at(&root).unwrap();
         assert_eq!(first, std::fs::read_to_string(&settings).unwrap());
+    }
+
+    #[test]
+    fn init_state_creates_sessions_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        init_state_at(&root, false).unwrap();
+        assert!(
+            root.join("sessions").is_dir(),
+            "sessions/ sollte existieren"
+        );
+        // idempotent
+        init_state_at(&root, false).unwrap();
     }
 
     #[tokio::test]

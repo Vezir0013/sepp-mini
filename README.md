@@ -141,8 +141,8 @@ cargo build --release -p sepp-cli --features sqlite
 Direkt aus der installierten Binary:
 
 ```bash
-sepp uninstall            # entfernt die Binary; ~/.sepp (Sessions + Config) bleibt erhalten
-sepp uninstall --purge    # entfernt zusätzlich ~/.sepp
+sepp uninstall            # entfernt die Binary; alle .sepp-Daten bleiben erhalten
+sepp uninstall --purge    # entfernt zusätzlich config- und state-Root + projektlokale .sepp (Trust-Registry)
 ```
 
 Alternativ über den Installer (z. B. wenn die Binary schon weg ist) — `install.sh` liegt nach
@@ -192,12 +192,17 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 | `SEPP_PROVIDER` | Default-Provider, wenn `--provider` fehlt |
 | `RUST_LOG` | Log-Level (One-shot/RPC; Logs nach stderr) |
 
-Globale Konfiguration und Erweiterungen liegen unter `~/.sepp/` (Sessions, `settings.toml` für
-MCP-Server, `plugins/` für WASM, `skills/`, `prompts/`, `hooks/`). Projektlokale Erweiterungen
-(`<repo>/.sepp/…`) laden erst, nachdem das Projekt **getrustet** wurde.
+Standardmäßig liegt alles unter der einen Wurzel `~/.sepp/`. Für System-Installationen ist die Wurzel
+**FHS-fähig** getrennt in **config_root** (`settings.toml`, `skills/`, `prompts/`, `hooks/`,
+`plugins/`; via `$SEPP_CONFIG_DIR`, Default `/etc/sepp` im Systemfall) und **state_root** (`sessions/`,
+`trust.json`; via `$SEPP_STATE_DIR`, Default `/var/lib/sepp`). `SEPP_HOME` setzt beide zugleich.
+Projektlokale **Config**-Erweiterungen (`<repo>/.sepp/…`, nur skills/prompts/hooks/plugins/settings)
+laden erst, nachdem das Projekt **getrustet** wurde; Sessions/Trust liegen zentral im state_root.
 
-**Erstkonfiguration:** `sepp init` legt das Skelett `~/.sepp/{skills,prompts,hooks,plugins}/` samt
-kommentierter Beispiel-`settings.toml` an. Der Befehl ist idempotent — vorhandene Dateien und
+**Erstkonfiguration:** `sepp init` legt das projektlokale Config-Skelett
+`./.sepp/{skills,prompts,hooks,plugins}/` samt kommentierter Beispiel-`settings.toml` an;
+`sepp init --global` zielt auf `~/.sepp`, `sepp init --system` legt das FHS-Layout
+(`/etc/sepp` + `/var/lib/sepp`) in einem Befehl an. Der Befehl ist idempotent — vorhandene Dateien und
 Verzeichnisse bleiben unangetastet.
 
 ## Erweiterungen

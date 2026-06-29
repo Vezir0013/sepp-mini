@@ -7,19 +7,22 @@
 #   curl -fsSL <raw-url>/install.sh | sh
 #   SEPP_REPO=owner/repo SEPP_BIN_DIR=~/.local/bin sh install.sh
 #   sh install.sh --from-source        # via `cargo install` (braucht Rust-Toolchain)
-#   sh install.sh --uninstall          # Binary entfernen (~/.sepp bleibt)
-#   sh install.sh --uninstall --purge  # zusätzlich ~/.sepp (Sessions + Config) löschen
+#   sh install.sh --system             # systemweit: Binary nach /usr/local/bin + `sepp init --system`
+#                                       # (FHS: /etc/sepp config + /var/lib/sepp state)
+#   sh install.sh --uninstall          # Binary entfernen (Nutzerdaten bleiben)
+#   sh install.sh --uninstall --purge  # zusätzlich config+state-Root + projektlokale .sepp löschen
 #   curl -fsSL <raw-url>/install.sh | sh -s -- --uninstall --purge   # via Pipe
 #
 # Umgebung:
-#   SEPP_REPO     GitHub "owner/repo" (Default: aus dem Repo-Override unten)
-#   SEPP_VERSION  Tag, z. B. v0.1.0 (Default: latest)
-#   SEPP_BIN_DIR  Zielverzeichnis (Default: ~/.local/bin)
+#   SEPP_REPO        GitHub "owner/repo" (Default: aus dem Repo-Override unten)
+#   SEPP_VERSION     Tag, z. B. v0.1.0 (Default: latest)
+#   SEPP_BIN_DIR     Zielverzeichnis der Binary (Default: ~/.local/bin; mit --system /usr/local/bin)
+#   SEPP_CONFIG_DIR  Config-Wurzel (FHS-Default /etc/sepp; sonst ~/.sepp)
+#   SEPP_STATE_DIR   State-Wurzel  (FHS-Default /var/lib/sepp; sonst ~/.sepp)
 set -eu
 
 REPO="${SEPP_REPO:-Vezir0013/sepp-mini}"
 VERSION="${SEPP_VERSION:-latest}"
-BIN_DIR="${SEPP_BIN_DIR:-$HOME/.local/bin}"
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "Fehler: $*"; exit 1; }
@@ -27,9 +30,10 @@ die() { log "Fehler: $*"; exit 1; }
 usage() {
     log "sepp mini Installer — Optionen:"
     log "  (ohne)            Vorgebaute Binary nach \$SEPP_BIN_DIR (Default ~/.local/bin) installieren"
+    log "  --system          Systemweit: Binary nach /usr/local/bin + 'sepp init --system' (FHS-Layout)"
     log "  --from-source     Via 'cargo install' aus dem Quellcode bauen (braucht Rust)"
-    log "  --uninstall       Binary entfernen (~/.sepp bleibt erhalten)"
-    log "  --uninstall --purge   zusätzlich ~/.sepp (Sessions + Config) löschen"
+    log "  --uninstall       Binary entfernen (Nutzerdaten bleiben erhalten)"
+    log "  --uninstall --purge   zusätzlich config+state-Root + projektlokale .sepp löschen"
     log "  -h, --help        Diese Hilfe"
 }
 
@@ -43,23 +47,26 @@ from_source() {
 
 uninstall() {
     target="${BIN_DIR}/sepp"
-    if [ -e "$target" ]; then
-        rm -f "$target"
-        log "Entfernt: $target"
-    else
-        log "Nicht gefunden (übersprungen): $target"
-    fi
-
-    config_dir="$HOME/.sepp"
-    if [ "$do_purge" = 1 ]; then
-        if [ -d "$config_dir" ]; then
-            rm -rf "$config_dir"
-            log "Entfernt (--purge): $config_dir"
+    # Ist die Binary noch da, übernimmt sie das vollständige Entfernen selbst — beide Wurzeln
+    # (config_root + state_root) und projektlokale .sepp via Trust-Registry, konsistent mit `sepp`.
+    if [ -x "$target" ]; then
+        if [ "$do_purge" = 1 ]; then
+            "$target" uninstall --purge
         else
-            log "Nicht gefunden (übersprungen): $config_dir"
+            "$target" uninstall
         fi
-    elif [ -d "$config_dir" ]; then
-        log "Hinweis: Nutzerdaten unter $config_dir bleiben erhalten."
+        return
+    fi
+    # Fallback (Binary schon weg): Datei-Reste anhand der aufgelösten Wurzeln aufräumen.
+    config_dir="${SEPP_CONFIG_DIR:-${SEPP_HOME:-$HOME/.sepp}}"
+    state_dir="${SEPP_STATE_DIR:-${SEPP_HOME:-$HOME/.sepp}}"
+    log "Nicht gefunden (übersprungen): $target"
+    if [ "$do_purge" = 1 ]; then
+        for d in "$config_dir" "$state_dir"; do
+            [ -d "$d" ] && rm -rf "$d" && log "Entfernt (--purge): $d"
+        done
+    else
+        log "Hinweis: Nutzerdaten ($config_dir, $state_dir) bleiben erhalten."
         log "         Zum vollständigen Entfernen erneut mit --purge ausführen."
     fi
     log "Deinstallation abgeschlossen."
@@ -69,18 +76,29 @@ uninstall() {
 mode=install
 do_purge=0
 do_from_source=0
+do_system=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --from-source) do_from_source=1 ;;
+        --system)      do_system=1 ;;
         --uninstall)   mode=uninstall ;;
         --purge)       do_purge=1 ;;
         -h|--help)     usage; exit 0 ;;
-        *) die "unbekannte Option: $1 (erlaubt: --from-source, --uninstall, --purge, --help)" ;;
+        *) die "unbekannte Option: $1 (erlaubt: --system, --from-source, --uninstall, --purge, --help)" ;;
     esac
     shift
 done
 
 [ "$do_purge" = 1 ] && [ "$mode" != uninstall ] && die "--purge ist nur zusammen mit --uninstall gültig"
+
+# Binary-Zielverzeichnis: --system installiert systemweit (sofern SEPP_BIN_DIR nicht explizit gesetzt).
+if [ -n "${SEPP_BIN_DIR:-}" ]; then
+    BIN_DIR="$SEPP_BIN_DIR"
+elif [ "$do_system" = 1 ]; then
+    BIN_DIR="/usr/local/bin"
+else
+    BIN_DIR="$HOME/.local/bin"
+fi
 
 if [ "$mode" = uninstall ]; then
     uninstall
@@ -123,3 +141,9 @@ case ":$PATH:" in
     *) log "Hinweis: ${BIN_DIR} ist nicht im PATH — ergänze es in deiner Shell-Konfig." ;;
 esac
 "${BIN_DIR}/sepp" --version || true
+
+# --system: FHS-Layout direkt mit anlegen (ein Schritt).
+if [ "$do_system" = 1 ]; then
+    log "Richte System-Layout ein (sepp init --system) …"
+    "${BIN_DIR}/sepp" init --system || die "sepp init --system fehlgeschlagen"
+fi

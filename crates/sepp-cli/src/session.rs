@@ -1,7 +1,19 @@
-//! Session-Ablage und Resource-/Trust-Wurzeln unter `~/.sepp` bzw. `<repo>/.sepp`.
+//! Pfad-Auflösung für sepp: getrennte **config**- und **state**-Wurzeln (FHS-fähig) plus die
+//! projektlokale Config-Wurzel `<repo>/.sepp`.
+//!
+//! - **config_root** (settings.toml, skills/, prompts/, hooks/, plugins/; künftig auth.json, 0600):
+//!   `$SEPP_CONFIG_DIR` → `$SEPP_HOME` → vorhandenes `~/.sepp` → vorhandenes `/etc/sepp` → `~/.sepp`.
+//! - **state_root** (sessions/, trust.json): analog mit `$SEPP_STATE_DIR` und `/var/lib/sepp`.
+//!
+//! Für normale Nutzer bleibt es damit die **eine** Wurzel `~/.sepp`; der FHS-Split greift nur, wenn
+//! die Env-Variablen gesetzt sind oder ein System-Setup unter `/etc/sepp` + `/var/lib/sepp` existiert
+//! (`sepp init --system`). `SEPP_HOME` setzt weiterhin beide Wurzeln zugleich (Rückwärtskompatibel).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -15,6 +27,17 @@ pub enum SessionSelect {
     Resume(Option<String>),
 }
 
+/// Ziel von `sepp init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitScope {
+    /// Projektlokal `<cwd>/.sepp` (nur Config), wird auto-vertraut.
+    Project,
+    /// Globale Nutzer-Wurzel (Default `~/.sepp`, via Env verlegbar).
+    Global,
+    /// System-Installation (Default `/etc/sepp` + `/var/lib/sepp`, via Env verlegbar).
+    System,
+}
+
 fn home() -> Result<PathBuf> {
     directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
@@ -22,19 +45,76 @@ fn home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Home-Verzeichnis nicht ermittelbar"))
 }
 
-/// Globale Wurzel für Sessions, Resources, Hooks, Trust. Default `~/.sepp`; über die
-/// Umgebungsvariable `SEPP_HOME` direkt verlegbar (Konvention wie `CARGO_HOME` — der Wert IST die
-/// Wurzel, kein `.sepp` wird angehängt). Einzige Quelle für init/uninstall **und** alle Loader,
-/// daher zieht der Override überall konsistent mit (auch `trust.json`).
-pub fn sepp_root() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("SEPP_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir));
+/// Reine Wurzel-Auflösung: explizite Variable > `SEPP_HOME`-Alias > Default. Leere Werte zählen als
+/// nicht gesetzt (Konvention wie bei `SEPP_HOME`).
+fn resolve_root(specific: Option<&OsStr>, home_alias: Option<&OsStr>, default: PathBuf) -> PathBuf {
+    if let Some(v) = specific.filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
     }
-    Ok(home()?.join(".sepp"))
+    if let Some(v) = home_alias.filter(|v| !v.is_empty()) {
+        return PathBuf::from(v);
+    }
+    default
 }
 
-/// Projektlokale Wurzel `<cwd>/.sepp` (Erweiterungen hier laden nur nach `/trust`). Nicht
-/// kanonisiert — spiegelt die Loader, damit `sepp init` und das Laden denselben Pfad treffen.
+/// Reiner Laufzeit-Default: bevorzugt die vorhandene User-Wurzel, fällt sonst auf eine vorhandene
+/// System-Wurzel zurück (so findet ein `sepp init --system`-Setup sich auch ohne gesetzte Env),
+/// sonst die User-Wurzel.
+fn runtime_default(user: PathBuf, system: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if exists(&user) {
+        user
+    } else if exists(system) {
+        system.to_path_buf()
+    } else {
+        user
+    }
+}
+
+/// Liest `$<specific_var>` und `$SEPP_HOME` und wendet [`resolve_root`] mit dem gegebenen Default an.
+fn resolve_named(specific_var: &str, default: PathBuf) -> PathBuf {
+    let specific = std::env::var_os(specific_var);
+    let alias = std::env::var_os("SEPP_HOME");
+    resolve_root(specific.as_deref(), alias.as_deref(), default)
+}
+
+/// Config-Wurzel: `settings.toml`, `skills/`, `prompts/`, `hooks/`, `plugins/` (künftig `auth.json`).
+pub fn config_root() -> Result<PathBuf> {
+    let default = runtime_default(home()?.join(".sepp"), Path::new("/etc/sepp"), |p| {
+        p.exists()
+    });
+    Ok(resolve_named("SEPP_CONFIG_DIR", default))
+}
+
+/// State-Wurzel: `sessions/`, `trust.json`.
+pub fn state_root() -> Result<PathBuf> {
+    let default = runtime_default(home()?.join(".sepp"), Path::new("/var/lib/sepp"), |p| {
+        p.exists()
+    });
+    Ok(resolve_named("SEPP_STATE_DIR", default))
+}
+
+/// `(config, state)`-Wurzeln, die `sepp init <scope>` anlegt. `Project` liefert nur die config-Wurzel
+/// (`<cwd>/.sepp`); Sessions/Trust liegen zentral im state_root, daher dort kein eigener State.
+pub fn init_roots(scope: InitScope) -> Result<(PathBuf, Option<PathBuf>)> {
+    match scope {
+        InitScope::Project => Ok((project_root()?, None)),
+        InitScope::Global => Ok((
+            resolve_named("SEPP_CONFIG_DIR", home()?.join(".sepp")),
+            Some(resolve_named("SEPP_STATE_DIR", home()?.join(".sepp"))),
+        )),
+        InitScope::System => Ok((
+            resolve_named("SEPP_CONFIG_DIR", PathBuf::from("/etc/sepp")),
+            Some(resolve_named(
+                "SEPP_STATE_DIR",
+                PathBuf::from("/var/lib/sepp"),
+            )),
+        )),
+    }
+}
+
+/// Projektlokale **Config**-Wurzel `<cwd>/.sepp` (nur skills/prompts/hooks/plugins/settings.toml;
+/// lädt erst nach `/trust`). Sessions und Trust liegen NICHT hier, sondern zentral im state_root.
+/// Nicht kanonisiert — spiegelt die Loader, damit `sepp init` und das Laden denselben Pfad treffen.
 pub fn project_root() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".sepp"))
 }
@@ -44,26 +124,29 @@ fn cwd_canon() -> Result<PathBuf> {
     Ok(cwd.canonicalize().unwrap_or(cwd))
 }
 
-/// `<cwd>/.sepp/sessions` — projektlokal (kein `hash(cwd)`-Unterordner mehr). Sessions reisen mit
-/// dem Projekt; `sepp init` legt den Ordner vor an und schützt ihn per `.gitignore`. Entkoppelt von
-/// `SEPP_HOME` (das nur noch globale Config/Resources/Trust verschiebt).
+/// `state_root()/sessions/<hash(cwd)>` — zentral, pro Arbeitsverzeichnis getrennt (stabiler
+/// `DefaultHasher`). Sessions sind State und liegen damit unter der state-Wurzel, nicht projektlokal.
 pub fn project_session_dir() -> Result<PathBuf> {
-    Ok(project_root()?.join("sessions"))
+    let mut h = DefaultHasher::new();
+    cwd_canon()?.hash(&mut h);
+    Ok(state_root()?
+        .join("sessions")
+        .join(format!("{:016x}", h.finish())))
 }
 
 /// Resource-Wurzeln (jede enthält optional `skills/`, `prompts/`, `themes/`): global immer,
 /// projektlokal nur, wenn das Projekt vertraut ist.
 pub fn resource_roots(project_trusted: bool) -> Result<Vec<PathBuf>> {
-    let mut roots = vec![sepp_root()?];
+    let mut roots = vec![config_root()?];
     if project_trusted {
         roots.push(project_root()?);
     }
     Ok(roots)
 }
 
-/// Hook-Verzeichnisse (`<root>/hooks`): global immer, projektlokal nur nach Trust.
+/// Hook-Verzeichnisse (`<config_root>/hooks`): global immer, projektlokal nur nach Trust.
 pub fn hook_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
-    let mut dirs = vec![sepp_root()?.join("hooks")];
+    let mut dirs = vec![config_root()?.join("hooks")];
     if project_trusted {
         dirs.push(project_root()?.join("hooks"));
     }
@@ -72,16 +155,16 @@ pub fn hook_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
 
 /// `settings.toml`-Pfade (`[[mcp.servers]]`): global immer, projektlokal nur nach Trust.
 pub fn settings_paths(project_trusted: bool) -> Result<Vec<PathBuf>> {
-    let mut paths = vec![sepp_root()?.join("settings.toml")];
+    let mut paths = vec![config_root()?.join("settings.toml")];
     if project_trusted {
         paths.push(project_root()?.join("settings.toml"));
     }
     Ok(paths)
 }
 
-/// WASM-Plugin-Verzeichnisse (`<root>/plugins`): global immer, projektlokal nur nach Trust.
+/// WASM-Plugin-Verzeichnisse (`<config_root>/plugins`): global immer, projektlokal nur nach Trust.
 pub fn plugin_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
-    let mut dirs = vec![sepp_root()?.join("plugins")];
+    let mut dirs = vec![config_root()?.join("plugins")];
     if project_trusted {
         dirs.push(project_root()?.join("plugins"));
     }
@@ -91,7 +174,7 @@ pub fn plugin_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
 // ---- Trust (Vorstufe zu sepp-policy, Phase 4) ---------------------------
 
 fn trust_file() -> Result<PathBuf> {
-    Ok(sepp_root()?.join("trust.json"))
+    Ok(state_root()?.join("trust.json"))
 }
 
 fn read_trust() -> Result<HashMap<String, bool>> {
@@ -118,7 +201,7 @@ pub fn trusted_projects() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Markiert das aktuelle Projekt als vertraut (persistiert in `~/.sepp/trust.json`).
+/// Markiert das aktuelle Projekt als vertraut (persistiert in `state_root()/trust.json`).
 pub fn trust_current_project() -> Result<()> {
     let key = cwd_canon()?.display().to_string();
     let mut map = read_trust()?;
@@ -185,15 +268,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sepp_root_honors_sepp_home_override() {
-        // Einziger Test im sepp-cli-Binary, der SEPP_HOME berührt → keine Race mit anderen.
-        std::env::set_var("SEPP_HOME", "/tmp/sepp-home-test");
-        assert_eq!(sepp_root().unwrap(), PathBuf::from("/tmp/sepp-home-test"));
-        // Leerer Wert zählt als nicht gesetzt → Default-Pfad endet auf ".sepp".
-        std::env::set_var("SEPP_HOME", "");
-        assert!(sepp_root().unwrap().ends_with(".sepp"));
-        std::env::remove_var("SEPP_HOME");
-        assert!(sepp_root().unwrap().ends_with(".sepp"));
+    fn resolve_root_precedence() {
+        let d = PathBuf::from("/default");
+        // explizit schlägt alles
+        assert_eq!(
+            resolve_root(
+                Some(OsStr::new("/spec")),
+                Some(OsStr::new("/home")),
+                d.clone()
+            ),
+            PathBuf::from("/spec")
+        );
+        // ohne explizit greift der SEPP_HOME-Alias
+        assert_eq!(
+            resolve_root(None, Some(OsStr::new("/home")), d.clone()),
+            PathBuf::from("/home")
+        );
+        // leere Werte zählen als nicht gesetzt
+        assert_eq!(
+            resolve_root(Some(OsStr::new("")), Some(OsStr::new("/home")), d.clone()),
+            PathBuf::from("/home")
+        );
+        assert_eq!(resolve_root(None, None, d.clone()), d);
+    }
+
+    #[test]
+    fn runtime_default_prefers_user_then_system() {
+        let user = PathBuf::from("/home/u/.sepp");
+        let sys = Path::new("/etc/sepp");
+        // User-Wurzel existiert → User
+        assert_eq!(runtime_default(user.clone(), sys, |_| true), user);
+        // nur System existiert → System
+        assert_eq!(
+            runtime_default(user.clone(), sys, |p| p == sys),
+            sys.to_path_buf()
+        );
+        // nichts existiert → User-Default
+        assert_eq!(runtime_default(user.clone(), sys, |_| false), user);
+    }
+
+    #[test]
+    fn roots_honor_env_overrides() {
+        // Einziger Test im sepp-cli-Binary, der Prozess-Env mutiert → bewusst seriell gehalten.
+        // Erst die System-Defaults bei sauberer Env (keine SEPP_*-Variablen gesetzt), dann Overrides.
+        let (c0, s0) = init_roots(InitScope::System).unwrap();
+        assert_eq!(c0, PathBuf::from("/etc/sepp"));
+        assert_eq!(s0, Some(PathBuf::from("/var/lib/sepp")));
+
+        std::env::set_var("SEPP_HOME", "/tmp/sepp-home-x");
+        assert_eq!(config_root().unwrap(), PathBuf::from("/tmp/sepp-home-x"));
+        assert_eq!(state_root().unwrap(), PathBuf::from("/tmp/sepp-home-x"));
+        // spezifische Variablen schlagen den SEPP_HOME-Alias
+        std::env::set_var("SEPP_CONFIG_DIR", "/tmp/cfg-x");
+        std::env::set_var("SEPP_STATE_DIR", "/tmp/state-x");
+        assert_eq!(config_root().unwrap(), PathBuf::from("/tmp/cfg-x"));
+        assert_eq!(state_root().unwrap(), PathBuf::from("/tmp/state-x"));
+        // System-Init-Ziele folgen denselben Overrides
+        let (c, s) = init_roots(InitScope::System).unwrap();
+        assert_eq!(c, PathBuf::from("/tmp/cfg-x"));
+        assert_eq!(s, Some(PathBuf::from("/tmp/state-x")));
+        for k in ["SEPP_HOME", "SEPP_CONFIG_DIR", "SEPP_STATE_DIR"] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn project_init_is_config_only() {
+        let (c, s) = init_roots(InitScope::Project).unwrap();
+        assert_eq!(c, project_root().unwrap());
+        assert!(s.is_none(), "Projekt-Init hat keinen eigenen State-Root");
     }
 
     #[test]
@@ -204,12 +347,13 @@ mod tests {
     }
 
     #[test]
-    fn project_session_dir_is_project_local_no_hash() {
-        // Projektlokal direkt unter `<cwd>/.sepp/sessions` — kein hash(cwd)-Segment mehr.
+    fn project_session_dir_is_state_root_sessions_hash() {
+        // Zentral unter state_root/sessions/<16-hex>. Struktur prüfen (nicht den absoluten state_root,
+        // der env-/fs-abhängig ist).
         let dir = project_session_dir().unwrap();
-        assert_eq!(dir, project_root().unwrap().join("sessions"));
-        assert!(dir.ends_with("sessions"));
-        // Letztes Segment ist „sessions", das Elternsegment „.sepp" — keine Hex-Hash-Ebene dazwischen.
-        assert_eq!(dir.parent().unwrap(), project_root().unwrap());
+        let hash = dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(hash.len(), 16, "16-stelliger Hex-Hash");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(dir.parent().unwrap().ends_with("sessions"));
     }
 }

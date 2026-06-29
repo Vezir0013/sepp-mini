@@ -7,13 +7,33 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geändert
+- **FHS-Layout: die globale Wurzel ist in `config_root` und `state_root` getrennt.** config_root
+  (`settings.toml`, `skills/`, `prompts/`, `hooks/`, `plugins/`): `$SEPP_CONFIG_DIR` → `$SEPP_HOME`
+  → vorhandenes `~/.sepp` → vorhandenes `/etc/sepp` → `~/.sepp`. state_root (`sessions/`,
+  `trust.json`): analog mit `$SEPP_STATE_DIR` und `/var/lib/sepp`. **Default bleibt die eine Wurzel
+  `~/.sepp`**; der Split greift nur, wenn die Env-Variablen gesetzt sind oder ein System-Setup
+  existiert. `SEPP_HOME` setzt weiterhin beide Wurzeln (rückwärtskompatibel).
+- **Sessions liegen wieder zentral** unter `state_root/sessions/<hash(cwd)>/` (kehrt die
+  projektlokale Ablage aus 0.1.8 um). Projektlokales `<repo>/.sepp` enthält jetzt **nur Config**
+  (skills/prompts/hooks/plugins/settings.toml); `sepp init` legt dort kein `sessions/` und keine
+  `.gitignore` mehr an.
+
+### Hinzugefügt
+- **`sepp init --system`**: legt das FHS-Layout in einem Befehl an (`/etc/sepp` config +
+  `/var/lib/sepp` state, state_root `0700`) und nennt die passenden Env-Exports. Über
+  `$SEPP_CONFIG_DIR`/`$SEPP_STATE_DIR` umlenkbar.
+- **`install.sh --system`**: installiert die Binary nach `/usr/local/bin` und ruft `sepp init
+  --system` — Systeminstallation in einem Schritt.
+- **`sepp uninstall --purge` räumt beide Wurzeln** (config_root + state_root) plus projektlokale
+  `.sepp` via Trust-Registry. `install.sh --uninstall` delegiert nun an die Binary (behebt, dass es
+  vorher `~/.sepp` hartkodierte und `SEPP_HOME` ignorierte).
+
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
-- FHS-Layout für System-Installationen (config_root `/etc/sepp` + state_root `/var/lib/sepp`,
-  `sepp init --system`, `install.sh --system`)
 
 ## [0.1.8] - 2026-06-29
 
