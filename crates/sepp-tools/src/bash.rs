@@ -1,14 +1,22 @@
 //! `bash` — Shell-Kommando mit Timeout, Cancellation, Prozess-Tree-Kill, `truncate_tail`.
+//!
+//! Im Hintergrund gestartete Prozesse (`cmd &`) erben die stdout/stderr-Pipe und halten sie
+//! offen, solange sie leben. Das Tool wartet daher nach Exit des direkten Kindprozesses nur
+//! eine kurze Drain-Frist (`POST_EXIT_DRAIN_MS`) und kehrt dann zurück, statt auf Pipe-EOF zu
+//! blockieren.
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::{Result, SeppError, ToolResult, ToolSpec};
@@ -17,6 +25,11 @@ use crate::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::{schema_for, Tool};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+
+/// Frist nach Exit des direkten Kindprozesses, in der noch gepufferte Ausgabe abgeholt wird,
+/// bevor das Tool zurückkehrt — auch wenn ein im Hintergrund gestarteter Enkelprozess (`cmd &`)
+/// die geerbte stdout/stderr-Pipe offen hält. Verhindert das Blockieren auf Pipe-EOF.
+const POST_EXIT_DRAIN_MS: u64 = 1_000;
 
 /// Provider-Secrets, die nicht an Shell-Kommandos durchgereicht werden (Exfiltrationsschutz).
 const SECRET_ENV_VARS: &[&str] = &[
@@ -41,6 +54,36 @@ enum Outcome {
     Cancelled,
 }
 
+/// Liest `reader` chunk-weise in `buf`, bis EOF/Fehler. Solange `stop` `false` ist, wird die
+/// Ausgabe gesammelt; danach wird nur noch geleert (Pipe drainen, ohne den Puffer wachsen zu
+/// lassen) — so bleibt ein im Hintergrund gestarteter Prozess lauffähig, ohne das Tool zu
+/// blockieren. Die Ausgabe landet im geteilten `buf`.
+fn spawn_reader<R>(
+    reader: Option<R>,
+    buf: Arc<Mutex<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut r) = reader else {
+            return;
+        };
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if !stop.load(Ordering::Relaxed) {
+                        buf.lock().await.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Führt ein Shell-Kommando aus.
 pub struct BashTool;
 
@@ -51,7 +94,8 @@ impl Tool for BashTool {
             name: "bash".into(),
             label: "Bash".into(),
             description: "Führt ein Shell-Kommando via `sh -c` aus. Mit Timeout (Default 120s) \
-                          und Prozess-Tree-Kill. stdout+stderr werden (vom Ende her) gekürzt."
+                          und Prozess-Tree-Kill. stdout+stderr werden (vom Ende her) gekürzt. \
+                          Im Hintergrund gestartete Prozesse (`&`) laufen nach Rückkehr weiter."
                 .into(),
             parameters: schema_for::<BashParams>(),
         }
@@ -97,23 +141,14 @@ impl Tool for BashTool {
             .map_err(|e| SeppError::Tool(format!("bash spawn: {e}")))?;
         let pid = child.id();
 
-        // stdout/stderr nebenläufig vollständig lesen (verhindert Pipe-Deadlocks).
-        let mut out_handle = child.stdout.take();
-        let mut err_handle = child.stderr.take();
-        let out_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(s) = out_handle.as_mut() {
-                let _ = s.read_to_end(&mut buf).await;
-            }
-            buf
-        });
-        let err_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(s) = err_handle.as_mut() {
-                let _ = s.read_to_end(&mut buf).await;
-            }
-            buf
-        });
+        // stdout/stderr nebenläufig in geteilte Puffer lesen (verhindert Pipe-Deadlocks bei
+        // großer Ausgabe). `stop` schaltet die Reader nach dem Detachen auf reines Drainen um,
+        // damit ein im Hintergrund weiterlaufender Prozess die Pipe nicht füllt.
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+        let err_buf = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let out_task = spawn_reader(child.stdout.take(), out_buf.clone(), stop.clone());
+        let err_task = spawn_reader(child.stderr.take(), err_buf.clone(), stop.clone());
 
         let outcome = tokio::select! {
             status = child.wait() => match status {
@@ -129,8 +164,23 @@ impl Tool for BashTool {
             let _ = child.wait().await; // Zombie ernten
         }
 
-        let stdout_bytes = out_task.await.unwrap_or_default();
-        let stderr_bytes = err_task.await.unwrap_or_default();
+        // Restausgabe einsammeln — aber NICHT unbegrenzt auf Pipe-EOF warten: ein im Hintergrund
+        // gestarteter Enkelprozess (`server &`) erbt die Pipe und hält sie offen, solange er
+        // lebt. Nach kurzer Drain-Frist werden die noch laufenden Reader detacht (das Droppen der
+        // JoinHandles im timeout-Block bricht sie nicht ab — sie drainen die Pipe weiter, damit
+        // der Hintergrundprozess nicht blockiert); weitergearbeitet wird mit dem bis dahin
+        // Gelesenen. Bei Timeout/Cancel ist der Tree bereits gekillt → EOF kommt sofort.
+        let drained = tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_MS), async {
+            let _ = out_task.await;
+            let _ = err_task.await;
+        })
+        .await;
+        if drained.is_err() {
+            // Detachte Reader nicht mehr in die Puffer schreiben lassen (Speicher beschränken).
+            stop.store(true, Ordering::Relaxed);
+        }
+        let stdout_bytes = std::mem::take(&mut *out_buf.lock().await);
+        let stderr_bytes = std::mem::take(&mut *err_buf.lock().await);
 
         // Bei Abbruch durch den Nutzer: harter Abbruch.
         if matches!(outcome, Outcome::Cancelled) {
@@ -271,6 +321,30 @@ mod tests {
                 .await;
             assert!(matches!(res, Err(SeppError::Aborted)));
         });
+    }
+
+    #[test]
+    fn background_process_does_not_hang() {
+        // Regression (Hänger an offener Pipe): Ein im Hintergrund gestarteter, langlebiger
+        // Prozess (`sleep 30 &`) erbt die stdout/stderr-Pipe des Kommandos. Der direkte
+        // Kindprozess (`sh`) endet sofort, die Pipe bleibt aber offen, solange der
+        // Hintergrundprozess lebt. Das Tool darf NICHT auf Pipe-EOF warten, sondern muss nach
+        // Kind-Exit + kurzer Drain-Frist mit der bis dahin gelesenen Ausgabe zurückkehren.
+        let start = std::time::Instant::now();
+        let r = run("echo started; sleep 30 &", Some(60_000));
+        assert!(!r.is_error, "exit: {:?}", r.details["exit_code"]);
+        assert!(
+            matches!(&r.content[0],
+                sepp_core::ContentBlock::Text { text } if text.contains("started")),
+            "Ausgabe vor dem Backgrounding muss erhalten bleiben: {:?}",
+            r.content[0]
+        );
+        // Muss lange vor den 30s des Hintergrundprozesses zurückkehren.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Tool hing an der offenen Pipe (dauerte {:?})",
+            start.elapsed()
+        );
     }
 
     #[test]
