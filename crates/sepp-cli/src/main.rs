@@ -250,7 +250,7 @@ fn print_help() {
          \x20 -r, --resume [id]         Session per ID-Präfix wählen (ohne id: jüngste)\n\
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
          \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192)\n\
-         \x20     --provider <name>     anthropic (Default) | openai | local | zai\n\
+         \x20     --provider <name>     anthropic (Default) | openai | local | zai | mlx\n\
          \x20                           (ohne Angabe aus -m abgeleitet, z. B. glm-* → zai)\n\
          \x20     --think / --no-think  Reasoning erzwingen/abschalten (z.ai: Default an)\n\
          \x20     --hide-thinking       Reasoning nicht anzeigen (Default: gedimmt sichtbar)\n\
@@ -263,7 +263,8 @@ fn print_help() {
          Umgebung:\n\
          \x20 ANTHROPIC_API_KEY         Pflicht für Anthropic-Live-Aufrufe\n\
          \x20 OPENAI_API_KEY            OpenAI (optional bei lokalen Servern)\n\
-         \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local)\n\
+         \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local/mlx)\n\
+         \x20                           (--provider mlx: Default http://localhost:1234/v1 = LM Studio)\n\
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
          \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
          \x20 SEPP_HOME                 globale Konfig-Wurzel verlegen (Default ~/.sepp)\n\
@@ -550,6 +551,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .unwrap_or_else(|| "anthropic".into());
     let is_openai = matches!(provider_kind.as_str(), "openai" | "local");
     let is_zai = provider_kind == "zai";
+    let is_mlx = provider_kind == "mlx";
     // Reasoning-Stufe auflösen: --think/--no-think > SEPP_THINK > Provider-Default (z.ai an, sonst aus).
     let thinking = resolve_thinking(
         opts.think,
@@ -619,11 +621,46 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         )
         .await);
     }
+    // mlx: Modell muss explizit gewählt werden — sepp schreibt kein Modell vor; LM Studio bedient
+    // das jeweils geladene Modell, dessen Identifier der Nutzer mit -m angibt.
+    if is_mlx && opts.model.is_none() {
+        let msg =
+            "Kein Modell angegeben. Wähle mit -m <modell> das in LM Studio geladene Modell\n  \
+             (Identifier siehst du in LM Studio oder via GET http://localhost:1234/v1/models).";
+        return Err(abort_with_audit(
+            store.as_mut(),
+            msg,
+            serde_json::json!({ "reason": "missing_model", "provider": "mlx" }),
+        )
+        .await);
+    }
+    // mlx: früh + hilfreich scheitern, wenn LM Studios lokaler Server nicht läuft — statt rohem
+    // "connection refused" erst im Stream. Nur für den Default-Endpunkt; bei gesetztem
+    // OPENAI_BASE_URL vertraut sepp der Nutzerkonfiguration (abweichender Host/Port).
+    if is_mlx && std::env::var_os("OPENAI_BASE_URL").is_none() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1234));
+        let up = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700))
+            .is_ok();
+        if !up {
+            let msg = "Kein lokaler MLX-Server auf http://localhost:1234 erreichbar.\n  \
+                 - LM Studio öffnen → Developer → Local Server starten (Port 1234)\n  \
+                 - dort ein tool-fähiges MLX-Modell (mit Function-/Tool-Calling) laden\n  \
+                 - LM Studio noch nicht installiert? https://lmstudio.ai\n  \
+                 - abweichender Endpunkt/Port? OPENAI_BASE_URL setzen.";
+            return Err(abort_with_audit(
+                store.as_mut(),
+                msg,
+                serde_json::json!({ "reason": "mlx_server_unreachable", "provider": "mlx" }),
+            )
+            .await);
+        }
+    }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
         "anthropic" => Arc::new(AnthropicProvider::from_env()?),
         "openai" | "local" => Arc::new(OpenAiProvider::from_env()?),
+        "mlx" => Arc::new(OpenAiProvider::mlx_from_env()?),
         "zai" => Arc::new(ZaiProvider::from_env()?),
-        other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai)"),
+        other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai|mlx)"),
     };
 
     let model = match opts.model {
@@ -949,8 +986,8 @@ fn build_store(
 }
 
 /// Aussagekräftiges Modell-Label für die Anzeige: bevorzugt `display_name`, fällt aber auf die `id`
-/// zurück, wenn das Modell der generische Custom-Platzhalter `(custom)` ist (so erscheint z. B.
-/// `qwen3.5:9b` statt `(custom)` für lokale Ollama-Modelle).
+/// zurück, wenn das Modell der generische Custom-Platzhalter `(custom)` ist (so erscheint die
+/// konkrete Modell-ID statt `(custom)` bei lokalen bzw. eigenen Modellen).
 pub(crate) fn model_label(model: &Model) -> &str {
     if model.display_name == "(custom)" {
         &model.id

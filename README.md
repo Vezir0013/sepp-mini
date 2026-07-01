@@ -43,7 +43,8 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
   Prompt-Templates→Slash-Commands), **Hooks** (in-process Rhai), **WASM-Plugins** (memory-sandboxed,
   capability-gated, via `wasmi`), **MCP-Server** (out-of-process, OS-sandboxed).
 - 🔌 **Multi-Provider hinter einem Trait:** Anthropic (Messages API) und OpenAI-kompatibel —
-  inklusive lokaler Endpunkte (Ollama/vLLM) über `OPENAI_BASE_URL`.
+  inklusive lokaler Endpunkte (Ollama/vLLM) über `OPENAI_BASE_URL`, plus **`--provider mlx`** für
+  lokale Apple-Silicon-Inferenz via **LM Studio** (verbindet automatisch zu `localhost:1234`).
 - 🖥️ **Drei Modi, ein Kern:** interaktive **TUI**, **One-shot** (`-p`) und **JSONL-RPC** (`--rpc`).
 - 🌳 **Robuste Sessions:** baumstrukturiert mit Branching und Compaction, persistent als JSONL
   (Default) oder optional **SQLite** (`--features sqlite`).
@@ -96,6 +97,27 @@ Installation prüfen:
 ```bash
 sepp --version
 ```
+
+### Lokale Modelle auf macOS — MLX via LM Studio (empfohlen)
+
+sepp führt die Inferenz nicht selbst aus; die **MLX-Infrastruktur stellst du über
+[LM Studio](https://lmstudio.ai) bereit** (Apple-Silicon-nativ, spürbar schneller als
+llama.cpp/Ollama). sepp und LM Studio werden **getrennt** installiert:
+
+1. **LM Studio installieren** und öffnen.
+2. **MLX-Runtime** aktiv lassen und ein **tool-fähiges Modell deiner Wahl** laden (sepp gibt kein
+   Modell vor — wichtig ist nur Function-/Tool-Calling-Fähigkeit).
+3. **Local Server starten:** Developer → *Start Server* (Port **1234**).
+4. sepp verbindet sich **automatisch** — kein API-Key, kein `OPENAI_BASE_URL` nötig:
+
+```bash
+sepp --provider mlx -m <in-lm-studio-geladenes-modell> -p "Was liegt in diesem Verzeichnis?"
+```
+
+`--provider mlx` zielt ohne weitere Konfiguration auf `http://localhost:1234/v1`. Läuft der Server
+nicht, bricht sepp mit einer klaren Anleitung ab statt mit einem rohen Verbindungsfehler. Ein
+abweichender Endpunkt/Port lässt sich per `OPENAI_BASE_URL` setzen; `-m` muss dem in LM Studio
+geladenen Modell entsprechen (Identifier via `GET http://localhost:1234/v1/models`).
 
 ### Vorgebaute Binary für Linux ARM (aarch64)
 

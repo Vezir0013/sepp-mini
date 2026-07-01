@@ -15,6 +15,9 @@ use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+/// Default-Endpunkt des `mlx`-Presets: LM Studios lokaler OpenAI-kompatibler Server (Port 1234).
+/// Über `OPENAI_BASE_URL` überschreibbar (abweichender Host/Port).
+const MLX_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Welcher OpenAI-kompatible Dialekt gesprochen wird. Steuert anbieterspezifische Body-Felder:
 /// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
@@ -215,6 +218,18 @@ impl OpenAiProvider {
     pub fn from_env() -> Result<Self> {
         let base =
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        Ok(Self::new(key, base))
+    }
+
+    /// `mlx`-Preset (`--provider mlx`): lokaler LM-Studio-Server. base_url aus `OPENAI_BASE_URL`
+    /// (Default [`MLX_BASE_URL`] = `http://localhost:1234/v1`), Key optional. Fällt bewusst NICHT
+    /// auf api.openai.com zurück wie [`Self::from_env`] — so verbindet `sepp --provider mlx` ohne
+    /// Env-Konfiguration direkt zu LM Studio.
+    pub fn mlx_from_env() -> Result<Self> {
+        let base = std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| MLX_BASE_URL.to_string());
         let key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
@@ -618,5 +633,16 @@ mod tests {
         let m = test_model(true);
         let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn mlx_from_env_defaults_to_local_lm_studio() {
+        // Ohne OPENAI_BASE_URL zielt das mlx-Preset auf LM Studios lokalen Port (1234) —
+        // NICHT auf api.openai.com. Genau das macht `sepp --provider mlx` zero-config und
+        // vermeidet die 401-Fehlerklasse des lokalen Falls.
+        std::env::remove_var("OPENAI_BASE_URL");
+        let p = OpenAiProvider::mlx_from_env().expect("mlx_from_env");
+        assert_eq!(p.base_url, MLX_BASE_URL);
+        assert_ne!(p.base_url, DEFAULT_BASE_URL);
     }
 }
