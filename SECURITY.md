@@ -31,14 +31,16 @@ das jeweils jüngste Release ein.
 Abgewehrt wird vor allem eine **bösartige oder schlampige Erweiterung** (Hook, WASM-Plugin,
 MCP-Server), die geheime Dateien liest, API-Keys exfiltriert oder nach Hause telefoniert, sowie
 **Prompt-Injection** über Tool-Ausgaben. Durchsetzung: Default-deny-Capabilities, OS-Sandbox
-(Landlock) für Subprozesse, Environment-Scrubbing, capability-gegatete WASM-Host-Funktionen,
-keine Secrets im Klartext an Erweiterungen oder Logs.
+(Linux: Landlock, macOS: Seatbelt) für Subprozesse, Environment-Scrubbing, capability-gegatete
+WASM-Host-Funktionen, keine Secrets im Klartext an Erweiterungen oder Logs.
 
 **Nicht** im Modell: ein bösartiger Kern selbst, Kernel-0days, physischer Zugriff.
 
 ## Bekannte Einschränkungen (v0.1)
 
-- Landlock begrenzt aktuell nur das **Dateisystem**; eine Netz-Sandbox für MCP-Subprozesse
-  (seccomp/Namespaces) ist geplant.
-- Auf Plattformen ohne durchsetzbares Landlock (z. B. nicht-Linux) gibt es kein OS-FS-Sandboxing;
-  der Kern warnt bzw. verfährt fail-closed, wo möglich.
+- Die OS-Sandbox (Landlock/Seatbelt) begrenzt aktuell nur das **Dateisystem**; eine Netz-Sandbox
+  für MCP-Subprozesse (seccomp/Namespaces) ist geplant.
+- Dateisystem-Sandboxing gibt es auf **Linux** (Landlock) und **macOS** (Seatbelt); lässt es sich
+  nicht durchsetzen, wird fail-closed verfahren.
+- Auf Plattformen ohne Adapter (Windows/BSD) gibt es **kein** OS-FS-Sandboxing — nur
+  Environment-Scrubbing, mit deutlicher Warnung.

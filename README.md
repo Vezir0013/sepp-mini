@@ -37,8 +37,8 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
 
 - 🔒 **Sandbox-by-default (das Alleinstellungsmerkmal).** Default ist **deny**. Code-tragende
   Erweiterungen deklarieren Capabilities (`FsRead`/`FsWrite`/`Net`/`Env`/`Exec`); der Kern parst
-  sie zu einer Policy und erzwingt sie an der Grenze — Linux via **Landlock**, plus
-  Environment-Scrubbing (Subprozesse sehen keine geerbten Secrets).
+  sie zu einer Policy und erzwingt sie an der Grenze — Linux via **Landlock**, macOS via
+  **Seatbelt**, plus Environment-Scrubbing (Subprozesse sehen keine geerbten Secrets).
 - 🧩 **Vier Erweiterungs-Tiers** nach Macht/Isolation: **Resources** (Skills→System-Prompt,
   Prompt-Templates→Slash-Commands), **Hooks** (in-process Rhai), **WASM-Plugins** (memory-sandboxed,
   capability-gated, via `wasmi`), **MCP-Server** (out-of-process, OS-sandboxed).
@@ -232,9 +232,11 @@ exec     = ["git"]
 Default ist **deny**. Eine Erweiterung bekommt nur die Rechte, die sie deklariert und der Mensch
 bestätigt — und der Kern erzwingt sie an der jeweiligen Grenze:
 
-- **MCP/Subprozesse:** OS-Sandbox via Landlock (Dateisystem) + Environment-Scrubbing (nur
-  gewährte `Env`-Vars + minimale Allowlist; **keine** geerbten API-Keys). Auf Kerneln ohne
-  durchsetzbares Landlock wird **fail-closed** verfahren.
+- **MCP/Subprozesse:** OS-Dateisystem-Sandbox — Linux via **Landlock**, macOS via **Seatbelt**
+  (`sandbox_init`) — plus Environment-Scrubbing (nur gewährte `Env`-Vars + minimale Allowlist;
+  **keine** geerbten API-Keys). Lässt sich die Sandbox nicht durchsetzen (Kernel ohne Landlock,
+  `sandbox_init`-Fehler), wird **fail-closed** verfahren. Auf Plattformen ohne Adapter
+  (Windows/BSD) gibt es kein FS-Sandboxing — nur Env-Scrubbing, mit deutlicher Warnung.
 - **WASM:** Host-Funktionen werden nur registriert, wenn die Policy sie erlaubt — ein Plugin ohne
   `Net` kann nachweislich nicht ins Netz.
 - **Secrets:** API-Keys kommen aus Env-Vars, werden nie geloggt/persistiert; das `bash`-Tool
