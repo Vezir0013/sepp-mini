@@ -12,8 +12,12 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
