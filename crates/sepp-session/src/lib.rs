@@ -1,6 +1,6 @@
 //! `sepp-session` — baumstrukturierte, persistente Sessions.
 //!
-//! Default-Backend ist JSONL (append-only, git-freundlich; Format: `specs/session-format.md`):
+//! Default-Backend ist JSONL (append-only, git-freundlich):
 //! erste Zeile Header, danach `entry`/`label_change`-Zeilen. Der **aktive Pfad** (root→leaf)
 //! ist die Conversation; `compaction`-Einträge ersetzen einen Pfad-Präfix durch eine
 //! Zusammenfassung.
@@ -36,7 +36,7 @@ pub struct Entry {
     pub payload: EntryPayload,
 }
 
-/// Nutzlast eines Eintrags. Wire-Format exakt nach `specs/session-format.md`
+/// Nutzlast eines Eintrags. Das Wire-Format ist stabil und nur additiv änderbar
 /// (`Message` ist deshalb eine Struct-Variante mit `message`-Feld, nicht ein Newtype).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]

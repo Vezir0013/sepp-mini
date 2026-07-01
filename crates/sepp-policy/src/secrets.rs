@@ -1,4 +1,4 @@
-//! Minimaler Secret-Broker (`docs/06-security-model.md`).
+//! Minimaler Secret-Broker.
 //!
 //! Erweiterungen sollen Secrets **nie im Klartext sehen**: sie nutzen Platzhalter `$NAME`, der
 //! Broker ersetzt sie durch echte Werte **nur** für erlaubte Hosts (Policy `Net{host}`). Keys

@@ -1,6 +1,6 @@
 //! Native Sub-Agenten (Phase 4): eine Teilaufgabe läuft in einer **isolierten** [`AgentSession`]
 //! (eigene Conversation, eingeschränktes Toolset, eigenes Budget). Nur das Endergebnis kehrt als
-//! [`ToolResult`] zur Wurzel zurück — der Wurzel-Kontext bleibt schlank (`docs/07`-Akzeptanz).
+//! [`ToolResult`] zur Wurzel zurück — der Wurzel-Kontext bleibt schlank.
 
 use std::sync::Arc;
 

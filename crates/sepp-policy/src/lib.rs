@@ -1,9 +1,9 @@
 //! `sepp-policy` — Capabilities, Policy-Auswertung und OS-Sandbox.
 //!
-//! Default ist **deny**: was nicht deklariert ist, gibt es nicht (`docs/06-security-model.md`).
-//! Eine [`Policy`] ist die Menge gewährter [`Capability`]s, gelesen aus einem [`Manifest`]
-//! (`specs/extension-manifest.md`). Durchsetzung out-of-process über [`Sandbox`] (Linux:
-//! Landlock; sonst portabler Fallback ohne Durchsetzung + Warnung).
+//! Default ist **deny**: was nicht deklariert ist, gibt es nicht.
+//! Eine [`Policy`] ist die Menge gewährter [`Capability`]s, gelesen aus einem [`Manifest`].
+//! Durchsetzung out-of-process über [`Sandbox`] (Linux: Landlock, macOS: Seatbelt; sonst
+//! portabler Fallback ohne Durchsetzung + Warnung).
 
 use std::path::{Path, PathBuf};
 

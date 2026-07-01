@@ -214,7 +214,7 @@ impl Tool for BashTool {
                 None => (true, None, Some("[durch Signal beendet]".into())),
             },
             // Bereits oben behandelt; dieser Arm hält den `match` ohne `panic!` exhaustiv
-            // (AGENTS.md Rule #5: kein panic!/unreachable! in Library-Crates).
+            // (Konvention: kein panic!/unreachable! in Library-Crates, siehe CLAUDE.md).
             Outcome::Cancelled => return Err(SeppError::Aborted),
         };
 

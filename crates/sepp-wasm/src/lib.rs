@@ -1,8 +1,8 @@
 //! `sepp-wasm` — Tier-2-Plugin-Host: lädt WASM-Plugins als Tools, **capability-gated**.
 //!
 //! Sicherheit: WASM ist von Natur aus capability-secure — ein Modul kann nur, was der Host als
-//! Funktion bereitstellt. Host-Funktionen werden **nur registriert, wenn die Policy sie erlaubt**
-//! (`docs/06-security-model.md`). Ein Plugin ohne `Net`-Capability importiert `host_http`, das
+//! Funktion bereitstellt. Host-Funktionen werden **nur registriert, wenn die Policy sie erlaubt**.
+//! Ein Plugin ohne `Net`-Capability importiert `host_http`, das
 //! dann nicht existiert → Instanziierung schlägt fehl → es kann nachweislich nicht ins Netz.
 //!
 //! Plugin-ABI (Exports): `sepp_alloc(i32)->i32`, `sepp_spec()->i64`, `sepp_call(i32,i32)->i64`.

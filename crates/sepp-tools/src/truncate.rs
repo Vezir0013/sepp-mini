@@ -1,4 +1,4 @@
-//! Ausgabe-Trunkierung (Pflicht für alle Tools, siehe `specs/tool-protocol.md`).
+//! Ausgabe-Trunkierung (Pflicht für alle Tools).
 //!
 //! Arbeitet auf **Byte-Bereichen des Originals** und gibt bei „passt" den Input unverändert
 //! zurück (keine Re-Konstruktion via `lines().join`, die Zeilenenden/Trailing-Newline

@@ -1,6 +1,6 @@
 //! Tier 0 — Resources (reine Daten): Skills, Prompt-Templates, Themes.
 //!
-//! Discovery aus konventionellen Wurzeln (`docs/05-extensibility-tiers.md`):
+//! Discovery aus konventionellen Wurzeln:
 //! `<root>/skills/`, `<root>/prompts/`, `<root>/themes/`. Üblich: global `~/.sepp` und
 //! projektlokal `<repo>/.sepp` (letzteres erst nach Trust laden). Skills fließen in den
 //! System-Prompt, Prompt-Templates werden zu Slash-Commands. Resources sind inert (keine
