@@ -72,6 +72,32 @@ uninstall() {
     log "Deinstallation abgeschlossen."
 }
 
+# Sorgt dafür, dass BIN_DIR im PATH landet: hängt (idempotent) eine PATH-Zeile an die zur
+# Login-Shell passende Profildatei an. Macht den macOS-Flow 1:1 wie Linux (wo ~/.local/bin oft
+# schon im PATH ist, unter macOS/zsh aber nicht). System-Installationen (/usr/local/bin) sind
+# bereits im PATH und werden übersprungen.
+ensure_path() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+    shell_name="$(basename "${SHELL:-sh}")"
+    case "$shell_name" in
+        zsh)  profile="$HOME/.zprofile" ;;
+        bash) [ "$(uname -s)" = Darwin ] && profile="$HOME/.bash_profile" || profile="$HOME/.bashrc" ;;
+        *)    profile="$HOME/.profile" ;;
+    esac
+    line="export PATH=\"$BIN_DIR:\$PATH\""
+    if [ -f "$profile" ] && grep -Fq "$line" "$profile" 2>/dev/null; then
+        log "PATH: ${BIN_DIR} bereits in ${profile} eingetragen — ggf. neue Shell öffnen."
+        return 0
+    fi
+    if printf '\n# sepp mini: PATH-Erweiterung (vom Installer ergänzt)\n%s\n' "$line" >> "$profile" 2>/dev/null; then
+        log "PATH: ${BIN_DIR} in ${profile} ergänzt — neue Shell öffnen oder: . ${profile}"
+    else
+        log "Hinweis: ${BIN_DIR} ist nicht im PATH — bitte manuell ergänzen: ${line}"
+    fi
+}
+
 # Argumente einsammeln (echte Schleife, damit --uninstall --purge in beliebiger Reihenfolge geht).
 mode=install
 do_purge=0
@@ -136,10 +162,7 @@ log "Lade ${url} …"
 curl -fsSL "$url" -o "${BIN_DIR}/sepp" || die "Download fehlgeschlagen ($url)"
 chmod +x "${BIN_DIR}/sepp"
 log "Installiert: ${BIN_DIR}/sepp"
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *) log "Hinweis: ${BIN_DIR} ist nicht im PATH — ergänze es in deiner Shell-Konfig." ;;
-esac
+ensure_path
 "${BIN_DIR}/sepp" --version || true
 
 # --system: FHS-Layout direkt mit anlegen (ein Schritt).
