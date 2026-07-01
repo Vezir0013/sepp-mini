@@ -1,5 +1,5 @@
-//! Plattform-Sandbox für Subprozesse (MCP-Server u. a.). Linux: Landlock (LSM); sonst ein
-//! portabler Fallback ohne Durchsetzung (mit deutlicher Warnung).
+//! Plattform-Sandbox für Subprozesse (MCP-Server u. a.). Linux: Landlock (LSM), macOS: Seatbelt
+//! (`sandbox_init`); sonst ein portabler Fallback ohne Durchsetzung (mit deutlicher Warnung).
 
 use sepp_core::{Result, SeppError};
 
@@ -108,7 +108,11 @@ pub fn default_sandbox() -> Box<dyn Sandbox> {
     {
         Box::new(LandlockSandbox)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(SeatbeltSandbox)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         tracing::warn!(
             "kein OS-Sandbox-Adapter für diese Plattform — Erweiterungen laufen UNGESANDBOXT"
@@ -201,6 +205,226 @@ fn apply_landlock(
         );
     }
     Ok(())
+}
+
+/// Quotet einen Pfad als SBPL-String-Literal (escaped `\` und `"`).
+#[cfg(any(target_os = "macos", test))]
+fn sbpl_quote(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Baut ein Seatbelt-Profil (SBPL) mit **Default-deny**: erlaubt nur die zum Start nötigen
+/// System-Lesepfade sowie die per [`Policy`] gewährten Lese-/Schreibpfade. Reine, testbare
+/// Funktion (plattformunabhängig, damit der Generator auch ohne macOS geprüft werden kann).
+#[cfg(any(target_os = "macos", test))]
+fn build_seatbelt_profile(read: &[std::path::PathBuf], write: &[std::path::PathBuf]) -> String {
+    // macOS-Systempfade, die ein Prozess zum Starten braucht (dyld-Cache, Frameworks, Config).
+    // Nur **Lesen** — analog zu Landlocks Systempfad-Set, an macOS angepasst.
+    const SYSTEM_READ: &[&str] = &[
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/opt",
+        "/Applications",
+    ];
+
+    let mut p = String::from("(version 1)\n(deny default)\n");
+    // Prozess-Start (exec des Ziels + Kinder) und minimaler Runtime-Bedarf, damit dyld und
+    // Frameworks laden. FS bleibt Default-deny — nur die folgenden Pfade sind erlaubt.
+    p.push_str("(allow process-exec*)\n");
+    p.push_str("(allow process-fork)\n");
+    p.push_str("(allow sysctl-read)\n");
+    p.push_str("(allow mach-lookup)\n");
+    // Metadaten (stat/lookup) baumweit — gibt keine Datei-Inhalte frei, erlaubt Traversierung.
+    p.push_str("(allow file-read-metadata)\n");
+    // Geräte (stdin/stdout/null): lesen + schreiben (wie Landlock für /dev).
+    p.push_str("(allow file-read* file-write* (subpath \"/dev\"))\n");
+
+    for sys in SYSTEM_READ {
+        p.push_str(&format!(
+            "(allow file-read* (subpath {}))\n",
+            sbpl_quote(sys)
+        ));
+    }
+    for r in read {
+        if let Some(s) = r.to_str() {
+            p.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl_quote(s)));
+        }
+    }
+    for w in write {
+        if let Some(s) = w.to_str() {
+            p.push_str(&format!(
+                "(allow file-read* file-write* (subpath {}))\n",
+                sbpl_quote(s)
+            ));
+        }
+    }
+    p
+}
+
+/// macOS-Sandbox via Seatbelt (`sandbox_init`): Dateisystem-Zugriff auf die Policy-Pfade
+/// begrenzt. Parität zu `LandlockSandbox` (Scope: Dateisystem + Env).
+#[cfg(target_os = "macos")]
+pub struct SeatbeltSandbox;
+
+#[cfg(target_os = "macos")]
+impl Sandbox for SeatbeltSandbox {
+    fn prepare(&self, cmd: &mut tokio::process::Command, policy: &Policy) -> Result<()> {
+        // Env-Capability durchsetzen (geerbte Secrets entfernen) — wie bei allen Adaptern.
+        scrub_env(cmd, policy);
+
+        let read = policy.fs_read_prefixes();
+        let write = policy.fs_write_prefixes();
+        // Das SBPL-Profil VOR dem fork bauen: im Kind nach fork() darf nur minimal (nicht
+        // async-signal-safe) gearbeitet werden — siehe apply_seatbelt.
+        let profile = build_seatbelt_profile(&read, &write);
+        let profile = std::ffi::CString::new(profile)
+            .map_err(|e| SeppError::Provider(format!("seatbelt: Profil enthält NUL: {e}")))?;
+
+        // pre_exec läuft im Kind nach fork(), vor exec() — die Restriktion überlebt exec.
+        unsafe {
+            cmd.pre_exec(move || apply_seatbelt(profile.as_c_str()).map_err(std::io::Error::other));
+        }
+        Ok(())
+    }
+}
+
+/// Wendet ein SBPL-Profil auf den **aktuellen** Prozess an (im Kind, vor exec).
+///
+/// Nutzt `sandbox_init` aus libSystem/`libsandbox` (seit macOS 10.8 als deprecated markiert, aber
+/// weiter stabil und u. a. von Chromium verwendet). Fehler → `Err`, damit exec abbricht: der
+/// Subprozess startet dann **nicht** ungesandboxt (**fail-closed**, spiegelt Landlocks
+/// `NotEnforced`-Abbruch).
+#[cfg(target_os = "macos")]
+fn apply_seatbelt(profile: &std::ffi::CStr) -> std::result::Result<(), String> {
+    use std::os::raw::{c_char, c_int};
+
+    // `flags = 0` interpretiert `profile` als rohes SBPL — identisch zu `sandbox-exec -p`.
+    #[link(name = "sandbox")]
+    extern "C" {
+        fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
+        fn sandbox_free_error(errorbuf: *mut c_char);
+    }
+
+    let mut errbuf: *mut c_char = std::ptr::null_mut();
+    // SAFETY: `profile` ist ein gültiger, NUL-terminierter C-String; `errbuf` zeigt auf einen
+    // Null-Pointer, den `sandbox_init` bei Fehler mit einer Meldung befüllt.
+    let rc = unsafe { sandbox_init(profile.as_ptr(), 0, &mut errbuf) };
+    if rc != 0 {
+        let msg = if errbuf.is_null() {
+            "unbekannter Fehler".to_string()
+        } else {
+            // SAFETY: bei Fehler zeigt `errbuf` auf einen NUL-terminierten String von sandbox_init.
+            let s = unsafe { std::ffi::CStr::from_ptr(errbuf) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: `errbuf` stammt aus sandbox_init und wird genau einmal freigegeben.
+            unsafe { sandbox_free_error(errbuf) };
+            s
+        };
+        return Err(format!(
+            "Seatbelt (sandbox_init) fehlgeschlagen — Start abgebrochen (fail-closed): {msg}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod seatbelt_profile_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn profile_is_deny_default_with_policy_paths() {
+        let read = vec![PathBuf::from("/tmp/ro")];
+        let write = vec![PathBuf::from("/tmp/rw")];
+        let p = build_seatbelt_profile(&read, &write);
+
+        // Default-deny als Fundament.
+        assert!(p.starts_with("(version 1)\n(deny default)\n"));
+        // Gewährte Policy-Pfade tauchen exakt auf.
+        assert!(p.contains("(allow file-read* (subpath \"/tmp/ro\"))"));
+        assert!(p.contains("(allow file-read* file-write* (subpath \"/tmp/rw\"))"));
+        // System-Lesepfade vorhanden, aber nur lesend.
+        assert!(p.contains("(allow file-read* (subpath \"/usr\"))"));
+        assert!(p.contains("(allow file-read* (subpath \"/System\"))"));
+        // Kein pauschaler Schreibzugriff außerhalb der gewährten Pfade.
+        assert!(!p.contains("(allow file-write* (subpath \"/\"))"));
+    }
+
+    #[test]
+    fn sbpl_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(sbpl_quote("/a/b"), "\"/a/b\"");
+        assert_eq!(sbpl_quote("/a\"b"), "\"/a\\\"b\"");
+        assert_eq!(sbpl_quote("/a\\b"), "\"/a\\\\b\"");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod seatbelt_tests {
+    use super::*;
+    use std::process::Stdio;
+
+    // Gated wie der Landlock-Test: braucht durchsetzbares Seatbelt (echter macOS-Host).
+    // Lauf: `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "braucht macOS-Seatbelt"]
+    async fn seatbelt_blocks_write_outside_allowed_prefix() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ok = allowed.path().join("ok.txt");
+        let escaped = outside.path().join("escaped.txt");
+
+        let policy = Policy::new(vec![
+            Capability::FsWrite {
+                prefix: allowed.path().to_path_buf(),
+            },
+            Capability::FsRead {
+                prefix: allowed.path().to_path_buf(),
+            },
+        ]);
+        let sb = SeatbeltSandbox;
+
+        let mut good = tokio::process::Command::new("sh");
+        good.arg("-c")
+            .arg(format!("echo hi > '{}'", ok.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = sb.spawn(&mut good, &policy).unwrap().wait().await;
+
+        let mut bad = tokio::process::Command::new("sh");
+        bad.arg("-c")
+            .arg(format!("echo hi > '{}'", escaped.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = sb.spawn(&mut bad, &policy).unwrap().wait().await;
+
+        // Positiv-Kontrolle: erlaubter Schreibzugriff klappt.
+        assert!(
+            ok.exists(),
+            "erlaubter Schreibzugriff schlug fehl (Sandbox zu streng/inaktiv)"
+        );
+        // Negativ: Schreibzugriff außerhalb des erlaubten Pfads ist blockiert.
+        assert!(
+            !escaped.exists(),
+            "Seatbelt verhinderte den Schreibzugriff außerhalb des erlaubten Pfads NICHT"
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
