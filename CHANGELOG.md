@@ -7,12 +7,28 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.10] - 2026-07-01
+
 ### Hinzugefügt
 - **macOS: OS-Dateisystem-Sandbox für MCP-Subprozesse via Seatbelt** (`sandbox_init`, rohes
   SBPL-Profil im `pre_exec` des Kindes). Damit erhalten stdio-MCP-Server auf macOS dieselbe
   Absicherung wie unter Linux-Landlock — Scope Dateisystem + Environment-Scrubbing, **fail-closed**
-  (schlägt `sandbox_init` fehl, wird der Subprozess nicht ungesandboxt gestartet). Nur Plattformen
-  ohne Adapter (Windows/BSD) fallen weiterhin auf `NullSandbox` mit Warnung zurück.
+  (schlägt `sandbox_init` fehl, wird der Subprozess nicht ungesandboxt gestartet). Read- und
+  Write-Confinement auf echtem macOS (26.x) verifiziert. Nur Plattformen ohne Adapter (Windows/BSD)
+  fallen weiterhin auf `NullSandbox` mit Warnung zurück.
+
+### Geändert
+- **`install.sh` trägt den PATH automatisch ein.** Liegt das Zielverzeichnis (Default
+  `~/.local/bin`) nicht im PATH, ergänzt der Installer idempotent eine PATH-Zeile in der zur
+  Login-Shell passenden Profildatei (`~/.zprofile` / `~/.bash_profile` / `~/.profile`). Damit ist
+  der macOS-Install 1:1 wie unter Linux — kein manueller PATH-Schritt mehr. System-Installationen
+  (`/usr/local/bin`) sind ohnehin im PATH und bleiben unberührt.
 
 ### Entfernt
 - **Token-Verbrauch-Anzeige komplett entfernt.** Die Mini-Tabelle am Ende der Konversation
@@ -22,12 +38,6 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   bleibt erhalten (Provider-Daten); `last_usage` bleibt als Basis der Auto-Compaction-Schwelle und
   `model_label` weiterhin für die TUI-Statuszeile. Alte Sessions mit `usage_summary`-Einträgen
   bleiben les- und ladbar (generischer Custom-Eintrag).
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.9] - 2026-06-29
 
