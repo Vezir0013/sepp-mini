@@ -100,6 +100,7 @@ struct App {
     streaming: Option<String>,
     streaming_thinking: Option<String>,
     show_thinking: bool,
+    show_status: bool,
     input: String,
     status: String,
     running: bool,
@@ -201,6 +202,7 @@ impl App {
             streaming: None,
             streaming_thinking: None,
             show_thinking,
+            show_status: true,
             input: String::new(),
             status: "bereit · /help für Befehle".into(),
             running: false,
@@ -339,7 +341,7 @@ impl App {
             "quit" | "exit" | "q" => self.should_quit = true,
             "help" | "h" => {
                 let mut text = String::from(
-                    "Befehle: /new /resume /tree /compact /model [id] /trust /reload /quit",
+                    "Befehle: /new /resume /tree /compact /model [id] /trust /reload /hide /show /quit",
                 );
                 if !self.prompt_templates.is_empty() {
                     let names: Vec<String> = self
@@ -417,6 +419,12 @@ impl App {
                 Err(e) => self.status = format!("/trust: {e}"),
             },
             "reload" => self.reload_resources().await,
+            "hide" => self.show_status = false,
+            "show" => {
+                self.show_status = true;
+                let g = self.session.lock().await;
+                self.status = idle_status(&g);
+            }
             other => {
                 // Prompt-Template als Slash-Command?
                 let content = self
@@ -679,12 +687,17 @@ impl App {
     }
 
     fn render_chat(&mut self, f: &mut Frame, area: Rect) {
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
+        // Statuszeile (Length(1)) nur einplanen, wenn sie sichtbar ist (`/hide`/`/show`).
+        let constraints: &[Constraint] = if self.show_status {
+            &[
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ]
+        } else {
+            &[Constraint::Min(1), Constraint::Length(3)]
+        };
+        let chunks = Layout::vertical(constraints).split(area);
 
         let chat_area = chunks[0];
         let inner_w = chat_area.width.saturating_sub(2).max(1) as usize;
@@ -725,22 +738,31 @@ impl App {
             .scroll((scroll, 0));
         f.render_widget(chat, chat_area);
 
-        let status = Paragraph::new(Line::styled(
-            self.status.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
-        f.render_widget(status, chunks[1]);
+        // Input rutscht ohne Statuszeile in chunks[1] hoch.
+        let input_area = if self.show_status {
+            let status = Paragraph::new(Line::styled(
+                self.status.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
+            f.render_widget(status, chunks[1]);
+            chunks[2]
+        } else {
+            chunks[1]
+        };
 
         let input = Paragraph::new(format!("> {}", self.input)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Eingabe · /help"),
         );
-        f.render_widget(input, chunks[2]);
+        f.render_widget(input, input_area);
 
-        let cx = chunks[2].x + 3 + self.input.chars().count() as u16;
-        let cy = chunks[2].y + 1;
-        f.set_cursor_position((cx.min(chunks[2].x + chunks[2].width.saturating_sub(1)), cy));
+        let cx = input_area.x + 3 + self.input.chars().count() as u16;
+        let cy = input_area.y + 1;
+        f.set_cursor_position((
+            cx.min(input_area.x + input_area.width.saturating_sub(1)),
+            cy,
+        ));
     }
 }
 
