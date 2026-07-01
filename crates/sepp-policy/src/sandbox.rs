@@ -248,10 +248,15 @@ fn build_seatbelt_profile(read: &[std::path::PathBuf], write: &[std::path::PathB
     p.push_str("(allow process-fork)\n");
     p.push_str("(allow sysctl-read)\n");
     p.push_str("(allow mach-lookup)\n");
-    // Metadaten (stat/lookup) baumweit — gibt keine Datei-Inhalte frei, erlaubt Traversierung.
-    p.push_str("(allow file-read-metadata)\n");
-    // Geräte (stdin/stdout/null): lesen + schreiben (wie Landlock für /dev).
+    // Pfad-Traversierung: Metadaten (stat/lookup) baumweit — gibt KEINE Datei-Inhalte frei.
+    p.push_str("(allow file-read-metadata (subpath \"/\"))\n");
+    // Der Root-Knoten braucht read-data (dyld liest beim Start das „/“-Directory). `literal` = nur
+    // der „/“-Knoten selbst, NICHT rekursiv → Kindpfade bleiben Default-deny (Read bleibt confined).
+    p.push_str("(allow file-read* (literal \"/\"))\n");
+    // Geräte (stdin/stdout/null): lesen + schreiben (wie Landlock für /dev); `file-ioctl` deckt den
+    // dtracehelper-Zugriff beim libc-Start ab (sonst harmlose, aber laute Sandbox-Violation).
     p.push_str("(allow file-read* file-write* (subpath \"/dev\"))\n");
+    p.push_str("(allow file-ioctl (subpath \"/dev\"))\n");
 
     for sys in SYSTEM_READ {
         p.push_str(&format!(
@@ -275,6 +280,18 @@ fn build_seatbelt_profile(read: &[std::path::PathBuf], write: &[std::path::PathB
     p
 }
 
+/// Löst Policy-Pfade zu ihrem kanonischen (realpath-)Pfad auf. Seatbelt matcht kanonisch, und auf
+/// macOS sind Verzeichnisse wie `/var` oder `/tmp` Symlinks (`/var` → `/private/var`) — ohne
+/// Auflösung würde die erlaubte Regel den echten Zugriffspfad verfehlen. Best effort: existiert der
+/// Pfad (noch) nicht, bleibt das Original erhalten.
+#[cfg(target_os = "macos")]
+fn canonicalize_all(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    paths
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect()
+}
+
 /// macOS-Sandbox via Seatbelt (`sandbox_init`): Dateisystem-Zugriff auf die Policy-Pfade
 /// begrenzt. Parität zu `LandlockSandbox` (Scope: Dateisystem + Env).
 #[cfg(target_os = "macos")]
@@ -286,8 +303,11 @@ impl Sandbox for SeatbeltSandbox {
         // Env-Capability durchsetzen (geerbte Secrets entfernen) — wie bei allen Adaptern.
         scrub_env(cmd, policy);
 
-        let read = policy.fs_read_prefixes();
-        let write = policy.fs_write_prefixes();
+        // Seatbelt matcht KANONISCHE Pfade; auf macOS sind /var, /tmp u. a. Symlinks
+        // (/var → /private/var) — Policy-Pfade vor dem Profil-Eintrag auflösen, sonst greift die
+        // erlaubte Regel nicht.
+        let read = canonicalize_all(policy.fs_read_prefixes());
+        let write = canonicalize_all(policy.fs_write_prefixes());
         // Das SBPL-Profil VOR dem fork bauen: im Kind nach fork() darf nur minimal (nicht
         // async-signal-safe) gearbeitet werden — siehe apply_seatbelt.
         let profile = build_seatbelt_profile(&read, &write);
@@ -361,8 +381,14 @@ mod seatbelt_profile_tests {
         // System-Lesepfade vorhanden, aber nur lesend.
         assert!(p.contains("(allow file-read* (subpath \"/usr\"))"));
         assert!(p.contains("(allow file-read* (subpath \"/System\"))"));
+        // Start-/Traversierungs-kritisch: Root-Metadaten baumweit + read-data NUR auf dem
+        // „/“-Knoten selbst (literal, nicht rekursiv).
+        assert!(p.contains("(allow file-read-metadata (subpath \"/\"))"));
+        assert!(p.contains("(allow file-read* (literal \"/\"))"));
         // Kein pauschaler Schreibzugriff außerhalb der gewährten Pfade.
         assert!(!p.contains("(allow file-write* (subpath \"/\"))"));
+        // Read bleibt confined: KEIN rekursives read auf „/“.
+        assert!(!p.contains("(allow file-read* (subpath \"/\"))"));
     }
 
     #[test]
