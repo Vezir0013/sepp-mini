@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession};
-use sepp_core::{ContentBlock, Message, Model, Role};
+use sepp_core::{ContentBlock, Message, Role};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_provider::models;
 use sepp_session::{SessionInfo, SessionStore};
@@ -139,6 +139,19 @@ pub async fn run(
         show_thinking,
     );
     app.rebuild_transcript().await;
+    // Prompt-Templates, die Builtins verschatten, sind per Slash unerreichbar — sichtbar im
+    // Transcript warnen (ein eprintln verpufft hinter dem Alternate-Screen).
+    let shadowed = template_collisions(&app.prompt_templates);
+    if !shadowed.is_empty() {
+        app.transcript.push(DisplayMsg {
+            kind: Kind::Info,
+            text: format!(
+                "Hinweis: Prompt-Template(s) {} kollidieren mit Builtin-Befehlen und sind \
+                 per / nicht aufrufbar.",
+                slash_list(&shadowed)
+            ),
+        });
+    }
 
     let mut events = EventStream::new();
     let result = loop {
@@ -226,6 +239,28 @@ impl App {
         self.status = idle_status(&g);
     }
 
+    /// Meldung in die Statuszeile; ist sie versteckt (`/hide`), zusätzlich in den Chatverlauf —
+    /// Feedback darf nie unsichtbar verpuffen (verworfene Eingaben, Befehls-Ausgaben, Fehler).
+    fn notify_kind(&mut self, kind: Kind, text: String) {
+        if !self.show_status {
+            self.transcript.push(DisplayMsg {
+                kind,
+                text: text.clone(),
+            });
+        }
+        self.status = text;
+    }
+
+    /// [`Self::notify_kind`] als Info (grau).
+    fn notify(&mut self, text: impl Into<String>) {
+        self.notify_kind(Kind::Info, text.into());
+    }
+
+    /// [`Self::notify_kind`] als Fehler (rot).
+    fn notify_error(&mut self, text: impl Into<String>) {
+        self.notify_kind(Kind::Error, text.into());
+    }
+
     // ---- Eingabe ---------------------------------------------------------
 
     async fn on_term_event(&mut self, ev: Event) {
@@ -276,15 +311,18 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.input.clear();
         if let Some(cmd) = text.strip_prefix('/') {
+            self.input.clear();
             self.handle_command(cmd).await;
             return;
         }
         if self.running {
-            self.status = "läuft noch — bitte warten".into();
+            // Eingabe NICHT verwerfen — der getippte Prompt bleibt zum Absenden stehen,
+            // sobald der laufende Turn fertig ist.
+            self.notify("läuft noch — bitte warten");
             return;
         }
+        self.input.clear();
         self.transcript.push(DisplayMsg {
             kind: Kind::User,
             text: text.clone(),
@@ -333,10 +371,12 @@ impl App {
                 "new" | "compact" | "model" | "tree" | "resume" | "reload" | "trust"
             )
         {
-            self.status = "läuft noch — bitte warten".into();
+            self.notify("läuft noch — bitte warten");
             return;
         }
 
+        // Neue Builtins auch in BUILTIN_COMMANDS (Modulebene) eintragen — Grundlage der
+        // Kollisionswarnung für gleichnamige Prompt-Templates.
         match name {
             "quit" | "exit" | "q" => self.should_quit = true,
             "help" | "h" => {
@@ -367,39 +407,47 @@ impl App {
                     self.streaming = None;
                     self.streaming_thinking = None;
                     self.scroll_back = 0;
-                    self.status = "neue Session".into();
+                    self.notify("neue Session");
                 }
-                Err(e) => self.status = format!("/new: {e}"),
+                Err(e) => self.notify_error(format!("/new: {e}")),
             },
             "model" => match arg {
                 Some(id) => {
-                    let model = models::find_model(&id).unwrap_or_else(|| custom_model(&id));
-                    let name = model.display_name.clone();
-                    self.session.lock().await.set_model(model);
-                    self.status = format!("Modell: {name}");
+                    // Custom-Modelle erben den Session-Provider (korrekte Compaction-Schwelle
+                    // statt pauschal anthropic/200k); Anzeige über model_label statt des
+                    // generischen "(custom)"-display_name.
+                    let mut g = self.session.lock().await;
+                    let provider = g.model().provider.clone();
+                    let model = models::find_model(&id)
+                        .unwrap_or_else(|| crate::custom_model(id, &provider));
+                    let label = crate::model_label(&model).to_string();
+                    g.set_model(model);
+                    drop(g);
+                    self.notify(format!("Modell: {label}"));
                 }
                 None => {
                     let ids: Vec<String> =
                         models::builtin_models().into_iter().map(|m| m.id).collect();
-                    self.status = format!("Modelle: {}", ids.join(", "));
+                    self.notify(format!("Modelle: {}", ids.join(", ")));
                 }
             },
             "compact" => self.start_compact(),
             "tree" => {
+                // Guard vor den notify-Aufrufen (&mut self) freigeben.
                 let g = self.session.lock().await;
-                match g.session() {
-                    Some(store) => {
-                        let (lines, sel) = build_tree(store);
-                        drop(g);
+                let built = g.session().map(build_tree);
+                drop(g);
+                match built {
+                    Some((lines, sel)) => {
                         if lines.is_empty() {
-                            self.status = "Baum ist leer".into();
+                            self.notify("Baum ist leer");
                         } else {
                             self.tree_lines = lines;
                             self.tree_sel = sel;
                             self.mode = Mode::Tree;
                         }
                     }
-                    None => self.status = "keine persistente Session".into(),
+                    None => self.notify("keine persistente Session"),
                 }
             }
             "resume" => match session::list_sessions() {
@@ -408,23 +456,23 @@ impl App {
                     self.resume_sel = 0;
                     self.mode = Mode::Resume;
                 }
-                Ok(_) => self.status = "keine gespeicherten Sessions".into(),
-                Err(e) => self.status = format!("/resume: {e}"),
+                Ok(_) => self.notify("keine gespeicherten Sessions"),
+                Err(e) => self.notify_error(format!("/resume: {e}")),
             },
             "trust" => match session::trust_current_project() {
                 Ok(()) => {
                     self.reload_resources().await;
-                    self.status = format!("Projekt vertraut · {}", self.status);
+                    let text = format!("Projekt vertraut · {}", self.status);
+                    self.notify(text);
                 }
-                Err(e) => self.status = format!("/trust: {e}"),
+                Err(e) => self.notify_error(format!("/trust: {e}")),
             },
             "reload" => self.reload_resources().await,
+            // Bewusst ohne Session-Lock: der Prompt-Task hält den Mutex für die gesamte
+            // Turn-Dauer — ein lock().await hier fröre die Event-Loop bis Turn-Ende ein
+            // (kein Rendern, kein Esc). self.status wird ohnehin durchgängig gepflegt.
             "hide" => self.show_status = false,
-            "show" => {
-                self.show_status = true;
-                let g = self.session.lock().await;
-                self.status = idle_status(&g);
-            }
+            "show" => self.show_status = true,
             other => {
                 // Prompt-Template als Slash-Command?
                 let content = self
@@ -435,7 +483,7 @@ impl App {
                 match content {
                     Some(content) => {
                         if self.running {
-                            self.status = "läuft noch — bitte warten".into();
+                            self.notify("läuft noch — bitte warten");
                             return;
                         }
                         let expanded = match arg {
@@ -449,7 +497,7 @@ impl App {
                         self.scroll_back = 0;
                         self.start_prompt(expanded);
                     }
-                    None => self.status = format!("unbekannter Befehl: /{other}"),
+                    None => self.notify(format!("unbekannter Befehl: /{other}")),
                 }
             }
         }
@@ -461,7 +509,7 @@ impl App {
         let roots = match session::resource_roots(trusted) {
             Ok(r) => r,
             Err(e) => {
-                self.status = format!("/reload: {e}");
+                self.notify_error(format!("/reload: {e}"));
                 return;
             }
         };
@@ -486,11 +534,19 @@ impl App {
             .into_iter()
             .map(|p| (p.name, p.content))
             .collect();
-        self.status = format!(
+        let mut summary = format!(
             "neu geladen · {nskills} Skills · {} Templates · {} Hook-Quelle(n)",
             self.prompt_templates.len(),
             nhooks
         );
+        let shadowed = template_collisions(&self.prompt_templates);
+        if !shadowed.is_empty() {
+            summary.push_str(&format!(
+                " · Achtung: {} von Builtins verschattet",
+                slash_list(&shadowed)
+            ));
+        }
+        self.notify(summary);
     }
 
     fn start_compact(&mut self) {
@@ -531,10 +587,10 @@ impl App {
                     self.streaming_thinking = None;
                     self.mode = Mode::Chat;
                     self.scroll_back = 0;
-                    self.status = match err {
-                        Some(e) => format!("branch: {e}"),
-                        None => "verzweigt — neuer Ast".into(),
-                    };
+                    match err {
+                        Some(e) => self.notify_error(format!("branch: {e}")),
+                        None => self.notify("verzweigt — neuer Ast"),
+                    }
                 }
             }
             _ => {}
@@ -564,9 +620,9 @@ impl App {
                             self.streaming_thinking = None;
                             self.scroll_back = 0;
                             self.mode = Mode::Chat;
-                            self.status = format!("Session {} geladen", short_id(&info.id));
+                            self.notify(format!("Session {} geladen", short_id(&info.id)));
                         }
-                        Err(e) => self.status = format!("öffnen: {e}"),
+                        Err(e) => self.notify_error(format!("öffnen: {e}")),
                     }
                 }
             }
@@ -687,17 +743,7 @@ impl App {
     }
 
     fn render_chat(&mut self, f: &mut Frame, area: Rect) {
-        // Statuszeile (Length(1)) nur einplanen, wenn sie sichtbar ist (`/hide`/`/show`).
-        let constraints: &[Constraint] = if self.show_status {
-            &[
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-            ]
-        } else {
-            &[Constraint::Min(1), Constraint::Length(3)]
-        };
-        let chunks = Layout::vertical(constraints).split(area);
+        let chunks = Layout::vertical(chat_constraints(self.show_status)).split(area);
 
         let chat_area = chunks[0];
         let inner_w = chat_area.width.saturating_sub(2).max(1) as usize;
@@ -738,17 +784,16 @@ impl App {
             .scroll((scroll, 0));
         f.render_widget(chat, chat_area);
 
-        // Input rutscht ohne Statuszeile in chunks[1] hoch.
-        let input_area = if self.show_status {
+        // Die Statuszeile hat via chat_constraints Höhe 0, wenn versteckt — nur bei
+        // Sichtbarkeit rendern (spart zudem den String-Clone pro Frame).
+        if self.show_status {
             let status = Paragraph::new(Line::styled(
                 self.status.clone(),
                 Style::default().fg(Color::Yellow),
             ));
             f.render_widget(status, chunks[1]);
-            chunks[2]
-        } else {
-            chunks[1]
-        };
+        }
+        let input_area = chunks[2];
 
         let input = Paragraph::new(format!("> {}", self.input)).block(
             Block::default()
@@ -757,11 +802,9 @@ impl App {
         );
         f.render_widget(input, input_area);
 
-        let cx = input_area.x + 3 + self.input.chars().count() as u16;
-        let cy = input_area.y + 1;
         f.set_cursor_position((
-            cx.min(input_area.x + input_area.width.saturating_sub(1)),
-            cy,
+            cursor_x(input_area, self.input.chars().count()),
+            input_area.y + 1,
         ));
     }
 }
@@ -816,16 +859,48 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-fn custom_model(id: &str) -> Model {
-    Model {
-        id: id.to_string(),
-        provider: "anthropic".into(),
-        display_name: "(custom)".into(),
-        context_window: 200_000,
-        max_output_tokens: 8192,
-        supports_reasoning: true,
-        supports_images: true,
-    }
+/// Builtin-Slash-Commands inkl. Aliase — MUSS mit dem `match name` in `handle_command`
+/// synchron bleiben. Grundlage der Kollisionswarnung beim Laden der Prompt-Templates.
+const BUILTIN_COMMANDS: &[&str] = &[
+    "quit", "exit", "q", "help", "h", "new", "model", "compact", "tree", "resume", "trust",
+    "reload", "hide", "show",
+];
+
+/// Namen der Templates, die ein Builtin-Kommando verschatten würden — der Builtin gewinnt
+/// im Dispatch, solche Templates sind per Slash unerreichbar.
+fn template_collisions(templates: &[(String, String)]) -> Vec<String> {
+    templates
+        .iter()
+        .filter(|(n, _)| BUILTIN_COMMANDS.contains(&n.as_str()))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// Namen als `/name`-Liste für Meldungen (`["a","b"]` → `"/a /b"`).
+fn slash_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("/{n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Layout-Zonen des Chat-Screens: Chat, Statuszeile (Höhe 0, wenn via `/hide` versteckt),
+/// Eingabe — `chunks[2]` ist damit IMMER das Eingabefeld, unabhängig von `show_status`.
+fn chat_constraints(show_status: bool) -> [Constraint; 3] {
+    [
+        Constraint::Min(1),
+        Constraint::Length(u16::from(show_status)),
+        Constraint::Length(3),
+    ]
+}
+
+/// Cursor-Spalte: in usize gerechnet (kein u16-Overflow-Panic im Debug-Build bei sehr langen
+/// Eingaben), final auf die rechte Innenkante geclampt — Muster wie die Scroll-Arithmetik in
+/// `render_chat`. `+ 3` = Rahmen + `"> "`-Präfix.
+fn cursor_x(area: Rect, input_chars: usize) -> u16 {
+    let right = (area.x as usize + area.width.saturating_sub(1) as usize).min(u16::MAX as usize);
+    (area.x as usize + 3 + input_chars).min(right) as u16
 }
 
 fn transcript_from_messages(msgs: &[Message], show_thinking: bool) -> Vec<DisplayMsg> {
@@ -1052,5 +1127,34 @@ mod tests {
         let off = transcript_from_messages(&msgs, false);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].kind, Kind::Assistant);
+    }
+
+    #[test]
+    fn chat_constraints_toggle_status_row() {
+        // chunks[2] ist immer das Eingabefeld; /hide setzt nur die Statuszeile auf Höhe 0.
+        assert_eq!(chat_constraints(true)[1], Constraint::Length(1));
+        assert_eq!(chat_constraints(false)[1], Constraint::Length(0));
+        assert_eq!(chat_constraints(true)[2], Constraint::Length(3));
+        assert_eq!(chat_constraints(false)[2], Constraint::Length(3));
+    }
+
+    #[test]
+    fn cursor_x_clamps_without_overflow() {
+        let area = Rect::new(0, 20, 80, 3);
+        // Normalfall: x + 3 + Eingabelänge.
+        assert_eq!(cursor_x(area, 5), 8);
+        // ~70k Zeichen (Paste): kein u16-Overflow-Panic, Clamp auf die rechte Innenkante.
+        assert_eq!(cursor_x(area, 70_000), 79);
+    }
+
+    #[test]
+    fn template_collisions_finds_builtin_shadowing() {
+        let templates = vec![
+            ("model".to_string(), "…".to_string()),
+            ("review".to_string(), "…".to_string()),
+            ("hide".to_string(), "…".to_string()),
+        ];
+        assert_eq!(template_collisions(&templates), ["model", "hide"]);
+        assert!(template_collisions(&[("review".to_string(), "…".to_string())]).is_empty());
     }
 }
