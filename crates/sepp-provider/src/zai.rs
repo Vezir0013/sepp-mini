@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_core::Result;
 
-use crate::openai::{build_chat_body, stream_chat, OpenAiDialect};
+use crate::openai::{build_chat_body, resolve_base_url, stream_chat, OpenAiDialect};
 use crate::{CompletionRequest, Provider, StreamEvent};
 
 /// z.ai (Zhipu/GLM) spricht den OpenAI-kompatiblen Chat-Completions-Endpunkt; das ist der
@@ -40,7 +40,7 @@ impl ZaiProvider {
     /// z.ai aus der Umgebung: Key aus `ZAI_API_KEY` (Format `id.secret`), base_url aus
     /// `ZAI_BASE_URL` (Default `https://api.z.ai/api/paas/v4`).
     pub fn from_env() -> Result<Self> {
-        let base = std::env::var("ZAI_BASE_URL").unwrap_or_else(|_| ZAI_BASE_URL.to_string());
+        let base = resolve_base_url(std::env::var("ZAI_BASE_URL").ok(), ZAI_BASE_URL);
         let key = std::env::var("ZAI_API_KEY").ok().filter(|k| !k.is_empty());
         Ok(Self::new(key, base))
     }
@@ -97,11 +97,14 @@ mod tests {
     }
 
     #[test]
-    fn from_env_defaults_to_zai_host_when_base_unset() {
-        // Ohne ZAI_BASE_URL der internationale z.ai-Host — NICHT api.openai.com.
-        std::env::remove_var("ZAI_BASE_URL");
-        let p = ZaiProvider::from_env().expect("from_env");
-        assert_eq!(p.base_url, ZAI_BASE_URL);
+    fn base_url_resolution_defaults_to_zai_host() {
+        // Ohne/mit leerem ZAI_BASE_URL der internationale z.ai-Host — NICHT api.openai.com.
+        // Pure Auflösung statt env-mutierendem remove_var (racet im parallelen Test-Binary).
+        assert_eq!(resolve_base_url(None, ZAI_BASE_URL), ZAI_BASE_URL);
+        assert_eq!(
+            resolve_base_url(Some(String::new()), ZAI_BASE_URL),
+            ZAI_BASE_URL
+        );
     }
 
     #[test]

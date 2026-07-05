@@ -28,6 +28,9 @@ pub use zai::ZaiProvider;
 
 /// Ein normalisiertes Streaming-Ereignis. Die Reihenfolge-Invariante:
 /// `MessageStart (TextDelta|ThinkingDelta|ToolUse*)* Usage? MessageStop`.
+/// `ToolUseStop` kann auch mitten im Stream kommen (Server, die den tool_call-`index`
+/// recyceln, schließen den vorigen Call beim Start des nächsten), bleibt aber immer
+/// innerhalb der `ToolUse*`-Gruppe vor `Usage`/`MessageStop`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {

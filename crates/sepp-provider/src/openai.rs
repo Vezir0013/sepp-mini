@@ -2,7 +2,8 @@
 //! lokale Endpunkte ab (Ollama/vLLM, OpenAI-kompatibel). Auth aus `OPENAI_API_KEY` (optional
 //! für lokale Server). Feature `openai`.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
@@ -15,9 +16,12 @@ use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+/// Host:Port des LM-Studio-Default-Servers — die eine Quelle für den CLI-Preflight und die
+/// Meldungstexte des `mlx`-Presets. Konsistenz zu [`MLX_BASE_URL`] sichert ein Unit-Test.
+pub const MLX_HOST_PORT: &str = "localhost:1234";
 /// Default-Endpunkt des `mlx`-Presets: LM Studios lokaler OpenAI-kompatibler Server (Port 1234).
 /// Über `OPENAI_BASE_URL` überschreibbar (abweichender Host/Port).
-const MLX_BASE_URL: &str = "http://localhost:1234/v1";
+pub const MLX_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Welcher OpenAI-kompatible Dialekt gesprochen wird. Steuert anbieterspezifische Body-Felder:
 /// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
@@ -37,8 +41,11 @@ pub enum OpenAiDialect {
 pub struct OpenAiMapper {
     started: bool,
     stopped: bool,
-    tools: HashMap<u64, String>, // index -> tool id
-    order: Vec<u64>,
+    tools: HashMap<u64, String>, // index -> id des aktuell offenen Tool-Calls
+    /// Alle gestarteten Tool-Call-ids in Startreihenfolge — Grundlage für die Stops in `done()`.
+    started_ids: Vec<String>,
+    /// ids, für die bereits ein `ToolUseStop` emittiert wurde (Index-Recycling schließt früh).
+    closed_ids: HashSet<String>,
     stop: StopReason,
     usage: Usage,
     has_usage: bool,
@@ -82,21 +89,39 @@ impl OpenAiMapper {
                 {
                     for tc in tcs {
                         let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                        if let std::collections::hash_map::Entry::Vacant(e) = self.tools.entry(idx)
-                        {
-                            if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                e.insert(id.to_string());
-                                self.order.push(idx);
-                                out.push(StreamEvent::ToolUseStart {
-                                    id: id.to_string(),
-                                    name,
-                                });
+                        // Leere ids wie „keine id" behandeln (degenerierte Server).
+                        let chunk_id = tc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty());
+                        match self.tools.entry(idx) {
+                            Entry::Vacant(e) => {
+                                if let Some(id) = chunk_id {
+                                    e.insert(id.to_string());
+                                    self.started_ids.push(id.to_string());
+                                    out.push(StreamEvent::ToolUseStart {
+                                        id: id.to_string(),
+                                        name: tool_name(tc),
+                                    });
+                                }
+                            }
+                            // Manche Server (llama.cpp-Familie, LM Studio) recyceln index 0 für
+                            // JEDEN Tool-Call: eine neue, abweichende id eröffnet einen neuen Call
+                            // — den vorigen schließen, sonst würden die Argumente beider Calls
+                            // unter der ersten id konkateniert. Dieselbe id erneut (Server
+                            // wiederholen sie teils pro Chunk) ist bewusst ein No-op.
+                            Entry::Occupied(mut e) => {
+                                if let Some(id) = chunk_id.filter(|&id| e.get().as_str() != id) {
+                                    let old = e.insert(id.to_string());
+                                    if self.closed_ids.insert(old.clone()) {
+                                        out.push(StreamEvent::ToolUseStop { id: old });
+                                    }
+                                    self.started_ids.push(id.to_string());
+                                    out.push(StreamEvent::ToolUseStart {
+                                        id: id.to_string(),
+                                        name: tool_name(tc),
+                                    });
+                                }
                             }
                         }
                         if let (Some(id), Some(args)) = (
@@ -140,8 +165,9 @@ impl OpenAiMapper {
             return out;
         }
         self.stopped = true;
-        for idx in &self.order {
-            if let Some(id) = self.tools.get(idx) {
+        for id in &self.started_ids {
+            // Dedupe: bei Index-Recycling früh geschlossene Calls nicht erneut stoppen.
+            if self.closed_ids.insert(id.clone()) {
                 out.push(StreamEvent::ToolUseStop { id: id.clone() });
             }
         }
@@ -161,6 +187,16 @@ fn map_finish(s: &str) -> StopReason {
         "length" => StopReason::MaxTokens,
         _ => StopReason::EndTurn,
     }
+}
+
+/// `function.name` aus einem tool_call-Delta — kommt nur im ersten Chunk eines Calls mit;
+/// Folge-Chunks tragen nur `arguments`, dann bleibt es leer.
+fn tool_name(tc: &Value) -> String {
+    tc.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Dekodiert einen kompletten OpenAI-SSE-Body zu [`StreamEvent`]s (für Fixture-Tests).
@@ -187,12 +223,24 @@ pub fn decode_openai_sse(raw: &[u8]) -> Vec<StreamEvent> {
     out
 }
 
+/// Effektive base_url: nicht-leerer Env-Wert gewinnt, sonst `default`. Leere/Whitespace-Werte
+/// (z. B. `OPENAI_BASE_URL=""` aus Shell-Profilen/CI) zählen als „nicht gesetzt" — sonst ginge
+/// der Preset-Default verloren und der erste Request scheitert an einer relativen URL.
+pub(crate) fn resolve_base_url(env_val: Option<String>, default: &str) -> String {
+    env_val
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// OpenAI-kompatibler Provider.
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: Option<String>,
     base_url: String,
     dialect: OpenAiDialect,
+    /// Anbieter-Label für `name()` und alle Fehlertexte (`"openai"` bzw. `"mlx"`) — ein
+    /// LM-Studio-Fehler darf nicht als OpenAI-Fehler erscheinen (vgl. [`DecodeState`]).
+    label: &'static str,
 }
 
 impl OpenAiProvider {
@@ -204,6 +252,7 @@ impl OpenAiProvider {
             api_key,
             base_url: base_url.into(),
             dialect: OpenAiDialect::default(),
+            label: "openai",
         }
     }
 
@@ -216,8 +265,7 @@ impl OpenAiProvider {
 
     /// `OPENAI_API_KEY` (optional für lokale Server) + `OPENAI_BASE_URL` (Default OpenAI).
     pub fn from_env() -> Result<Self> {
-        let base =
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let base = resolve_base_url(std::env::var("OPENAI_BASE_URL").ok(), DEFAULT_BASE_URL);
         let key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
@@ -225,20 +273,38 @@ impl OpenAiProvider {
     }
 
     /// `mlx`-Preset (`--provider mlx`): lokaler LM-Studio-Server. base_url aus `OPENAI_BASE_URL`
-    /// (Default [`MLX_BASE_URL`] = `http://localhost:1234/v1`), Key optional. Fällt bewusst NICHT
-    /// auf api.openai.com zurück wie [`Self::from_env`] — so verbindet `sepp --provider mlx` ohne
-    /// Env-Konfiguration direkt zu LM Studio.
+    /// (Default [`MLX_BASE_URL`]), fällt bewusst NICHT auf api.openai.com zurück wie
+    /// [`Self::from_env`] — so verbindet `sepp --provider mlx` ohne Env-Konfiguration direkt zu
+    /// LM Studio. `OPENAI_API_KEY` wird nur mitgesendet, wenn `OPENAI_BASE_URL` explizit gesetzt
+    /// ist (bewusstes Opt-in, siehe [`mlx_config`]); Fehler melden sich als „mlx", nicht „openai".
     pub fn mlx_from_env() -> Result<Self> {
-        let base = std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| MLX_BASE_URL.to_string());
-        let key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
-        Ok(Self::new(key, base))
+        let (base, key) = mlx_config(
+            std::env::var("OPENAI_BASE_URL").ok(),
+            std::env::var("OPENAI_API_KEY").ok(),
+        );
+        let mut p = Self::new(key, base);
+        p.label = "mlx";
+        Ok(p)
     }
 
     fn build_body(&self, req: &CompletionRequest) -> Value {
         build_chat_body(req, self.dialect)
     }
+}
+
+/// mlx-Konfiguration aus (bereits gelesenen) Env-Werten: base_url mit LM-Studio-Default; der
+/// API-Key wird NUR übernommen, wenn der Endpunkt explizit gesetzt ist. Im Zero-Config-Fall
+/// (localhost:1234) darf ein für andere Tools exportierter echter `OPENAI_API_KEY` nicht als
+/// Bearer über Klartext-HTTP an einen beliebigen lokalen Prozess auf Port 1234 lecken.
+fn mlx_config(env_base: Option<String>, env_key: Option<String>) -> (String, Option<String>) {
+    let explicit = env_base.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let base = resolve_base_url(env_base, MLX_BASE_URL);
+    let key = if explicit {
+        env_key.filter(|k| !k.is_empty())
+    } else {
+        None
+    };
+    (base, key)
 }
 
 /// Baut den Chat-Completions-Request-Body für einen OpenAI-kompatiblen Endpunkt. Geteilt vom
@@ -389,7 +455,7 @@ struct DecodeState {
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.label
     }
 
     async fn stream<'a>(
@@ -403,7 +469,7 @@ impl Provider for OpenAiProvider {
             &self.base_url,
             self.api_key.as_deref(),
             body,
-            "openai",
+            self.label,
             cancel,
         )
         .await
@@ -428,10 +494,17 @@ pub(crate) async fn stream_chat(
     if let Some(key) = api_key {
         builder = builder.bearer_auth(key);
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| SeppError::Provider(format!("{label} request: {e}")))?;
+    let resp = builder.send().await.map_err(|e| {
+        // Verbindungsfehler nennen den Endpunkt: hilfreicher bei lokalen Servern (mlx/local),
+        // die zwischen Preflight und Request sterben können, statt eines rohen reqwest-Texts.
+        if e.is_connect() {
+            SeppError::Provider(format!(
+                "{label}: Verbindung zu {base_url} fehlgeschlagen: {e} — läuft der Server?"
+            ))
+        } else {
+            SeppError::Provider(format!("{label} request: {e}"))
+        }
+    })?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -636,13 +709,169 @@ mod tests {
     }
 
     #[test]
-    fn mlx_from_env_defaults_to_local_lm_studio() {
-        // Ohne OPENAI_BASE_URL zielt das mlx-Preset auf LM Studios lokalen Port (1234) —
-        // NICHT auf api.openai.com. Genau das macht `sepp --provider mlx` zero-config und
-        // vermeidet die 401-Fehlerklasse des lokalen Falls.
-        std::env::remove_var("OPENAI_BASE_URL");
+    fn resolve_base_url_prefers_nonempty_env() {
+        // Pure Auflösung statt env-mutierender Tests (remove_var raced im parallelen
+        // Test-Binary): None und Leer-/Whitespace-Werte fallen auf den Default.
+        assert_eq!(resolve_base_url(None, DEFAULT_BASE_URL), DEFAULT_BASE_URL);
+        assert_eq!(
+            resolve_base_url(Some(String::new()), MLX_BASE_URL),
+            MLX_BASE_URL
+        );
+        assert_eq!(
+            resolve_base_url(Some("  ".into()), MLX_BASE_URL),
+            MLX_BASE_URL
+        );
+        assert_eq!(
+            resolve_base_url(Some("http://10.0.0.2:8080/v1".into()), MLX_BASE_URL),
+            "http://10.0.0.2:8080/v1"
+        );
+    }
+
+    #[test]
+    fn mlx_config_defaults_to_lm_studio_and_withholds_key() {
+        // Zero-Config: localhost-Default (NICHT api.openai.com — vermeidet die 401-Klasse)
+        // UND kein Bearer — ein für andere Tools exportierter OPENAI_API_KEY darf nicht an
+        // einen beliebigen Port-1234-Prozess gehen.
+        let (base, key) = mlx_config(None, Some("sk-secret".into()));
+        assert_eq!(base, MLX_BASE_URL);
+        assert_ne!(base, DEFAULT_BASE_URL);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn mlx_config_sends_key_only_with_explicit_endpoint() {
+        let (base, key) = mlx_config(Some("http://host:8080/v1".into()), Some("k".into()));
+        assert_eq!(base, "http://host:8080/v1");
+        assert_eq!(key.as_deref(), Some("k"));
+        // Leerer Override zählt als „nicht gesetzt": Default-Endpunkt, kein Key.
+        let (base, key) = mlx_config(Some(String::new()), Some("k".into()));
+        assert_eq!(base, MLX_BASE_URL);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn mlx_preset_reports_as_mlx_not_openai() {
+        // Der Kern der Label-Trennung: ein LM-Studio-Fehler darf nicht als „openai" erscheinen.
         let p = OpenAiProvider::mlx_from_env().expect("mlx_from_env");
-        assert_eq!(p.base_url, MLX_BASE_URL);
-        assert_ne!(p.base_url, DEFAULT_BASE_URL);
+        assert_eq!(p.name(), "mlx");
+        assert_eq!(OpenAiProvider::new(None, "x").name(), "openai");
+    }
+
+    #[test]
+    fn mlx_endpoint_constants_stay_consistent() {
+        // MLX_HOST_PORT (CLI-Preflight) und MLX_BASE_URL (Provider) müssen dieselbe Adresse
+        // beschreiben — Drift ließe den Preflight gegen den falschen Port prüfen.
+        assert_eq!(MLX_BASE_URL, format!("http://{MLX_HOST_PORT}/v1"));
+    }
+
+    #[test]
+    fn splits_tool_calls_when_server_recycles_index_zero() {
+        // llama.cpp-Familie (LM Studio): jeder Tool-Call kommt erneut unter index 0 mit
+        // neuer id — der Mapper muss trennen statt die Argumente zu konkatenieren.
+        let raw = include_bytes!("../tests/fixtures/openai_repeated_index.sse");
+        let events = decode_openai_sse(raw);
+        let starts: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, [("call_1", "get_weather"), ("call_2", "get_time")]);
+        let args_for = |id: &str| -> String {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::ToolUseInputDelta {
+                        id: i,
+                        partial_json,
+                    } if i == id => Some(partial_json.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(args_for("call_1"), "{\"city\":\"Berlin\"}");
+        assert_eq!(args_for("call_2"), "{\"tz\":\"UTC\"}");
+        // Stop(call_1) VOR Start(call_2); genau ein Stop je id, in Startreihenfolge.
+        let stop1 = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolUseStop { id } if id == "call_1"))
+            .unwrap();
+        let start2 = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolUseStart { id, .. } if id == "call_2"))
+            .unwrap();
+        assert!(stop1 < start2, "{events:?}");
+        let stops: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStop { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, ["call_1", "call_2"]);
+        // Ordering-Invariante bleibt: letzter Stop < Usage < MessageStop.
+        let last_stop = events
+            .iter()
+            .rposition(|e| matches!(e, StreamEvent::ToolUseStop { .. }))
+            .unwrap();
+        let usage_pos = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Usage(_)))
+            .unwrap();
+        let msgstop = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::MessageStop { .. }))
+            .unwrap();
+        assert!(last_stop < usage_pos && usage_pos < msgstop, "{events:?}");
+    }
+
+    #[test]
+    fn repeated_same_id_chunks_do_not_restart_tool_call() {
+        // Manche Server wiederholen die id in JEDEM Chunk — das darf keinen neuen Call starten.
+        let mut m = OpenAiMapper::default();
+        let c1 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","function":{"name":"f","arguments":"{\"a\":"}}]}}]});
+        let c2 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","function":{"arguments":"1}"}}]}}]});
+        let mut ev = m.push(&c1);
+        ev.extend(m.push(&c2));
+        ev.extend(m.done());
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUseStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUseStop { .. }))
+                .count(),
+            1
+        );
+        let args: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseInputDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"a\":1}");
+    }
+
+    #[test]
+    fn empty_tool_call_id_starts_nothing() {
+        // Leere id zählt wie „keine id": kein Start, Deltas ohne offenen Call werden verworfen.
+        let mut m = OpenAiMapper::default();
+        let c = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"","function":{"name":"f","arguments":"{}"}}]}}]});
+        let mut ev = m.push(&c);
+        ev.extend(m.done());
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolUseStart { .. })));
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolUseInputDelta { .. })));
     }
 }
