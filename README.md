@@ -119,6 +119,12 @@ nicht, bricht sepp mit einer klaren Anleitung ab statt mit einem rohen Verbindun
 abweichender Endpunkt/Port lässt sich per `OPENAI_BASE_URL` setzen; `-m` muss dem in LM Studio
 geladenen Modell entsprechen (Identifier via `GET http://localhost:1234/v1/models`).
 
+> **Key-Verhalten (Sicherheit):** Im Zero-Config-Fall sendet `--provider mlx` **keinen**
+> `Authorization`-Header — ein für andere Tools exportierter `OPENAI_API_KEY` geht also nie an
+> den lokalen Port 1234. Erst mit explizit gesetztem `OPENAI_BASE_URL` (bewusstes Opt-in, z. B.
+> für einen LM-Studio-Server mit aktivierter Auth) wird ein vorhandener `OPENAI_API_KEY`
+> mitgesendet.
+
 ### Vorgebaute Binary für Linux ARM (aarch64)
 
 Für ARM64-Linux (Raspberry Pi OS 64-bit, ARM-VPS/Cloud, ARM-SBCs). Die Binary ist
@@ -200,7 +206,8 @@ OPENAI_BASE_URL=http://localhost:11434/v1 sepp --provider local -m llama3 -p "..
 ```
 
 Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--model`,
-`--max-tokens`, `--provider anthropic|openai|local`, `--rpc`, `--sqlite`. `sepp --help` zeigt alles.
+`--max-tokens`, `--provider anthropic|openai|local|zai|mlx`, `--rpc`, `--sqlite`.
+`sepp --help` zeigt alles.
 
 > Im RPC- und One-shot-Modus ist **stdout der reine Datenkanal**; alle Logs gehen nach stderr.
 
@@ -209,9 +216,12 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 | Variable | Zweck |
 |----------|-------|
 | `ANTHROPIC_API_KEY` | Anthropic-Live-Aufrufe |
-| `OPENAI_API_KEY` | OpenAI (optional bei lokalen Servern) |
-| `OPENAI_BASE_URL` | OpenAI-kompatible base_url (Ollama/vLLM/local) |
+| `OPENAI_API_KEY` | OpenAI (optional bei lokalen Servern; `--provider mlx` sendet ihn nur bei explizit gesetztem `OPENAI_BASE_URL`) |
+| `OPENAI_BASE_URL` | OpenAI-kompatible base_url (Ollama/vLLM/local/mlx) |
+| `ZAI_API_KEY` | z.ai/Zhipu-GLM (Pflicht für `--provider zai`) |
+| `ZAI_BASE_URL` | z.ai base_url überschreiben (Default api.z.ai) |
 | `SEPP_PROVIDER` | Default-Provider, wenn `--provider` fehlt |
+| `SEPP_THINK` | Default-Reasoning (on/off), wenn `--think`/`--no-think` fehlt |
 | `RUST_LOG` | Log-Level (One-shot/RPC; Logs nach stderr) |
 
 Standardmäßig liegt alles unter der einen Wurzel `~/.sepp/`. Für System-Installationen ist die Wurzel
