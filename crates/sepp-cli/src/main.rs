@@ -22,6 +22,7 @@ use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
 use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
+use sepp_provider::openai::{MLX_BASE_URL, MLX_HOST_PORT};
 use sepp_provider::{models, AnthropicProvider, OpenAiProvider, Provider, ZaiProvider};
 use sepp_tools::{builtin_tools, Tool};
 
@@ -55,7 +56,7 @@ struct RunOpts {
     model: Option<String>,
     max_tokens: Option<u64>,
     session: SessionSelect,
-    /// `anthropic` (Default) | `openai` | `local`.
+    /// `anthropic` (Default) | `openai` | `local` | `zai` | `mlx`.
     provider: Option<String>,
     /// JSONL-RPC über stdin/stdout statt TUI/One-shot.
     rpc: bool,
@@ -258,11 +259,12 @@ fn print_help() {
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
          \x20 -h, --help                Diese Hilfe\n\
          \x20 -V, --version             Version\n\n\
-         TUI-Befehle: /new /resume /tree /compact /model [id] /trust /reload /quit\n\
+         TUI-Befehle: /new /resume /tree /compact /model [id] /trust /reload /hide /show /quit\n\
          \x20            (plus /<name> für Prompt-Templates aus ~/.sepp/prompts)\n\n\
          Umgebung:\n\
          \x20 ANTHROPIC_API_KEY         Pflicht für Anthropic-Live-Aufrufe\n\
-         \x20 OPENAI_API_KEY            OpenAI (optional bei lokalen Servern)\n\
+         \x20 OPENAI_API_KEY            OpenAI (optional bei lokalen Servern; --provider mlx\n\
+         \x20                           sendet ihn nur bei explizit gesetztem OPENAI_BASE_URL)\n\
          \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local/mlx)\n\
          \x20                           (--provider mlx: Default http://localhost:1234/v1 = LM Studio)\n\
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
@@ -558,6 +560,15 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         std::env::var("SEPP_THINK").ok().as_deref(),
         is_zai,
     );
+    // --think/SEPP_THINK ist bei OpenAI-Dialekt-Providern wirkungslos (kein Request-seitiges
+    // Reasoning-Feld; anthropic/zai haben eins) — explizit gewünschtes Reasoning wäre sonst
+    // ein stiller No-op.
+    if thinking != ThinkingLevel::Off && (is_openai || is_mlx) {
+        eprintln!(
+            "Hinweis: --think/SEPP_THINK hat bei --provider {provider_kind} keine Wirkung — \
+             der Wert wird ignoriert."
+        );
+    }
     // Session-Store VOR den Key-Checks bauen, damit jeder Start auditierbar ist: bricht ein
     // Key-Check ab, hängen wir einen `aborted`-Eintrag an und fsyncen — die Datei existiert auch
     // ohne erfolgreichen Provider-Start (Audit-Trail). `build_store` braucht weder Provider noch
@@ -621,38 +632,56 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         )
         .await);
     }
-    // mlx: Modell muss explizit gewählt werden — sepp schreibt kein Modell vor; LM Studio bedient
-    // das jeweils geladene Modell, dessen Identifier der Nutzer mit -m angibt.
-    if is_mlx && opts.model.is_none() {
-        let msg =
-            "Kein Modell angegeben. Wähle mit -m <modell> das in LM Studio geladene Modell\n  \
-             (Identifier siehst du in LM Studio oder via GET http://localhost:1234/v1/models).";
-        return Err(abort_with_audit(
-            store.as_mut(),
-            msg,
-            serde_json::json!({ "reason": "missing_model", "provider": "mlx" }),
-        )
-        .await);
-    }
-    // mlx: früh + hilfreich scheitern, wenn LM Studios lokaler Server nicht läuft — statt rohem
-    // "connection refused" erst im Stream. Nur für den Default-Endpunkt; bei gesetztem
-    // OPENAI_BASE_URL vertraut sepp der Nutzerkonfiguration (abweichender Host/Port).
-    if is_mlx && std::env::var_os("OPENAI_BASE_URL").is_none() {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1234));
-        let up = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700))
-            .is_ok();
-        if !up {
-            let msg = "Kein lokaler MLX-Server auf http://localhost:1234 erreichbar.\n  \
-                 - LM Studio öffnen → Developer → Local Server starten (Port 1234)\n  \
-                 - dort ein tool-fähiges MLX-Modell (mit Function-/Tool-Calling) laden\n  \
-                 - LM Studio noch nicht installiert? https://lmstudio.ai\n  \
-                 - abweichender Endpunkt/Port? OPENAI_BASE_URL setzen.";
+    if is_mlx {
+        // Effektiver Endpunkt-Override: Leerstring zählt wie „nicht gesetzt" — konsistent zur
+        // Auflösung im Provider (openai::resolve_base_url); None ⇒ Zero-Config-Default.
+        let base_override = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        // Modell muss explizit gewählt werden — sepp schreibt kein Modell vor; LM Studio bedient
+        // das jeweils geladene Modell, dessen Identifier der Nutzer mit -m angibt.
+        if opts.model.is_none() {
+            let msg = format!(
+                "Kein Modell angegeben. Wähle mit -m <modell> das in LM Studio geladene Modell\n  \
+                 (Identifier siehst du in LM Studio oder via GET {}/models).",
+                base_override.as_deref().unwrap_or(MLX_BASE_URL)
+            );
             return Err(abort_with_audit(
                 store.as_mut(),
-                msg,
-                serde_json::json!({ "reason": "mlx_server_unreachable", "provider": "mlx" }),
+                &msg,
+                serde_json::json!({ "reason": "missing_model", "provider": provider_kind }),
             )
             .await);
+        }
+        // Früh + hilfreich scheitern, wenn LM Studios lokaler Server nicht läuft — statt rohem
+        // Verbindungsfehler erst im Stream. Nur für den Default-Endpunkt; bei gesetztem
+        // OPENAI_BASE_URL vertraut sepp der Nutzerkonfiguration. Async + Hostname statt fixer
+        // IPv4-Adresse: getaddrinfo probiert ::1 UND 127.0.0.1 (Muster wie der MCP-Connect
+        // weiter unten), und der current_thread-Reaktor bleibt frei (kein blockierender Syscall).
+        if base_override.is_none() {
+            let up = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(700),
+                    tokio::net::TcpStream::connect(MLX_HOST_PORT),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if !up {
+                let msg = format!(
+                    "Kein lokaler MLX-Server auf http://{MLX_HOST_PORT} erreichbar.\n  \
+                     - LM Studio öffnen → Developer → Local Server starten\n  \
+                     - dort ein tool-fähiges MLX-Modell (mit Function-/Tool-Calling) laden\n  \
+                     - LM Studio noch nicht installiert? https://lmstudio.ai\n  \
+                     - abweichender Endpunkt/Port? OPENAI_BASE_URL setzen."
+                );
+                return Err(abort_with_audit(
+                    store.as_mut(),
+                    &msg,
+                    serde_json::json!({ "reason": "mlx_server_unreachable", "provider": provider_kind }),
+                )
+                .await);
+            }
         }
     }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
@@ -996,7 +1025,9 @@ pub(crate) fn model_label(model: &Model) -> &str {
     }
 }
 
-fn custom_model(id: String, provider: &str) -> Model {
+/// Fallback-`Model` für unregistrierte IDs — provider-bewusst (Kontextfenster, Provider-Tag).
+/// Auch vom TUI-`/model`-Befehl genutzt; das Custom-Modell erbt dort den Session-Provider.
+pub(crate) fn custom_model(id: String, provider: &str) -> Model {
     // Konservatives Kontextfenster je Provider (steuert die Auto-Compaction-Schwelle):
     // Anthropic 200k, OpenAI/lokal 128k (typisch) — lieber früher komprimieren als überlaufen.
     let context_window = if provider == "anthropic" {
