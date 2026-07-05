@@ -13,6 +13,62 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.12] - 2026-07-05
+
+Review-Härtung des 0.1.11-Umfangs (`--provider mlx`, TUI `/hide`/`/show`) — Fokus Sicherheit,
+Performance und Plattform-Robustheit.
+
+### Behoben
+- **OpenAI-Streaming-Mapper trennt Tool-Calls bei Index-Recycling korrekt.** Server der
+  llama.cpp-Familie (LM Studios Engine) streamen teils jeden Tool-Call erneut unter `index:0`
+  mit neuer id; bisher wurden die Argumente beider Calls unter der ersten id konkateniert
+  (ungültiges JSON, zweites Tool lief nie). Neues SSE-Fixture `openai_repeated_index.sse`
+  deckt den Fall ab; leere Tool-Call-ids zählen jetzt wie „keine id".
+- **TUI: `/show` friert die UI nicht mehr ein.** Der Handler lockte den Session-Mutex, den ein
+  laufender Prompt-Task für die gesamte Turn-Dauer hält — die Event-Loop stand bis Turn-Ende
+  (kein Rendern, kein Esc-Abbruch). `/hide`/`/show` togglen jetzt lock-frei.
+- **TUI: getippte Eingabe geht bei laufendem Turn nicht mehr verloren** — der Text bleibt in
+  der Eingabezeile stehen statt kommentarlos verworfen zu werden.
+- **Leere `OPENAI_BASE_URL` (`=""`) zählt jetzt wie „nicht gesetzt"** — vorher ging der
+  Preset-Default verloren (roher „relative URL"-Fehler beim ersten Request) und der
+  mlx-Erreichbarkeits-Check wurde übersprungen.
+- **mlx-Fehler melden sich als „mlx", nicht als „openai"** (`name()` + alle Fehlertexte) —
+  LM-Studio-Probleme werden nicht mehr dem falschen Anbieter zugeschrieben.
+- **Verbindungsfehler nennen den Endpunkt** („Verbindung zu … fehlgeschlagen — läuft der
+  Server?") statt eines rohen reqwest-Texts — deckt auch den Fall ab, dass der Server nach dem
+  Preflight stirbt.
+- **TUI: Cursor-Überlauf behoben** — die Cursor-Spalte wird in `usize` gerechnet (kein
+  Debug-Panic mehr bei sehr langen Eingaben/Paste), erst final geclampt.
+- **Doku-Drift repariert:** `sepp --help` listet `/hide` `/show`; `--provider`-Aufzählungen
+  (RunOpts-Doku, README) nennen `zai` und `mlx`; CHANGELOG-Linkblock 0.1.5–0.1.12 nachgezogen.
+
+### Geändert
+- **mlx-Preflight nicht-blockierend und IPv4+IPv6-korrekt:** async `tokio::net`-Connect mit
+  700-ms-Timeout gegen den Hostnamen `localhost:1234` (getaddrinfo probiert `::1` UND
+  `127.0.0.1`) statt eines synchronen IPv4-only-Syscalls auf dem Runtime-Thread; der
+  Default-Endpunkt lebt jetzt als eine `pub`-Konstante in `sepp-provider` (Konsistenz per
+  Unit-Test gesichert), Meldungstexte leiten sich daraus ab.
+- **Hinweis, wenn `--think`/`SEPP_THINK` wirkungslos ist** (`--provider openai|local|mlx`
+  senden kein Reasoning-Feld) — vorher ein stiller No-op.
+- **TUI: Meldungen erreichen bei versteckter Statuszeile den Chatverlauf** (`notify`-Helfer;
+  Fehler rot) — Feedback wie „läuft noch", `/model`-Ausgaben oder Befehls-Fehler verpufft
+  nach `/hide` nicht mehr unsichtbar.
+- **TUI: Warnung bei Prompt-Templates, die Builtin-Befehle verschatten** (beim Start und bei
+  `/reload`) — solche Templates sind per Slash unerreichbar, der Builtin gewinnt.
+- **TUI: `/model` mit unregistrierter ID erbt den Session-Provider** (korrekte
+  Compaction-Schwelle, z. B. 128k statt fälschlich anthropic/200k) und zeigt die Modell-ID
+  statt „(custom)"; die TUI-eigene `custom_model`-Kopie ist konsolidiert.
+- **Provider-Tests mutieren die Prozess-Umgebung nicht mehr** (`remove_var` entfernt;
+  base_url-Auflösung als pure, direkt getestete Funktion) — kein Data-Race-Fenster mehr im
+  parallelen Test-Binary.
+
+### Sicherheit
+- **`--provider mlx` sendet `OPENAI_API_KEY` nur noch bei explizit gesetztem
+  `OPENAI_BASE_URL`.** Im Zero-Config-Fall geht kein Bearer-Token mehr über Klartext-HTTP an
+  den lokalen Port 1234 — ein für andere Tools exportierter echter OpenAI-Key kann nicht mehr
+  an einen fremden lokalen Prozess oder in Server-Logs lecken. Wer LM Studio mit aktivierter
+  Auth nutzt, setzt `OPENAI_BASE_URL=http://localhost:1234/v1` als bewusstes Opt-in.
+
 ## [0.1.11] - 2026-07-01
 
 ### Hinzugefügt
@@ -228,7 +284,15 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.11...v0.1.12
+[0.1.11]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.10...v0.1.11
+[0.1.10]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/Vezir0013/sepp-mini/releases/tag/v0.1.0
