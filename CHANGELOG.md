@@ -7,7 +7,21 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-Fixes der Correctness-Funde aus dem Review des 0.1.12-Release.
+Fixes der Correctness-Funde aus dem Review des 0.1.12-Release, plus neue TUI-Status-Bar.
+
+### Hinzugefügt
+- **TUI-Status-Bar mit Aktivitäts-Sparkline.** Die Statuszeile zeigt statt statischem
+  „denkt …" ein Live-Diagramm der Streaming-Intensität (Token-Rate der letzten 2 s als
+  ▁▂▃▅▇-Balken — flache Linie heißt ehrlich „es fließt gerade nichts", z. B. während ein
+  Tool läuft) plus Zustandswort (wartet auf <provider> / denkt / antwortet / <tool> … /
+  komprimiert / Abbruch / Fehler) und Turn-Timer. Rechts davon: Meldungsbereich,
+  Modell (Provider), Kontext-Gauge in Prozent der Auto-Compaction-Schwelle (grün/gelb/rot;
+  100 % = Compaction feuert beim nächsten Prompt), `m:`Messages, `t:`Tool-Aufrufe im Turn,
+  Session-Dauer. Bei schmalen Terminals fallen Segmente von rechts weg (das Statement
+  bleibt am längsten). `/hide`/`/show` togglen die Bar wie bisher; der Animations-Tick
+  (250 ms) läuft NUR während eines Turns — im Idle null zusätzliche Wakeups, und die Bar
+  liest ausschließlich gecachte Metriken (nie den Session-Mutex im Render-Pfad).
+  Ausgeblendetes Thinking speist Aktivität und Sparkline jetzt trotzdem.
 
 ### Geändert
 - **Breaking: `--provider local` verlangt ein nicht-leeres `OPENAI_BASE_URL`** und bricht sonst

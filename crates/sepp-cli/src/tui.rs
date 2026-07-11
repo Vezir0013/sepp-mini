@@ -6,8 +6,10 @@
 //! Transcript-Kopie und sperrt den Store nur im Leerlauf (für `/tree` etc.) — so blockiert
 //! Streaming nie das Rendering. Gezeichnet wird per Doppelpuffer-Diff (kein Flackern).
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -19,10 +21,11 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use sepp_agent::resources::ResourceSet;
@@ -94,6 +97,61 @@ struct TreeLine {
     display: String,
 }
 
+/// Tick-Intervall der Aktivitäts-Sparkline in der Statuszeile. Tickt NUR während eines
+/// laufenden Turns (select!-Guard in `run`) — im Idle null zusätzliche Wakeups.
+const SPARK_TICK_MS: u64 = 250;
+/// Slot-Anzahl des Sparkline-Rings: 8 × 250 ms = 2-Sekunden-Fenster.
+const SPARK_LEN: usize = 8;
+
+/// Was der Agent gerade tut — speist das Statement-Segment der Statuszeile. Abgeleitet aus
+/// den [`AgentEvent`]s bzw. lokal gesetzt (compact() emittiert keine Events, Esc cancelt nur).
+#[derive(Clone, PartialEq, Debug)]
+enum Activity {
+    /// Kein Turn aktiv: `▸ bereit`.
+    Idle,
+    /// Zwischen Turn-/Runden-Start und dem ersten Delta — der Provider „wärmt auf".
+    WaitingProvider,
+    /// Reasoning-Deltas fließen (auch bei ausgeblendetem Thinking).
+    Thinking,
+    /// Antwort-Text streamt.
+    Responding,
+    /// Mindestens ein Tool läuft (Tools laufen parallel — Zählung via `tools_inflight`).
+    Tool { name: String },
+    /// `/compact` läuft (eventlos — lokal gesetzt).
+    Compacting,
+    /// Esc gedrückt, Cancellation läuft bis zum `Done`.
+    Cancelling,
+    /// Der letzte Turn endete mit Fehler (Details als `[Fehler]`-Zeile im Verlauf).
+    Failed,
+}
+
+/// Gecachte Session-Metriken für die Statuszeile. Der Render-Pfad darf den Session-Mutex
+/// NIEMALS locken (der Prompt-Task hält ihn über die gesamte Turn-Dauer — der bekannte
+/// /show-Freeze-Mechanismus); aktualisiert wird der Cache nur dort, wo der Guard ohnehin
+/// gehalten wird ([`metric_snapshot`], z. B. in `rebuild_transcript` bei jedem Turn-Ende).
+#[derive(Clone, Default)]
+struct MetricCache {
+    model_label: String,
+    provider: String,
+    est_tokens: u64,
+    threshold: Option<u64>,
+    msg_count: usize,
+}
+
+/// Schnappschuss der Bar-Metriken bei gehaltenem Session-Lock. Freie Funktion statt
+/// `&mut self`-Methode: der MutexGuard borrowt `self.session`, die Zuweisung
+/// `self.metrics = metric_snapshot(&g)` nutzt disjunkte Field-Borrows (Muster wie
+/// `rebuild_transcript`).
+fn metric_snapshot(g: &AgentSession) -> MetricCache {
+    MetricCache {
+        model_label: crate::model_label(g.model()).to_string(),
+        provider: g.provider_name().to_string(),
+        est_tokens: g.estimated_tokens(),
+        threshold: g.auto_compact_threshold(),
+        msg_count: g.messages().len(),
+    }
+}
+
 struct App {
     session: Arc<Mutex<AgentSession>>,
     transcript: Vec<DisplayMsg>,
@@ -102,7 +160,24 @@ struct App {
     show_thinking: bool,
     show_status: bool,
     input: String,
-    status: String,
+    /// Letzte Meldung (notify/notify_error) — der Meldungs-Abschnitt der Statuszeile.
+    /// Reiner Meldungskanal; die Aktivität lebt separat in [`Activity`].
+    message: Option<DisplayMsg>,
+    /// Aktueller Agent-Zustand fürs Statement-Segment (Sparkline + Zustandswort + Timer).
+    activity: Activity,
+    /// Anzahl parallel laufender Tools (Tools laufen im JoinSet nebenläufig) — erst wenn der
+    /// LETZTE endet, wechselt die Aktivität zurück zu `WaitingProvider`.
+    tools_inflight: usize,
+    /// Tool-Aufrufe im aktuellen Turn (`t:`-Segment); Reset bei start_prompt/start_compact.
+    tools_turn: usize,
+    /// Gecachte Session-Metriken (Modell, Kontext-Gauge, Messages) — nie live gelockt.
+    metrics: MetricCache,
+    session_start: Instant,
+    turn_start: Option<Instant>,
+    /// Sparkline-Ring: Delta-Bytes je 250-ms-Slot (2-s-Fenster), jüngster Slot hinten.
+    spark: VecDeque<u64>,
+    /// Delta-Bytes seit dem letzten Tick — wandert beim Tick in den Ring.
+    spark_pending: u64,
     running: bool,
     cancel: Option<CancellationToken>,
     scroll_back: u16,
@@ -169,6 +244,10 @@ pub async fn run(
     }
 
     let mut events = EventStream::new();
+    // Sparkline-/Timer-Tick: tickt via Guard NUR während eines Turns (Idle = 0 Wakeups);
+    // Skip verhindert Tick-Bursts nach langen Pausen. Interval::tick ist cancel-safe.
+    let mut tick = interval(Duration::from_millis(SPARK_TICK_MS));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let result = loop {
         if let Err(e) = terminal.draw(|f| app.render(f)) {
             break Err(e.into());
@@ -180,6 +259,7 @@ pub async fn run(
                 None => {}
             },
             Some(msg) = rx.recv() => app.on_ui_msg(msg).await,
+            _ = tick.tick(), if app.running => app.on_tick(),
         }
         if app.should_quit {
             break Ok(());
@@ -232,7 +312,18 @@ impl App {
             show_thinking,
             show_status: true,
             input: String::new(),
-            status: "bereit · /help für Befehle".into(),
+            message: Some(DisplayMsg {
+                kind: Kind::Info,
+                text: "/help für Befehle".into(),
+            }),
+            activity: Activity::Idle,
+            tools_inflight: 0,
+            tools_turn: 0,
+            metrics: MetricCache::default(),
+            session_start: Instant::now(),
+            turn_start: None,
+            spark: VecDeque::from(vec![0; SPARK_LEN]),
+            spark_pending: 0,
             running: false,
             cancel: None,
             scroll_back: 0,
@@ -252,14 +343,15 @@ impl App {
     async fn rebuild_transcript(&mut self) {
         let g = self.session.lock().await;
         self.transcript = transcript_from_messages(g.messages(), self.show_thinking);
-        self.status = idle_status(&g);
+        self.metrics = metric_snapshot(&g);
     }
 
-    /// Meldung in die Statuszeile; ist sie versteckt (`/hide`), zusätzlich als Notice unter den
-    /// Chatverlauf — Feedback darf nie unsichtbar verpuffen (verworfene Eingaben, Befehls-
-    /// Ausgaben, Fehler). Notices statt Transcript, weil rebuild_transcript den Verlauf bei
-    /// jedem Turn-Ende komplett aus den Session-Messages neu baut und Ad-hoc-Zeilen darin
-    /// rückwirkend verschwänden; der Scroll-Reset holt die View ans Ende, wo die Notice steht.
+    /// Meldung in den Meldungs-Abschnitt der Statuszeile; ist sie versteckt (`/hide`),
+    /// zusätzlich als Notice unter den Chatverlauf — Feedback darf nie unsichtbar verpuffen
+    /// (verworfene Eingaben, Befehls-Ausgaben, Fehler). Notices statt Transcript, weil
+    /// rebuild_transcript den Verlauf bei jedem Turn-Ende komplett aus den Session-Messages
+    /// neu baut und Ad-hoc-Zeilen darin rückwirkend verschwänden; der Scroll-Reset holt die
+    /// View ans Ende, wo die Notice steht.
     fn notify_kind(&mut self, kind: Kind, text: String) {
         if !self.show_status {
             self.notices.push(DisplayMsg {
@@ -268,7 +360,7 @@ impl App {
             });
             self.scroll_back = 0;
         }
-        self.status = text;
+        self.message = Some(DisplayMsg { kind, text });
     }
 
     /// [`Self::notify_kind`] als Info (grau).
@@ -279,6 +371,26 @@ impl App {
     /// [`Self::notify_kind`] als Fehler (rot).
     fn notify_error(&mut self, text: impl Into<String>) {
         self.notify_kind(Kind::Error, text.into());
+    }
+
+    /// Turn-Zustand für eine neue Nutzeraktion aufsetzen (Prompt oder Compact).
+    fn begin_turn(&mut self, activity: Activity) {
+        self.activity = activity;
+        self.turn_start = Some(Instant::now());
+        self.tools_turn = 0;
+        self.tools_inflight = 0;
+        self.spark_pending = 0;
+        for slot in self.spark.iter_mut() {
+            *slot = 0;
+        }
+    }
+
+    /// Sparkline-Tick (250 ms, nur während eines Turns — select!-Guard in `run`): jüngsten
+    /// Delta-Zähler in den Ring schieben. Das Neuzeichnen passiert pro Loop-Iteration.
+    fn on_tick(&mut self) {
+        self.spark.pop_front();
+        self.spark
+            .push_back(std::mem::take(&mut self.spark_pending));
     }
 
     // ---- Eingabe ---------------------------------------------------------
@@ -313,7 +425,7 @@ impl App {
             KeyCode::Esc => {
                 if let Some(c) = self.cancel.take() {
                     c.cancel();
-                    self.status = "Abbruch …".into();
+                    self.activity = Activity::Cancelling;
                 } else {
                     self.input.clear();
                 }
@@ -356,10 +468,11 @@ impl App {
     }
 
     fn start_prompt(&mut self, text: String) {
-        // Neue Nutzeraktion: bisheriges Notice-Feedback hat seinen Zweck erfüllt.
+        // Neue Nutzeraktion: bisheriges Notice-/Meldungs-Feedback hat seinen Zweck erfüllt.
         self.notices.clear();
+        self.message = None;
+        self.begin_turn(Activity::WaitingProvider);
         self.running = true;
-        self.status = "denkt …".into();
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
         let sess = self.session.clone();
@@ -440,6 +553,7 @@ impl App {
                     // Alte Session durabel abschließen (fsync), bevor wir umschalten.
                     let _ = g.finalize().await;
                     g.set_session(store);
+                    self.metrics = metric_snapshot(&g);
                     drop(g);
                     self.transcript.clear();
                     self.notices.clear();
@@ -463,6 +577,8 @@ impl App {
                         .unwrap_or_else(|| crate::custom_model(id, &provider));
                     let label = crate::model_label(&model).to_string();
                     g.set_model(model);
+                    // Bar-Cache nachziehen: Label und Compaction-Schwelle haben sich geändert.
+                    self.metrics = metric_snapshot(&g);
                     drop(g);
                     self.notify(format!("Modell: {label}"));
                 }
@@ -518,7 +634,7 @@ impl App {
             }
             // Bewusst ohne Session-Lock: der Prompt-Task hält den Mutex für die gesamte
             // Turn-Dauer — ein lock().await hier fröre die Event-Loop bis Turn-Ende ein
-            // (kein Rendern, kein Esc). self.status wird ohnehin durchgängig gepflegt.
+            // (kein Rendern, kein Esc). Die Bar rendert ausschließlich aus Cache/Events.
             "hide" => self.show_status = false,
             "show" => self.show_status = true,
             other => {
@@ -623,10 +739,12 @@ impl App {
     }
 
     fn start_compact(&mut self) {
-        // Neue Nutzeraktion: bisheriges Notice-Feedback hat seinen Zweck erfüllt.
+        // Neue Nutzeraktion: bisheriges Notice-/Meldungs-Feedback hat seinen Zweck erfüllt.
+        // compact() emittiert keine AgentEvents — der Zustand lebt rein lokal.
         self.notices.clear();
+        self.message = None;
+        self.begin_turn(Activity::Compacting);
         self.running = true;
-        self.status = "komprimiere …".into();
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel);
         let sess = self.session.clone();
@@ -656,6 +774,7 @@ impl App {
                     let err = g.session_mut().and_then(|s| s.branch(&id).err());
                     g.reload_from_session();
                     let t = transcript_from_messages(g.messages(), self.show_thinking);
+                    self.metrics = metric_snapshot(&g);
                     drop(g);
                     self.transcript = t;
                     self.notices.clear();
@@ -690,6 +809,7 @@ impl App {
                             let _ = g.finalize().await;
                             g.set_session(Box::new(store));
                             let t = transcript_from_messages(g.messages(), self.show_thinking);
+                            self.metrics = metric_snapshot(&g);
                             drop(g);
                             self.transcript = t;
                             self.notices.clear();
@@ -716,6 +836,11 @@ impl App {
                 self.finalize_streaming();
                 self.running = false;
                 self.cancel = None;
+                self.turn_start = None;
+                self.tools_inflight = 0;
+                // Meldungen aus dem Turn („läuft noch — bitte warten") sind jetzt obsolet;
+                // das Statement zeigt Idle bzw. Failed (Details als [Fehler]-Zeile).
+                self.message = None;
                 // Transcript mit der kanonischen Conversation abgleichen.
                 self.rebuild_transcript().await;
                 if let Some(e) = err {
@@ -723,7 +848,9 @@ impl App {
                         kind: Kind::Error,
                         text: format!("[Fehler] {e}"),
                     });
-                    self.status = "Fehler".into();
+                    self.activity = Activity::Failed;
+                } else {
+                    self.activity = Activity::Idle;
                 }
                 self.scroll_back = 0;
             }
@@ -732,17 +859,34 @@ impl App {
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
         match ev {
+            // Kommt pro PROVIDER-RUNDE (auch vor Tool-Folge-Runden) — der Provider „wärmt auf",
+            // bis das erste Delta eintrifft.
+            AgentEvent::TurnStart => self.activity = Activity::WaitingProvider,
             AgentEvent::TextDelta(s) => {
+                self.activity = Activity::Responding;
+                self.spark_pending += s.len() as u64;
                 self.streaming.get_or_insert_with(String::new).push_str(&s);
                 self.scroll_back = 0;
             }
             AgentEvent::ThinkingDelta(s) if self.show_thinking => {
+                self.activity = Activity::Thinking;
+                self.spark_pending += s.len() as u64;
                 self.streaming_thinking
                     .get_or_insert_with(String::new)
                     .push_str(&s);
                 self.scroll_back = 0;
             }
+            // Ausgeblendetes Thinking speist trotzdem Aktivität und Sparkline — sonst sähe
+            // die Bar während langer Reasoning-Phasen fälschlich „wartet auf …" mit flacher
+            // Linie. Kein Transcript-/Streaming-Write.
+            AgentEvent::ThinkingDelta(s) => {
+                self.activity = Activity::Thinking;
+                self.spark_pending += s.len() as u64;
+            }
             AgentEvent::ToolStart { name, .. } => {
+                self.tools_inflight += 1;
+                self.tools_turn += 1;
+                self.activity = Activity::Tool { name: name.clone() };
                 self.finalize_streaming();
                 self.transcript.push(DisplayMsg {
                     kind: Kind::Info,
@@ -750,11 +894,19 @@ impl App {
                 });
                 self.scroll_back = 0;
             }
-            AgentEvent::ToolEnd { is_error, .. } if is_error => {
-                self.transcript.push(DisplayMsg {
-                    kind: Kind::Info,
-                    text: "· (Tool-Fehler)".into(),
-                });
+            AgentEvent::ToolEnd { is_error, .. } => {
+                // Tools laufen parallel (JoinSet): erst wenn der LETZTE endet, wartet der
+                // Loop wieder auf den Provider.
+                self.tools_inflight = self.tools_inflight.saturating_sub(1);
+                if self.tools_inflight == 0 && matches!(self.activity, Activity::Tool { .. }) {
+                    self.activity = Activity::WaitingProvider;
+                }
+                if is_error {
+                    self.transcript.push(DisplayMsg {
+                        kind: Kind::Info,
+                        text: "· (Tool-Fehler)".into(),
+                    });
+                }
             }
             AgentEvent::TurnEnd => self.finalize_streaming(),
             // Bewusst ins Transcript statt in die Notices: auf AgentEvent::Error folgt im
@@ -874,13 +1026,34 @@ impl App {
         f.render_widget(chat, chat_area);
 
         // Die Statuszeile hat via chat_constraints Höhe 0, wenn versteckt — nur bei
-        // Sichtbarkeit rendern (spart zudem den String-Clone pro Frame).
+        // Sichtbarkeit bauen/rendern. Alle Daten kommen aus Cache/Events (NIE session.lock()
+        // im Render-Pfad — der Prompt-Task hält den Mutex über die gesamte Turn-Dauer).
         if self.show_status {
-            let status = Paragraph::new(Line::styled(
-                self.status.clone(),
-                Style::default().fg(Color::Yellow),
-            ));
-            f.render_widget(status, chunks[1]);
+            let samples: Vec<u64> = self.spark.iter().copied().collect();
+            let statement = statement_parts(
+                &self.activity,
+                &sparkline(&samples),
+                self.turn_start.map(|t| t.elapsed().as_secs()),
+                &self.metrics.provider,
+            );
+            let message = self.message.as_ref().map(|m| {
+                let color = match m.kind {
+                    Kind::Error => Color::Red,
+                    _ => Color::Yellow,
+                };
+                (m.text.clone(), Style::default().fg(color))
+            });
+            let metrics = metric_segments(
+                &self.metrics,
+                self.session_start.elapsed().as_secs(),
+                self.tools_turn,
+            );
+            let segs = status_bar_segments(statement, message, metrics, chunks[1].width as usize);
+            let spans: Vec<Span> = segs
+                .into_iter()
+                .map(|(t, st)| Span::styled(t, st))
+                .collect();
+            f.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
         }
         let input_area = chunks[2];
 
@@ -939,11 +1112,6 @@ fn render_list(f: &mut Frame, area: Rect, title: &str, items: &[String], selecte
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn idle_status(g: &AgentSession) -> String {
-    // Bewusst ohne Token-Zähler — nur Modell.
-    format!("bereit · {} · /help", crate::model_label(g.model()))
-}
-
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -972,6 +1140,199 @@ fn slash_list(names: &[String]) -> String {
         .map(|n| format!("/{n}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Zellen der Kontext-Gauge in der Statuszeile.
+const GAUGE_CELLS: usize = 6;
+
+/// Sparkline über die Ring-Samples (Delta-Bytes je Tick): `▁` für 0, sonst max-normiert auf
+/// `▂`–`█` — Autoscaling, weil Token-Raten zwischen lokalen und API-Providern um
+/// Größenordnungen variieren. Alles 0 ⇒ flache Linie („es fließt gerade nichts").
+fn sparkline(samples: &[u64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = samples.iter().copied().max().unwrap_or(0);
+    samples
+        .iter()
+        .map(|&s| {
+            if s == 0 || max == 0 {
+                BARS[0]
+            } else {
+                BARS[(1 + (s - 1).saturating_mul(7) / max) as usize]
+            }
+        })
+        .collect()
+}
+
+/// Zustandswort fürs Statement-Segment.
+fn activity_label(a: &Activity, provider: &str) -> String {
+    match a {
+        Activity::Idle => "bereit".into(),
+        Activity::WaitingProvider => format!("wartet auf {provider}"),
+        Activity::Thinking => "denkt".into(),
+        Activity::Responding => "antwortet".into(),
+        Activity::Tool { name } => format!("{name} …"),
+        Activity::Compacting => "komprimiert".into(),
+        Activity::Cancelling => "Abbruch …".into(),
+        Activity::Failed => "Fehler".into(),
+    }
+}
+
+/// Statement-Segment: Sparkline (cyan) + Zustandswort (gelb) + Turn-Timer (dunkelgrau);
+/// Idle/Failed kommen ohne Sparkline/Timer aus.
+fn statement_parts(
+    a: &Activity,
+    spark: &str,
+    elapsed_secs: Option<u64>,
+    provider: &str,
+) -> Vec<(String, Style)> {
+    let dim = Style::default().fg(Color::DarkGray);
+    match a {
+        Activity::Idle => vec![(
+            "▸ bereit".into(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )],
+        Activity::Failed => vec![("Fehler".into(), Style::default().fg(Color::Red))],
+        _ => {
+            let mut parts = vec![
+                (format!("{spark} "), Style::default().fg(Color::Cyan)),
+                (
+                    activity_label(a, provider),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ];
+            if let Some(s) = elapsed_secs {
+                parts.push((format!(" · {}", fmt_turn_secs(s)), dim));
+            }
+            parts
+        }
+    }
+}
+
+/// Gefüllte Gauge-Zellen (gerundet); Anzeige-Prozent über 100 füllt „nur" alle Zellen.
+fn gauge_cells(pct: u64) -> usize {
+    (pct.min(100) as usize * GAUGE_CELLS + 50) / 100
+}
+
+/// Ampelfarbe der Kontext-Gauge (100 % = Auto-Compaction feuert beim nächsten Prompt).
+fn gauge_color(pct: u64) -> Color {
+    if pct < 60 {
+        Color::Green
+    } else if pct < 85 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Metrik-Segmente rechts: Modell (Provider) · Kontext-Gauge · `m:`Messages · `t:`Tool-Calls
+/// im Turn · Session-Dauer. Bewusst OHNE rohes Token-Zahlenpaar (Gauge + Prozent genügen)
+/// und nur mit Breite-1-Glyphen (keine Emoji — East-Asian-Width-Risiko im Terminal).
+fn metric_segments(m: &MetricCache, session_secs: u64, tools_turn: usize) -> Vec<(String, Style)> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut segs = Vec::new();
+    if !m.model_label.is_empty() {
+        segs.push((format!("{} ({})", m.model_label, m.provider), dim));
+    }
+    if let Some(thr) = m.threshold.filter(|&t| t > 0) {
+        let pct = m.est_tokens.saturating_mul(100) / thr;
+        let filled = gauge_cells(pct);
+        let bar = format!("{}{}", "▆".repeat(filled), "▁".repeat(GAUGE_CELLS - filled));
+        segs.push((
+            format!("[{bar}] {pct}%"),
+            Style::default().fg(gauge_color(pct)),
+        ));
+    }
+    segs.push((format!("m:{}", m.msg_count), dim));
+    segs.push((format!("t:{tools_turn}"), dim));
+    segs.push((fmt_session(session_secs), dim));
+    segs
+}
+
+/// Turn-Timer: `8s`, ab einer Minute `1m05s`.
+fn fmt_turn_secs(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+/// Session-Dauer: `42s`, ab einer Minute `12m`, ab einer Stunde `1h12m`.
+fn fmt_session(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Setzt die Statuszeile aus Statement, Meldung und Metriken zusammen, getrennt durch ` │ `.
+/// Truncation-Priorität bei Platzmangel: Metrik-Segmente von RECHTS droppen → Meldung mit `…`
+/// kürzen bzw. droppen → zuletzt hart auf `width` schneiden (Statement bleibt am längsten).
+/// Breite in Zeichen (`chars().count()`, konsistent zu `wrap`/`cursor_x`).
+fn status_bar_segments(
+    statement: Vec<(String, Style)>,
+    message: Option<(String, Style)>,
+    mut metrics: Vec<(String, Style)>,
+    width: usize,
+) -> Vec<(String, Style)> {
+    const SEP: &str = " │ ";
+    const SEP_W: usize = 3;
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let w = |t: &str| t.chars().count();
+    let stmt_w: usize = statement.iter().map(|(t, _)| w(t)).sum();
+    let mut message = message;
+    let total = |message: &Option<(String, Style)>, metrics: &[(String, Style)]| {
+        stmt_w
+            + message.as_ref().map_or(0, |(m, _)| SEP_W + w(m))
+            + metrics.iter().map(|(t, _)| SEP_W + w(t)).sum::<usize>()
+    };
+    while !metrics.is_empty() && total(&message, &metrics) > width {
+        metrics.pop();
+    }
+    // Nach dem Metrik-Drop ist entweder alles passend oder `metrics` leer — die Meldung
+    // konkurriert also nur noch mit dem Statement um die Breite.
+    if let Some((m, st)) = message.take() {
+        if total(&Some((m.clone(), st)), &metrics) <= width {
+            message = Some((m, st));
+        } else {
+            let avail = width.saturating_sub(stmt_w + SEP_W);
+            if avail > 1 {
+                let cut: String = m.chars().take(avail - 1).collect();
+                message = Some((format!("{cut}…"), st));
+            }
+        }
+    }
+    let mut out = statement;
+    if let Some(seg) = message {
+        out.push((SEP.into(), sep_style));
+        out.push(seg);
+    }
+    for seg in metrics {
+        out.push((SEP.into(), sep_style));
+        out.push(seg);
+    }
+    // Sicherheitsnetz: deterministisch auf `width` clippen (ratatui clippt sonst rechts).
+    let mut used = 0usize;
+    let mut clipped = Vec::new();
+    for (t, st) in out {
+        let tw = w(&t);
+        if used + tw <= width {
+            used += tw;
+            clipped.push((t, st));
+        } else {
+            let take = width.saturating_sub(used);
+            if take > 0 {
+                clipped.push((t.chars().take(take).collect(), st));
+            }
+            break;
+        }
+    }
+    clipped
 }
 
 /// Layout-Zonen des Chat-Screens: Chat, Statuszeile (Höhe 0, wenn via `/hide` versteckt),
@@ -1224,6 +1585,172 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    /// Segmenttexte zu einem String verkettet — für Truncation-Asserts.
+    fn seg_text(segs: &[(String, Style)]) -> String {
+        segs.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn sparkline_flat_and_scaled() {
+        // Alles 0 → flache Linie („es fließt nichts").
+        assert_eq!(sparkline(&[0; 8]), "▁▁▁▁▁▁▁▁");
+        // Max-normiert: 0 bleibt Boden, das Maximum erreicht den Vollbalken, monoton dazwischen.
+        let s = sparkline(&[0, 1, 2, 4, 8, 16, 32, 128]);
+        assert_eq!(s.chars().count(), 8);
+        assert!(s.starts_with('▁'));
+        assert!(s.ends_with('█'), "{s}");
+        let levels: Vec<u32> = s.chars().map(|c| c as u32).collect();
+        assert!(levels.windows(2).all(|w| w[0] <= w[1]), "{s}");
+    }
+
+    #[test]
+    fn gauge_color_boundaries() {
+        assert_eq!(gauge_color(0), Color::Green);
+        assert_eq!(gauge_color(59), Color::Green);
+        assert_eq!(gauge_color(60), Color::Yellow);
+        assert_eq!(gauge_color(84), Color::Yellow);
+        assert_eq!(gauge_color(85), Color::Red);
+        assert_eq!(gauge_color(150), Color::Red);
+    }
+
+    #[test]
+    fn gauge_cells_rounding() {
+        assert_eq!(gauge_cells(0), 0);
+        // Beispiel-Parität: 32 % → 2 von 6 Zellen.
+        assert_eq!(gauge_cells(32), 2);
+        assert_eq!(gauge_cells(100), 6);
+        // Anzeige-Prozent über 100 füllt „nur" alle Zellen (kein Index-Überlauf).
+        assert_eq!(gauge_cells(140), 6);
+    }
+
+    #[test]
+    fn fmt_durations() {
+        assert_eq!(fmt_turn_secs(8), "8s");
+        assert_eq!(fmt_turn_secs(59), "59s");
+        assert_eq!(fmt_turn_secs(65), "1m05s");
+        assert_eq!(fmt_session(42), "42s");
+        assert_eq!(fmt_session(60), "1m");
+        assert_eq!(fmt_session(3599), "59m");
+        assert_eq!(fmt_session(4320), "1h12m");
+    }
+
+    #[test]
+    fn bar_truncation_priority() {
+        let stmt = || vec![("▂▅▇▆ antwortet · 8s".to_string(), Style::default())];
+        let msg = || Some(("Modell: glm-5.2".to_string(), Style::default()));
+        let metrics = || {
+            vec![
+                ("glm-5.2 (zai)".to_string(), Style::default()),
+                ("[▆▆▁▁▁▁] 32%".to_string(), Style::default()),
+                ("m:13".to_string(), Style::default()),
+            ]
+        };
+        // Breit genug: alles da.
+        let full = seg_text(&status_bar_segments(stmt(), msg(), metrics(), 120));
+        assert!(full.contains("antwortet") && full.contains("m:13") && full.contains("Modell:"));
+        // Eng: Metriken fallen von RECHTS, die Meldung überlebt sie.
+        let mid = seg_text(&status_bar_segments(stmt(), msg(), metrics(), 40));
+        assert!(mid.contains("Modell:"), "{mid}");
+        assert!(!mid.contains("m:13"), "{mid}");
+        // Sehr eng: nur das (ggf. gekürzte) Statement, Gesamtbreite hält das Limit.
+        let tiny = status_bar_segments(stmt(), msg(), metrics(), 20);
+        let tiny_text = seg_text(&tiny);
+        assert!(tiny_text.starts_with("▂▅▇▆ antwortet"), "{tiny_text}");
+        assert!(tiny_text.chars().count() <= 20, "{tiny_text}");
+        assert!(!tiny_text.contains("Modell:"), "{tiny_text}");
+        // Zu lange Meldung wird mit … gekürzt statt zu verschwinden.
+        let long_msg = Some(("x".repeat(60), Style::default()));
+        let cut = seg_text(&status_bar_segments(stmt(), long_msg, vec![], 40));
+        assert!(cut.contains('…'), "{cut}");
+        assert!(cut.chars().count() <= 40, "{cut}");
+    }
+
+    #[tokio::test]
+    async fn activity_follows_agent_events() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::TurnStart);
+        assert_eq!(app.activity, Activity::WaitingProvider);
+        app.on_agent_event(AgentEvent::TextDelta("hallo".into()));
+        assert_eq!(app.activity, Activity::Responding);
+        assert!(app.spark_pending > 0);
+        app.on_agent_event(AgentEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+        });
+        assert_eq!(
+            app.activity,
+            Activity::Tool {
+                name: "bash".into()
+            }
+        );
+        // TurnEnd ändert die Aktivität nicht (ToolEnds kommen danach).
+        app.on_agent_event(AgentEvent::TurnEnd);
+        assert!(matches!(app.activity, Activity::Tool { .. }));
+        app.on_agent_event(AgentEvent::ToolEnd {
+            id: "t1".into(),
+            is_error: false,
+        });
+        assert_eq!(app.activity, Activity::WaitingProvider);
+    }
+
+    #[tokio::test]
+    async fn parallel_tools_wait_for_last_end() {
+        // Tools laufen parallel (JoinSet): erst der LETZTE ToolEnd wechselt zurück.
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolStart {
+            id: "a".into(),
+            name: "read".into(),
+        });
+        app.on_agent_event(AgentEvent::ToolStart {
+            id: "b".into(),
+            name: "bash".into(),
+        });
+        app.on_agent_event(AgentEvent::TurnEnd);
+        app.on_agent_event(AgentEvent::ToolEnd {
+            id: "a".into(),
+            is_error: false,
+        });
+        assert!(matches!(app.activity, Activity::Tool { .. }));
+        app.on_agent_event(AgentEvent::ToolEnd {
+            id: "b".into(),
+            is_error: true,
+        });
+        assert_eq!(app.activity, Activity::WaitingProvider);
+        assert_eq!(app.tools_turn, 2);
+        assert_eq!(app.tools_inflight, 0);
+    }
+
+    #[tokio::test]
+    async fn hidden_thinking_updates_activity_only() {
+        // Ausgeblendetes Thinking speist Aktivität + Sparkline, aber weder Transcript noch
+        // Streaming-Puffer — sonst zeigte die Bar fälschlich „wartet" mit flacher Linie.
+        let mut app = test_app();
+        assert!(!app.show_thinking);
+        app.on_agent_event(AgentEvent::ThinkingDelta("überlege…".into()));
+        assert_eq!(app.activity, Activity::Thinking);
+        assert!(app.spark_pending > 0);
+        assert!(app.streaming_thinking.is_none());
+        assert!(app.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_prompt_resets_turn_state() {
+        let mut app = test_app();
+        app.show_status = false;
+        app.notify("alter Hinweis");
+        app.spark_pending = 99;
+        app.spark[0] = 7;
+        app.tools_turn = 3;
+        app.start_prompt("hallo".into());
+        assert_eq!(app.activity, Activity::WaitingProvider);
+        assert!(app.turn_start.is_some());
+        assert_eq!(app.tools_turn, 0);
+        assert_eq!(app.spark_pending, 0);
+        assert!(app.spark.iter().all(|&s| s == 0));
+        assert!(app.message.is_none());
+        assert!(app.notices.is_empty());
+    }
+
     #[tokio::test]
     async fn notices_survive_transcript_rebuild() {
         // Bei /hide ist die Notice die einzige sichtbare Kopie des Feedbacks — sie muss den
@@ -1276,7 +1803,10 @@ mod tests {
         app.input = "/compact".into();
         app.submit().await;
         assert_eq!(app.input, "/compact");
-        assert_eq!(app.status, "läuft noch — bitte warten");
+        assert_eq!(
+            app.message.as_ref().map(|m| m.text.as_str()),
+            Some("läuft noch — bitte warten")
+        );
     }
 
     #[tokio::test]
