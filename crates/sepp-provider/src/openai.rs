@@ -43,9 +43,14 @@ pub struct OpenAiMapper {
     stopped: bool,
     tools: HashMap<u64, String>, // index -> id des aktuell offenen Tool-Calls
     /// Alle gestarteten Tool-Call-ids in Startreihenfolge — Grundlage für die Stops in `done()`.
+    /// Invariante: genau EIN Eintrag (und ein `ToolUseStart`) je id, auch bei Index-Recycling
+    /// oder Index-Drift — sonst entstünden doppelte PendingCalls mit derselben tool_call_id.
     started_ids: Vec<String>,
     /// ids, für die bereits ein `ToolUseStop` emittiert wurde (Index-Recycling schließt früh).
     closed_ids: HashSet<String>,
+    /// Zähler für synthetische ids (`call_synth_{n}`), wenn ein Server einen Tool-Call mit
+    /// leerer/fehlender id eröffnet — der Call soll laufen statt stumm verworfen zu werden.
+    synth_seq: u64,
     stop: StopReason,
     usage: Usage,
     has_usage: bool,
@@ -94,31 +99,49 @@ impl OpenAiMapper {
                             .get("id")
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty());
-                        match self.tools.entry(idx) {
-                            Entry::Vacant(e) => {
-                                if let Some(id) = chunk_id {
-                                    e.insert(id.to_string());
-                                    self.started_ids.push(id.to_string());
-                                    out.push(StreamEvent::ToolUseStart {
-                                        id: id.to_string(),
-                                        name: tool_name(tc),
-                                    });
-                                }
+                        match chunk_id {
+                            // Bereits GESCHLOSSENE id taucht erneut auf (A→B→A am selben Index):
+                            // degenerierter Server — Chunk samt Argumenten ignorieren. Ein zweiter
+                            // Start ohne zweites Stop bräche die Invariante „genau ein Start/Stop
+                            // je id" (doppelte tool_use-Blöcke im Folge-Request → HTTP 400).
+                            Some(id) if self.closed_ids.contains(id) => continue,
+                            // id ist bereits OFFEN, ggf. unter neuem Index (Index-Drift) oder
+                            // erneut im Folge-Chunk (Server wiederholen sie teils pro Chunk):
+                            // nur das Index-Mapping nachziehen, KEIN zweiter Start. Ein dabei
+                            // verdrängter anderer offener Call bleibt in `started_ids` und wird
+                            // in done() geschlossen.
+                            Some(id) if self.started_ids.iter().any(|s| s.as_str() == id) => {
+                                self.tools.insert(idx, id.to_string());
                             }
-                            // Manche Server (llama.cpp-Familie, LM Studio) recyceln index 0 für
-                            // JEDEN Tool-Call: eine neue, abweichende id eröffnet einen neuen Call
-                            // — den vorigen schließen, sonst würden die Argumente beider Calls
-                            // unter der ersten id konkateniert. Dieselbe id erneut (Server
-                            // wiederholen sie teils pro Chunk) ist bewusst ein No-op.
-                            Entry::Occupied(mut e) => {
-                                if let Some(id) = chunk_id.filter(|&id| e.get().as_str() != id) {
-                                    let old = e.insert(id.to_string());
+                            // Neue id: Manche Server (llama.cpp-Familie, LM Studio) recyceln
+                            // index 0 für JEDEN Tool-Call — den vorigen Call schließen, sonst
+                            // würden die Argumente beider Calls unter der ersten id konkateniert.
+                            Some(id) => {
+                                if let Some(old) = self.tools.insert(idx, id.to_string()) {
                                     if self.closed_ids.insert(old.clone()) {
                                         out.push(StreamEvent::ToolUseStop { id: old });
                                     }
-                                    self.started_ids.push(id.to_string());
+                                }
+                                self.started_ids.push(id.to_string());
+                                out.push(StreamEvent::ToolUseStart {
+                                    id: id.to_string(),
+                                    name: tool_name(tc),
+                                });
+                            }
+                            // Keine/leere id: auf offenem Index Continuation des laufenden Calls
+                            // (args-Folge-Chunks tragen keine id). Auf freiem Index eröffnet der
+                            // Chunk einen Call OHNE id (degenerierte Server) — synthetische id
+                            // vergeben statt den Call stumm zu verwerfen: tool_use.id und
+                            // tool_result.tool_use_id stammen beide aus demselben PendingCall,
+                            // die Paarung bleibt also auch mit erfundener id konsistent.
+                            None => {
+                                if let Entry::Vacant(e) = self.tools.entry(idx) {
+                                    let id = format!("call_synth_{}", self.synth_seq);
+                                    self.synth_seq += 1;
+                                    e.insert(id.clone());
+                                    self.started_ids.push(id.clone());
                                     out.push(StreamEvent::ToolUseStart {
-                                        id: id.to_string(),
+                                        id,
                                         name: tool_name(tc),
                                     });
                                 }
@@ -223,13 +246,21 @@ pub fn decode_openai_sse(raw: &[u8]) -> Vec<StreamEvent> {
     out
 }
 
-/// Effektive base_url: nicht-leerer Env-Wert gewinnt, sonst `default`. Leere/Whitespace-Werte
-/// (z. B. `OPENAI_BASE_URL=""` aus Shell-Profilen/CI) zählen als „nicht gesetzt" — sonst ginge
-/// der Preset-Default verloren und der erste Request scheitert an einer relativen URL.
+/// Nicht-leerer, getrimmter Wert oder `None` — DIE Semantik für „Env-Wert vorhanden":
+/// leer/Whitespace zählt als fehlend, umgebender Whitespace (Copy-Paste, Shell-Profile) wird
+/// entfernt. Ein Trailing Space in einer base_url würde sonst als `%20` in der Request-URL
+/// landen (404), ein Whitespace-Key als sinnloser `Bearer`-Header. `pub`, damit die
+/// CLI-Frühchecks (sepp-cli) exakt dieselbe Auflösung nutzen wie die Provider.
+pub fn nonempty_trimmed(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Effektive base_url: nicht-leerer Env-Wert gewinnt (getrimmt), sonst `default`.
+/// Leere/Whitespace-Werte (z. B. `OPENAI_BASE_URL=""` aus Shell-Profilen/CI) zählen als
+/// „nicht gesetzt" — sonst ginge der Preset-Default verloren und der erste Request scheitert
+/// an einer relativen URL.
 pub(crate) fn resolve_base_url(env_val: Option<String>, default: &str) -> String {
-    env_val
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+    nonempty_trimmed(env_val).unwrap_or_else(|| default.to_string())
 }
 
 /// OpenAI-kompatibler Provider.
@@ -266,9 +297,7 @@ impl OpenAiProvider {
     /// `OPENAI_API_KEY` (optional für lokale Server) + `OPENAI_BASE_URL` (Default OpenAI).
     pub fn from_env() -> Result<Self> {
         let base = resolve_base_url(std::env::var("OPENAI_BASE_URL").ok(), DEFAULT_BASE_URL);
-        let key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
+        let key = nonempty_trimmed(std::env::var("OPENAI_API_KEY").ok());
         Ok(Self::new(key, base))
     }
 
@@ -297,13 +326,15 @@ impl OpenAiProvider {
 /// (localhost:1234) darf ein für andere Tools exportierter echter `OPENAI_API_KEY` nicht als
 /// Bearer über Klartext-HTTP an einen beliebigen lokalen Prozess auf Port 1234 lecken.
 fn mlx_config(env_base: Option<String>, env_key: Option<String>) -> (String, Option<String>) {
-    let explicit = env_base.as_deref().is_some_and(|s| !s.trim().is_empty());
-    let base = resolve_base_url(env_base, MLX_BASE_URL);
-    let key = if explicit {
-        env_key.filter(|k| !k.is_empty())
+    // Key-Opt-in und Default-Endpunkt hängen an EINER Auflösung — zwei getrennte Prädikate
+    // über denselben Wert könnten auseinanderdriften (Key ginge dann an den falschen Endpunkt).
+    let base_override = nonempty_trimmed(env_base);
+    let key = if base_override.is_some() {
+        nonempty_trimmed(env_key)
     } else {
         None
     };
+    let base = base_override.unwrap_or_else(|| MLX_BASE_URL.to_string());
     (base, key)
 }
 
@@ -725,6 +756,21 @@ mod tests {
             resolve_base_url(Some("http://10.0.0.2:8080/v1".into()), MLX_BASE_URL),
             "http://10.0.0.2:8080/v1"
         );
+        // Umgebender Whitespace (Copy-Paste) wird entfernt — ein Trailing Space würde sonst
+        // als %20 in der Request-URL landen und der Server antwortete 404.
+        assert_eq!(
+            resolve_base_url(Some("http://10.0.0.2:8080/v1 ".into()), MLX_BASE_URL),
+            "http://10.0.0.2:8080/v1"
+        );
+    }
+
+    #[test]
+    fn nonempty_trimmed_semantics() {
+        // DIE eine „Env-Wert vorhanden"-Semantik: leer/Whitespace = fehlend, sonst getrimmt.
+        assert_eq!(nonempty_trimmed(None), None);
+        assert_eq!(nonempty_trimmed(Some(String::new())), None);
+        assert_eq!(nonempty_trimmed(Some("  \n".into())), None);
+        assert_eq!(nonempty_trimmed(Some(" x ".into())).as_deref(), Some("x"));
     }
 
     #[test]
@@ -746,6 +792,12 @@ mod tests {
         // Leerer Override zählt als „nicht gesetzt": Default-Endpunkt, kein Key.
         let (base, key) = mlx_config(Some(String::new()), Some("k".into()));
         assert_eq!(base, MLX_BASE_URL);
+        assert_eq!(key, None);
+        // Whitespace an base und Key wird getrimmt; Whitespace-only-Key zählt als fehlend.
+        let (base, key) = mlx_config(Some(" http://host:8080/v1 ".into()), Some(" k\n".into()));
+        assert_eq!(base, "http://host:8080/v1");
+        assert_eq!(key.as_deref(), Some("k"));
+        let (_, key) = mlx_config(Some("http://host:8080/v1".into()), Some("  ".into()));
         assert_eq!(key, None);
     }
 
@@ -860,18 +912,128 @@ mod tests {
     }
 
     #[test]
-    fn empty_tool_call_id_starts_nothing() {
-        // Leere id zählt wie „keine id": kein Start, Deltas ohne offenen Call werden verworfen.
+    fn empty_tool_call_id_gets_synthetic_id() {
+        // Leere id im ERSTEN Chunk: der Call läuft mit synthetischer id durch (wie unter
+        // 0.1.11, wo er mit id "" lief) statt stumm verworfen zu werden; Folge-Chunks mit
+        // leerer id sind Continuation desselben Calls.
         let mut m = OpenAiMapper::default();
-        let c = json!({"choices":[{"index":0,"delta":{"tool_calls":[
-            {"index":0,"id":"","function":{"name":"f","arguments":"{}"}}]}}]});
-        let mut ev = m.push(&c);
+        let c1 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"","function":{"name":"f","arguments":"{\"a\":"}}]}}]});
+        let c2 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"1}"}}]}}]});
+        let mut ev = m.push(&c1);
+        ev.extend(m.push(&c2));
         ev.extend(m.done());
-        assert!(!ev
+        let starts: Vec<&str> = ev
             .iter()
-            .any(|e| matches!(e, StreamEvent::ToolUseStart { .. })));
-        assert!(!ev
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStart { id, name } => {
+                    assert_eq!(name, "f");
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "{ev:?}");
+        assert!(starts[0].starts_with("call_synth_"), "{}", starts[0]);
+        let args: String = ev
             .iter()
-            .any(|e| matches!(e, StreamEvent::ToolUseInputDelta { .. })));
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseInputDelta { id, partial_json } => {
+                    assert_eq!(id, starts[0]);
+                    Some(partial_json.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"a\":1}");
+        let stops: Vec<&str> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStop { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, [starts[0]]);
+    }
+
+    #[test]
+    fn reappearing_closed_id_is_ignored() {
+        // A→B→A am selben Index: die bereits geschlossene id A darf weder erneut starten noch
+        // Argumente annehmen — genau ein Start/Stop je id, in Startreihenfolge.
+        let mut m = OpenAiMapper::default();
+        let a1 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"fa","arguments":"{\"x\":1}"}}]}}]});
+        let b = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_b","function":{"name":"fb","arguments":"{}"}}]}}]});
+        let a2 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"arguments":"{\"y\":2}"}}]}}]});
+        let mut ev = m.push(&a1);
+        ev.extend(m.push(&b));
+        ev.extend(m.push(&a2));
+        ev.extend(m.done());
+        let starts: Vec<&str> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStart { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, ["call_a", "call_b"], "{ev:?}");
+        let stops: Vec<&str> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStop { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, ["call_a", "call_b"], "{ev:?}");
+        // Die Argumente des dritten Chunks (wiederauferstandenes call_a) werden verworfen.
+        let a_args: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseInputDelta { id, partial_json } if id == "call_a" => {
+                    Some(partial_json.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(a_args, "{\"x\":1}");
+    }
+
+    #[test]
+    fn same_id_under_new_index_does_not_restart() {
+        // Index-Drift: dieselbe id taucht unter neuem Index auf — Continuation, kein zweiter
+        // Start; die Argumente beider Chunks konkatenzieren unter der einen id.
+        let mut m = OpenAiMapper::default();
+        let c1 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"f","arguments":"{\"a\":"}}]}}]});
+        let c2 = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":1,"id":"call_a","function":{"arguments":"1}"}}]}}]});
+        let mut ev = m.push(&c1);
+        ev.extend(m.push(&c2));
+        ev.extend(m.done());
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUseStart { .. }))
+                .count(),
+            1,
+            "{ev:?}"
+        );
+        let args: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseInputDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"a\":1}");
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolUseStop { .. }))
+                .count(),
+            1,
+            "{ev:?}"
+        );
     }
 }

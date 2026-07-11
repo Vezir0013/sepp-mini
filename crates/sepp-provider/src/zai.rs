@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_core::Result;
 
-use crate::openai::{build_chat_body, resolve_base_url, stream_chat, OpenAiDialect};
+use crate::openai::{
+    build_chat_body, nonempty_trimmed, resolve_base_url, stream_chat, OpenAiDialect,
+};
 use crate::{CompletionRequest, Provider, StreamEvent};
 
 /// z.ai (Zhipu/GLM) spricht den OpenAI-kompatiblen Chat-Completions-Endpunkt; das ist der
@@ -41,7 +43,7 @@ impl ZaiProvider {
     /// `ZAI_BASE_URL` (Default `https://api.z.ai/api/paas/v4`).
     pub fn from_env() -> Result<Self> {
         let base = resolve_base_url(std::env::var("ZAI_BASE_URL").ok(), ZAI_BASE_URL);
-        let key = std::env::var("ZAI_API_KEY").ok().filter(|k| !k.is_empty());
+        let key = nonempty_trimmed(std::env::var("ZAI_API_KEY").ok());
         Ok(Self::new(key, base))
     }
 }

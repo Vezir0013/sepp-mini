@@ -234,6 +234,32 @@ fn resolve_thinking(flag: Option<bool>, env: Option<&str>, is_zai: bool) -> Thin
     }
 }
 
+/// Env-Wert mit der Provider-Semantik „leer/Whitespace = nicht gesetzt" (getrimmt) — exakt
+/// die Auflösung, die auch `openai::from_env`/`mlx_config` nutzen. Eine Quelle, kein Drift:
+/// Frühchecks und Provider dürfen „gesetzt?" nie unterschiedlich beantworten (sonst geht z. B.
+/// ein Request ohne Frühwarnung an api.openai.com).
+fn env_nonempty(name: &str) -> Option<String> {
+    sepp_provider::openai::nonempty_trimmed(std::env::var(name).ok())
+}
+
+/// Frühcheck für die OpenAI-Dialekt-Provider (pur, testbar ohne Env-Mutation). Liefert das
+/// `reason`-Tag für den Audit-Eintrag oder `None`, wenn der Start zulässig ist:
+/// - `openai` ohne base_url-Override UND ohne Key → `missing_api_key` (der Request ginge an
+///   api.openai.com und endete als roher 401).
+/// - `local` ohne base_url → `missing_base_url`: local MEINT einen lokalen Endpunkt; der
+///   from_env-Fallback auf api.openai.com wäre ein stiller Cloud-Egress samt Key und Prompt.
+fn openai_local_precheck(
+    provider: &str,
+    base: Option<&str>,
+    key: Option<&str>,
+) -> Option<&'static str> {
+    match provider {
+        "openai" if base.is_none() && key.is_none() => Some("missing_api_key"),
+        "local" if base.is_none() => Some("missing_base_url"),
+        _ => None,
+    }
+}
+
 fn print_help() {
     eprintln!(
         "sepp mini — leichtgewichtiger Agent\n\n\
@@ -266,7 +292,8 @@ fn print_help() {
          \x20 OPENAI_API_KEY            OpenAI (optional bei lokalen Servern; --provider mlx\n\
          \x20                           sendet ihn nur bei explizit gesetztem OPENAI_BASE_URL)\n\
          \x20 OPENAI_BASE_URL           OpenAI-kompatible base_url (Ollama/vLLM/local/mlx)\n\
-         \x20                           (--provider mlx: Default http://localhost:1234/v1 = LM Studio)\n\
+         \x20                           (Pflicht für --provider local; --provider mlx:\n\
+         \x20                           Default http://localhost:1234/v1 = LM Studio)\n\
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
          \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
          \x20 SEPP_HOME                 globale Konfig-Wurzel verlegen (Default ~/.sepp)\n\
@@ -560,35 +587,56 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         std::env::var("SEPP_THINK").ok().as_deref(),
         is_zai,
     );
+    // Start-Hinweise: im TUI-Modus gesammelt und dort im Chatfenster angezeigt — ein eprintln
+    // verpufft hinter dem Alternate-Screen; bei -p/--rpc bleibt stderr der sichtbare Kanal.
+    let interactive = opts.prompt.is_none() && !opts.rpc;
+    let mut startup_notices: Vec<String> = Vec::new();
+    let mut startup_notice = |msg: String| {
+        if interactive {
+            startup_notices.push(msg);
+        } else {
+            eprintln!("{msg}");
+        }
+    };
     // --think/SEPP_THINK ist bei OpenAI-Dialekt-Providern wirkungslos (kein Request-seitiges
     // Reasoning-Feld; anthropic/zai haben eins) — explizit gewünschtes Reasoning wäre sonst
     // ein stiller No-op.
     if thinking != ThinkingLevel::Off && (is_openai || is_mlx) {
-        eprintln!(
+        startup_notice(format!(
             "Hinweis: --think/SEPP_THINK hat bei --provider {provider_kind} keine Wirkung — \
              der Wert wird ignoriert."
-        );
+        ));
     }
     // Session-Store VOR den Key-Checks bauen, damit jeder Start auditierbar ist: bricht ein
     // Key-Check ab, hängen wir einen `aborted`-Eintrag an und fsyncen — die Datei existiert auch
     // ohne erfolgreichen Provider-Start (Audit-Trail). `build_store` braucht weder Provider noch
     // Modell. `mut`, weil der Abbruch-Pfad in den Store schreibt.
     let mut store = build_store(opts.sqlite, opts.prompt.is_some(), opts.rpc, &opts.session)?;
-    // Echtes OpenAI braucht einen Key — früh + klar scheitern statt erst beim 401 (lokale
-    // Endpunkte via --provider local / OPENAI_BASE_URL bleiben key-optional).
-    if provider_kind == "openai"
-        && std::env::var_os("OPENAI_BASE_URL").is_none()
-        && std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .is_none()
-    {
-        let msg = "OPENAI_API_KEY nicht gesetzt — setze den Key, oder nutze --provider local \
-             (bzw. OPENAI_BASE_URL) für lokale Endpunkte";
+    // Effektiver OPENAI_BASE_URL-Override — EINE Auflösung für die Frühchecks hier und den
+    // mlx-Preflight unten, mit exakt der Semantik der Provider (leer/Whitespace = nicht gesetzt).
+    let base_override = env_nonempty("OPENAI_BASE_URL");
+    // Frühchecks openai/local: echtes OpenAI braucht einen Key (sonst roher 401 erst im
+    // Stream), --provider local einen lokalen Endpunkt (sonst ginge der Request samt
+    // OPENAI_API_KEY still an api.openai.com — Cloud-Egress, obwohl „lokal" gemeint war).
+    if let Some(reason) = openai_local_precheck(
+        &provider_kind,
+        base_override.as_deref(),
+        env_nonempty("OPENAI_API_KEY").as_deref(),
+    ) {
+        let msg = if reason == "missing_base_url" {
+            "OPENAI_BASE_URL nicht gesetzt — --provider local braucht einen lokalen \
+             OpenAI-kompatiblen Endpunkt:\n  \
+             export OPENAI_BASE_URL=http://localhost:11434/v1   # Ollama\n  \
+             export OPENAI_BASE_URL=http://localhost:8000/v1    # vLLM\n  \
+             LM Studio: --provider mlx · echtes OpenAI: --provider openai (mit OPENAI_API_KEY)"
+        } else {
+            "OPENAI_API_KEY nicht gesetzt — setze den Key, oder nutze --provider local \
+             mit OPENAI_BASE_URL für lokale Endpunkte"
+        };
         return Err(abort_with_audit(
             store.as_mut(),
             msg,
-            serde_json::json!({ "reason": "missing_api_key", "provider": provider_kind }),
+            serde_json::json!({ "reason": reason, "provider": provider_kind }),
         )
         .await);
     }
@@ -596,12 +644,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // "ANTHROPIC_API_KEY nicht gesetzt" aus AnthropicProvider::from_env(). Die Prüfung spiegelt
     // bewusst from_env (anthropic.rs): einzige Quelle ist ANTHROPIC_API_KEY, leer/Whitespace zählt
     // als fehlend. Zieht from_env künftig auch ~/.sepp/auth.json heran, muss dieser Check mit.
-    if provider_kind == "anthropic"
-        && std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .is_none()
-    {
+    if provider_kind == "anthropic" && env_nonempty("ANTHROPIC_API_KEY").is_none() {
         let msg = "ANTHROPIC_API_KEY nicht gesetzt — eine der Optionen:\n  \
              - Key setzen:     export ANTHROPIC_API_KEY=…\n  \
              - lokales Modell: --provider local  (bzw. OPENAI_BASE_URL für Ollama/vLLM)\n  \
@@ -616,12 +659,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     }
     // z.ai (Zhipu/GLM) braucht ZAI_API_KEY — anders als lokale OpenAI-Endpunkte ist der Key
     // Pflicht, daher hier früh + hilfreich scheitern statt erst beim 401.
-    if provider_kind == "zai"
-        && std::env::var("ZAI_API_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .is_none()
-    {
+    if provider_kind == "zai" && env_nonempty("ZAI_API_KEY").is_none() {
         let msg = "ZAI_API_KEY nicht gesetzt — Key auf https://z.ai holen (Format id.secret) und setzen:\n  \
              export ZAI_API_KEY=…\n  \
              (optional ZAI_BASE_URL für einen abweichenden Endpunkt, z. B. die China-Region)";
@@ -633,11 +671,6 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .await);
     }
     if is_mlx {
-        // Effektiver Endpunkt-Override: Leerstring zählt wie „nicht gesetzt" — konsistent zur
-        // Auflösung im Provider (openai::resolve_base_url); None ⇒ Zero-Config-Default.
-        let base_override = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
         // Modell muss explizit gewählt werden — sepp schreibt kein Modell vor; LM Studio bedient
         // das jeweils geladene Modell, dessen Identifier der Nutzer mit -m angibt.
         if opts.model.is_none() {
@@ -701,12 +734,12 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 // früher unterdrückte Fall „GLM-Modell auf --provider local/openai" warnt jetzt
                 // bewusst — er sendet GLM an api.openai.com und scheitert dort am 401.
                 if m.provider != provider_kind {
-                    eprintln!(
+                    startup_notice(format!(
                         "Hinweis: Modell '{}' gehört zu Provider '{}', gewählt ist \
                          '{provider_kind}' — die Anfrage geht an dessen Endpunkt und schlägt fehl, \
                          wenn die Endpunkte inkompatibel sind.",
                         m.id, m.provider
-                    );
+                    ));
                 }
                 m
             }
@@ -720,7 +753,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         None if is_openai => custom_model("gpt-4o-mini".into(), &provider_kind),
         None => models::default_model(),
     };
-    let threshold = model.context_window.saturating_mul(3) / 4;
+    let threshold = sepp_agent::default_compact_threshold(&model);
     // `store` wurde bereits vor den Key-Checks gebaut (Audit jeden Start).
 
     // Tier 0: Resources (Skills → System-Prompt, Prompt-Templates → Slash-Commands).
@@ -868,6 +901,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 prompts,
                 SYSTEM_PROMPT.to_string(),
                 !opts.hide_thinking,
+                startup_notices,
             )
             .await
         }
@@ -1075,6 +1109,35 @@ mod tests {
         // Lifecycle-Events erzeugen keine RPC-Zeile.
         assert!(rpc_event(&AgentEvent::TurnStart).is_none());
         assert!(rpc_event(&AgentEvent::Done).is_none());
+    }
+
+    #[test]
+    fn openai_local_precheck_decides_early_aborts() {
+        // openai: ohne base UND ohne Key → früher, klarer Abbruch statt rohem 401.
+        assert_eq!(
+            openai_local_precheck("openai", None, None),
+            Some("missing_api_key")
+        );
+        // openai: Key ODER base_url reichen (lokale/kompatible Endpunkte bleiben key-optional).
+        assert_eq!(openai_local_precheck("openai", None, Some("sk-x")), None);
+        assert_eq!(
+            openai_local_precheck("openai", Some("http://x/v1"), None),
+            None
+        );
+        // local MEINT einen lokalen Endpunkt: ohne base_url wäre der from_env-Fallback auf
+        // api.openai.com ein stiller Cloud-Egress — auch mit gesetztem Key abbrechen.
+        assert_eq!(
+            openai_local_precheck("local", None, Some("sk-x")),
+            Some("missing_base_url")
+        );
+        assert_eq!(
+            openai_local_precheck("local", Some("http://localhost:11434/v1"), None),
+            None
+        );
+        // Andere Provider haben eigene Checks — hier kein Urteil.
+        assert_eq!(openai_local_precheck("anthropic", None, None), None);
+        assert_eq!(openai_local_precheck("mlx", None, None), None);
+        assert_eq!(openai_local_precheck("zai", None, None), None);
     }
 
     fn args(v: &[&str]) -> Vec<String> {

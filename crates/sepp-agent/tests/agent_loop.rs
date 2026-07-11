@@ -470,3 +470,66 @@ async fn compact_after_branch_keeps_summary_on_active_path() {
     assert!(matches!(&msgs[0].content[0],
         sepp_core::ContentBlock::Text { text } if text.contains("SUMMARY")));
 }
+
+#[test]
+fn default_compact_threshold_is_three_quarters() {
+    let mut m = test_model();
+    m.context_window = 200_000;
+    assert_eq!(sepp_agent::default_compact_threshold(&m), 150_000);
+    m.context_window = 128_000;
+    assert_eq!(sepp_agent::default_compact_threshold(&m), 96_000);
+    // Saturation statt Overflow bei absurd großen Fenstern.
+    m.context_window = u64::MAX;
+    assert_eq!(sepp_agent::default_compact_threshold(&m), u64::MAX / 4);
+}
+
+#[tokio::test]
+async fn set_model_updates_active_compact_threshold() {
+    // Aktive Auto-Compaction: /model auf ein Modell mit anderem Kontextfenster muss die
+    // Schwelle nachziehen — sonst liefe ein kleineres Fenster über, bevor je komprimiert wird.
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::new()),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model()) // 100k Fenster
+        .auto_compact_threshold(sepp_agent::default_compact_threshold(&test_model()))
+        .build()
+        .unwrap();
+    assert_eq!(session.auto_compact_threshold(), Some(75_000));
+
+    let mut small = test_model();
+    small.context_window = 128_000;
+    session.set_model(small);
+    assert_eq!(session.auto_compact_threshold(), Some(96_000));
+}
+
+#[tokio::test]
+async fn set_model_keeps_disabled_compaction() {
+    // Ohne Builder-Schwelle ist Auto-Compaction bewusst aus (z. B. Sub-Agenten) —
+    // set_model darf sie nicht aktivieren.
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::new()),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .build()
+        .unwrap();
+    assert_eq!(session.auto_compact_threshold(), None);
+    session.set_model(test_model());
+    assert_eq!(session.auto_compact_threshold(), None);
+}
+
+#[tokio::test]
+async fn provider_name_reports_provider_label() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::new()),
+    });
+    let session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .build()
+        .unwrap();
+    assert_eq!(session.provider_name(), "fake");
+}

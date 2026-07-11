@@ -7,6 +7,54 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Fixes der Correctness-Funde aus dem Review des 0.1.12-Release.
+
+### Geändert
+- **Breaking: `--provider local` verlangt ein nicht-leeres `OPENAI_BASE_URL`** und bricht sonst
+  früh mit Anleitung ab (Audit-Eintrag `missing_base_url`) — der bisherige stille Fallback auf
+  api.openai.com entfällt. Grund: Seit der `OPENAI_BASE_URL=""`-Härtung in 0.1.12 wäre ein
+  leerer Wert sonst kein harter Fehler mehr gewesen, sondern ein stiller Cloud-Request samt
+  Prompt und `OPENAI_API_KEY`, obwohl „lokal" gemeint war. Gilt für TUI, `-p` und `--rpc`;
+  wer die Cloud will, nimmt `--provider openai`.
+- **Eine Env-Wert-Semantik für alle Provider (`nonempty_trimmed`):** leer/Whitespace zählt als
+  fehlend, umgebender Whitespace wird entfernt — ein Trailing Space in `OPENAI_BASE_URL`
+  (Copy-Paste) landete vorher als `%20` in der Request-URL (kryptisches 404), ein
+  Whitespace-Key als sinnloser `Bearer`-Header (später 401 statt Frühmeldung). Der
+  openai-Key-Frühcheck nutzt dieselbe Auflösung wie der Provider (vorher `var_os`-Drift:
+  `OPENAI_BASE_URL=""` übersprang den Check und endete als roher 401 ohne Audit-Eintrag).
+- **Start-Hinweise erreichen die TUI:** der „--think wirkungslos"-Hinweis und die
+  Cross-Provider-Modellwarnung erscheinen im Chatfenster statt als eprintln hinter dem
+  Alternate-Screen zu verpuffen (bei `-p`/`--rpc` weiter auf stderr).
+
+### Behoben
+- **OpenAI-Mapper: Tool-Calls mit leerer id laufen wieder** (synthetische id `call_synth_…`
+  statt stummen Verwerfens — Regression aus 0.1.12, unter 0.1.11 lief der Call mit id `""`);
+  und die Invariante „genau ein Start/Stop je id" hält jetzt auch bei degeneriertem
+  id-Recycling (A→B→A) und Index-Drift (gleiche id unter neuem Index) — vorher doppelter
+  `ToolUseStart` ohne zweites Stop → doppelte Tool-Ausführung, doppelte `tool_call_id`.
+- **`/model` zieht die Auto-Compaction-Schwelle nach** (`set_model` berechnet sie aus dem
+  Kontextfenster des neuen Modells, Formel zentral in `sepp_agent::default_compact_threshold`)
+  — vorher blieb die Start-Schwelle stehen und ein kleineres Modell lief über, bevor je
+  komprimiert wurde. Custom-Modelle erben zudem den TATSÄCHLICHEN Session-Provider
+  (`AgentSession::provider_name`), nicht das Provider-Tag des Vorgängermodells.
+- **TUI: `/quit` während eines laufenden Turns cancelt den Turn** (wie Ctrl+C) — vorher hing
+  der Prozess nach dem Verlassen des Alternate-Screens stumm am Session-Mutex bis Turn-Ende,
+  und Ctrl+C in dem Zustand killte ohne `finalize()`/fsync.
+- **TUI: abgewiesene Slash-Befehle leeren die Eingabe nicht mehr** („läuft noch — bitte
+  warten" bei laufendem Turn) — Parität zum Eingabe-Erhalt für normale Prompts aus 0.1.12.
+- **TUI: `/reload`/`/trust` verschlucken Hook-Fehler nicht mehr:** ein Rhai-Syntaxfehler in
+  einem Skript deaktivierte vorher kommentarlos ALLE Hooks (auch intakte Policy-Guards, Meldung
+  „0 Hook-Quelle(n)"); jetzt rote Fehlermeldung, bestehende Hooks bleiben aktiv,
+  Skills/Templates werden trotzdem aktualisiert.
+- **TUI: Feedback-Meldungen überleben das Turn-Ende** — Notices (bei versteckter Statuszeile,
+  plus Start-Hinweise) leben außerhalb des Transcripts, das `rebuild_transcript` bei jedem
+  Turn-Ende aus den Session-Messages neu baut und das sie vorher rückwirkend löschte; sie
+  gelten bis zur nächsten Nutzeraktion. Bei zurückgescrolltem Verlauf springt die Ansicht
+  zur Meldung (Scroll-Reset — vorher landete sie unsichtbar unterhalb des Sichtfensters).
+- **TUI: `/trust` meldet genau eine Zeile** („Projekt vertraut · <Reload-Summary>") statt bei
+  versteckter Statuszeile zwei fast identische Transcript-Zeilen zu erzeugen; Reload-Fehler
+  erscheinen rot statt als Info verpackt.
+
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider

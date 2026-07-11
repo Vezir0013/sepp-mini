@@ -114,15 +114,22 @@ struct App {
     prompt_templates: Vec<(String, String)>,
     base_prompt: String,
     should_quit: bool,
+    /// Feedback-/Startup-Zeilen AUSSERHALB des Transcripts, gerendert unter dem Chatverlauf:
+    /// überleben so rebuild_transcript (das nur aus Session-Messages baut) und gelten bis zur
+    /// nächsten Nutzeraktion (start_prompt/start_compact bzw. Kontextwechsel leeren sie).
+    notices: Vec<DisplayMsg>,
     tx: mpsc::UnboundedSender<UiMsg>,
 }
 
-/// Startet die TUI und blockiert, bis der Nutzer beendet.
+/// Startet die TUI und blockiert, bis der Nutzer beendet. `startup_notices` sind Hinweise aus
+/// dem CLI-Start (z. B. „--think wirkungslos", Cross-Provider-Modellwarnung), die im Chatfenster
+/// erscheinen müssen — ein eprintln verpufft hinter dem Alternate-Screen.
 pub async fn run(
     agent: AgentSession,
     prompt_templates: Vec<(String, String)>,
     base_prompt: String,
     show_thinking: bool,
+    startup_notices: Vec<String>,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -139,11 +146,19 @@ pub async fn run(
         show_thinking,
     );
     app.rebuild_transcript().await;
-    // Prompt-Templates, die Builtins verschatten, sind per Slash unerreichbar — sichtbar im
-    // Transcript warnen (ein eprintln verpufft hinter dem Alternate-Screen).
+    // Start-Hinweise als Notices (nicht ins Transcript): rebuild_transcript baut den Verlauf
+    // bei jedem Turn-Ende aus den Session-Messages neu — dort eingefügte Zeilen verschwänden
+    // rückwirkend. Notices leben, bis der Nutzer die nächste Aktion startet.
+    for text in startup_notices {
+        app.notices.push(DisplayMsg {
+            kind: Kind::Info,
+            text,
+        });
+    }
+    // Prompt-Templates, die Builtins verschatten, sind per Slash unerreichbar — sichtbar warnen.
     let shadowed = template_collisions(&app.prompt_templates);
     if !shadowed.is_empty() {
-        app.transcript.push(DisplayMsg {
+        app.notices.push(DisplayMsg {
             kind: Kind::Info,
             text: format!(
                 "Hinweis: Prompt-Template(s) {} kollidieren mit Builtin-Befehlen und sind \
@@ -229,6 +244,7 @@ impl App {
             prompt_templates,
             base_prompt,
             should_quit: false,
+            notices: Vec::new(),
             tx,
         }
     }
@@ -239,14 +255,18 @@ impl App {
         self.status = idle_status(&g);
     }
 
-    /// Meldung in die Statuszeile; ist sie versteckt (`/hide`), zusätzlich in den Chatverlauf —
-    /// Feedback darf nie unsichtbar verpuffen (verworfene Eingaben, Befehls-Ausgaben, Fehler).
+    /// Meldung in die Statuszeile; ist sie versteckt (`/hide`), zusätzlich als Notice unter den
+    /// Chatverlauf — Feedback darf nie unsichtbar verpuffen (verworfene Eingaben, Befehls-
+    /// Ausgaben, Fehler). Notices statt Transcript, weil rebuild_transcript den Verlauf bei
+    /// jedem Turn-Ende komplett aus den Session-Messages neu baut und Ad-hoc-Zeilen darin
+    /// rückwirkend verschwänden; der Scroll-Reset holt die View ans Ende, wo die Notice steht.
     fn notify_kind(&mut self, kind: Kind, text: String) {
         if !self.show_status {
-            self.transcript.push(DisplayMsg {
+            self.notices.push(DisplayMsg {
                 kind,
                 text: text.clone(),
             });
+            self.scroll_back = 0;
         }
         self.status = text;
     }
@@ -312,8 +332,12 @@ impl App {
             return;
         }
         if let Some(cmd) = text.strip_prefix('/') {
-            self.input.clear();
-            self.handle_command(cmd).await;
+            // Eingabe erst nach ANNAHME leeren — ein wegen laufendem Turn abgewiesener Befehl
+            // (inkl. Prompt-Template mit Argumenten) bleibt zum erneuten Absenden stehen,
+            // genau wie der Prompt-Pfad darunter.
+            if self.handle_command(cmd).await {
+                self.input.clear();
+            }
             return;
         }
         if self.running {
@@ -332,6 +356,8 @@ impl App {
     }
 
     fn start_prompt(&mut self, text: String) {
+        // Neue Nutzeraktion: bisheriges Notice-Feedback hat seinen Zweck erfüllt.
+        self.notices.clear();
         self.running = true;
         self.status = "denkt …".into();
         let cancel = CancellationToken::new();
@@ -357,7 +383,10 @@ impl App {
 
     // ---- Slash-Commands --------------------------------------------------
 
-    async fn handle_command(&mut self, cmd: &str) {
+    /// Führt einen Slash-Befehl aus. `false` = abgewiesen („läuft noch — bitte warten"), die
+    /// Eingabe soll dann zum erneuten Absenden stehen bleiben (Parität zum Prompt-Pfad in
+    /// [`Self::submit`]); `true` = angenommen (auch „unbekannter Befehl": der wurde behandelt).
+    async fn handle_command(&mut self, cmd: &str) -> bool {
         let mut it = cmd.splitn(2, ' ');
         let name = it.next().unwrap_or("");
         let arg = it
@@ -372,13 +401,22 @@ impl App {
             )
         {
             self.notify("läuft noch — bitte warten");
-            return;
+            return false;
         }
 
         // Neue Builtins auch in BUILTIN_COMMANDS (Modulebene) eintragen — Grundlage der
         // Kollisionswarnung für gleichnamige Prompt-Templates.
         match name {
-            "quit" | "exit" | "q" => self.should_quit = true,
+            "quit" | "exit" | "q" => {
+                // Wie Ctrl+C (on_term_event): einen laufenden Turn canceln — sonst hinge
+                // run() nach dem Loop-Ende in session.lock().await, bis der Turn (Streaming,
+                // Tools) von selbst fertig ist, und Ctrl+C in dem Zustand killte ohne
+                // finalize()/fsync.
+                if let Some(c) = self.cancel.take() {
+                    c.cancel();
+                }
+                self.should_quit = true;
+            }
             "help" | "h" => {
                 let mut text = String::from(
                     "Befehle: /new /resume /tree /compact /model [id] /trust /reload /hide /show /quit",
@@ -404,6 +442,7 @@ impl App {
                     g.set_session(store);
                     drop(g);
                     self.transcript.clear();
+                    self.notices.clear();
                     self.streaming = None;
                     self.streaming_thinking = None;
                     self.scroll_back = 0;
@@ -413,11 +452,13 @@ impl App {
             },
             "model" => match arg {
                 Some(id) => {
-                    // Custom-Modelle erben den Session-Provider (korrekte Compaction-Schwelle
-                    // statt pauschal anthropic/200k); Anzeige über model_label statt des
-                    // generischen "(custom)"-display_name.
+                    // Custom-Modelle erben den TATSÄCHLICHEN Session-Provider (nicht das
+                    // provider-Tag des aktuellen Modells, das nach einem Cross-Provider-Start
+                    // falsch wäre) — korrekte Compaction-Schwelle statt pauschal anthropic/200k.
+                    // `--provider local` meldet sich als "openai"; custom_model behandelt beide
+                    // gleich (128k). Anzeige über model_label statt "(custom)"-display_name.
                     let mut g = self.session.lock().await;
-                    let provider = g.model().provider.clone();
+                    let provider = g.provider_name().to_string();
                     let model = models::find_model(&id)
                         .unwrap_or_else(|| crate::custom_model(id, &provider));
                     let label = crate::model_label(&model).to_string();
@@ -461,13 +502,20 @@ impl App {
             },
             "trust" => match session::trust_current_project() {
                 Ok(()) => {
-                    self.reload_resources().await;
-                    let text = format!("Projekt vertraut · {}", self.status);
-                    self.notify(text);
+                    // Genau EINE Meldung aus der Rückgabe bauen — self.status zurückzulesen
+                    // erzeugte bei /hide zwei fast identische Transcript-Zeilen. Bei None steht
+                    // der Reload-Fehler bereits rot da (das Projekt ist trotzdem vertraut).
+                    if let Some(summary) = self.reload_resources().await {
+                        self.notify(format!("Projekt vertraut · {summary}"));
+                    }
                 }
                 Err(e) => self.notify_error(format!("/trust: {e}")),
             },
-            "reload" => self.reload_resources().await,
+            "reload" => {
+                if let Some(summary) = self.reload_resources().await {
+                    self.notify(summary);
+                }
+            }
             // Bewusst ohne Session-Lock: der Prompt-Task hält den Mutex für die gesamte
             // Turn-Dauer — ein lock().await hier fröre die Event-Loop bis Turn-Ende ein
             // (kein Rendern, kein Esc). self.status wird ohnehin durchgängig gepflegt.
@@ -484,7 +532,7 @@ impl App {
                     Some(content) => {
                         if self.running {
                             self.notify("läuft noch — bitte warten");
-                            return;
+                            return false;
                         }
                         let expanded = match arg {
                             Some(a) => format!("{content} {a}"),
@@ -501,39 +549,64 @@ impl App {
                 }
             }
         }
+        true
     }
 
     /// Lädt Resources (Skills → System-Prompt, Prompt-Templates) und Hooks neu von Platte.
-    async fn reload_resources(&mut self) {
+    /// `Some(summary)` bei Erfolg — die Meldung setzt der AUFRUFER ab (`/trust` präfixt sie),
+    /// statt sie aus `self.status` zurückzulesen; `None`, wenn ein Fehler bereits via
+    /// [`Self::notify_error`] gemeldet wurde.
+    async fn reload_resources(&mut self) -> Option<String> {
         let trusted = session::is_project_trusted().unwrap_or(false);
         let roots = match session::resource_roots(trusted) {
             Ok(r) => r,
             Err(e) => {
                 self.notify_error(format!("/reload: {e}"));
-                return;
+                return None;
             }
         };
         let res = ResourceSet::load(&roots);
         let nskills = res.skills.len();
         let system = format!("{}{}", self.base_prompt, res.system_prompt_addition());
 
-        let hooks: Option<Box<dyn HookHost>> = session::hook_dirs(trusted)
-            .ok()
-            .and_then(|dirs| RhaiHookHost::from_dirs(&dirs).ok())
-            .filter(|h| !h.is_empty())
-            .map(|h| Box::new(h) as Box<dyn HookHost>);
-        let nhooks = hooks.as_ref().map(|_| 1).unwrap_or(0);
+        // Hook-Fehler NICHT verschlucken (vorher eine `.ok()`-Kette): ein Rhai-Syntaxfehler in
+        // EINEM Skript würde sonst via set_hooks(None) alle Hooks — auch intakte Policy-Guards
+        // — kommentarlos deaktivieren. Konsistent zum Startup (main.rs bailt hart), für die
+        // laufende TUI abgeschwächt: Fehler melden, bestehende Hooks unangetastet lassen.
+        let hooks_res: std::result::Result<Option<Box<dyn HookHost>>, String> =
+            match session::hook_dirs(trusted) {
+                Ok(dirs) => match RhaiHookHost::from_dirs(&dirs) {
+                    Ok(h) if h.is_empty() => Ok(None),
+                    Ok(h) => Ok(Some(Box::new(h) as Box<dyn HookHost>)),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+        let (nhooks, hook_err) = match &hooks_res {
+            Ok(Some(_)) => (1, None),
+            Ok(None) => (0, None),
+            Err(e) => (0, Some(e.clone())),
+        };
 
         {
             let mut g = self.session.lock().await;
             g.set_system_prompt(system);
-            g.set_hooks(hooks);
+            if let Ok(hooks) = hooks_res {
+                g.set_hooks(hooks);
+            }
         }
         self.prompt_templates = res
             .prompts
             .into_iter()
             .map(|p| (p.name, p.content))
             .collect();
+        if let Some(e) = hook_err {
+            self.notify_error(format!(
+                "/reload: Hooks fehlgeschlagen: {e} — bestehende Hooks bleiben aktiv; \
+                 Skills/Templates wurden aktualisiert"
+            ));
+            return None;
+        }
         let mut summary = format!(
             "neu geladen · {nskills} Skills · {} Templates · {} Hook-Quelle(n)",
             self.prompt_templates.len(),
@@ -546,10 +619,12 @@ impl App {
                 slash_list(&shadowed)
             ));
         }
-        self.notify(summary);
+        Some(summary)
     }
 
     fn start_compact(&mut self) {
+        // Neue Nutzeraktion: bisheriges Notice-Feedback hat seinen Zweck erfüllt.
+        self.notices.clear();
         self.running = true;
         self.status = "komprimiere …".into();
         let cancel = CancellationToken::new();
@@ -583,6 +658,7 @@ impl App {
                     let t = transcript_from_messages(g.messages(), self.show_thinking);
                     drop(g);
                     self.transcript = t;
+                    self.notices.clear();
                     self.streaming = None;
                     self.streaming_thinking = None;
                     self.mode = Mode::Chat;
@@ -616,6 +692,7 @@ impl App {
                             let t = transcript_from_messages(g.messages(), self.show_thinking);
                             drop(g);
                             self.transcript = t;
+                            self.notices.clear();
                             self.streaming = None;
                             self.streaming_thinking = None;
                             self.scroll_back = 0;
@@ -680,6 +757,10 @@ impl App {
                 });
             }
             AgentEvent::TurnEnd => self.finalize_streaming(),
+            // Bewusst ins Transcript statt in die Notices: auf AgentEvent::Error folgt im
+            // Agent-Loop immer ein Err → UiMsg::Done(Some(e)), und der Done-Handler pusht die
+            // [Fehler]-Zeile NACH dem rebuild_transcript erneut — eine Notice ergäbe eine
+            // Doppelanzeige. Diese Live-Zeile hier überbrückt nur bis zum Done.
             AgentEvent::Error(e) => self.transcript.push(DisplayMsg {
                 kind: Kind::Error,
                 text: format!("[Fehler] {e}"),
@@ -768,6 +849,14 @@ impl App {
         if let Some(s) = &self.streaming {
             for row in wrap(s, inner_w) {
                 lines.push(Line::styled(row, Style::default()));
+            }
+        }
+        // Notices (Feedback bei versteckter Statuszeile, Start-Hinweise) ganz unten — VOR der
+        // total-Berechnung, damit der Scroll-Anker sie einschließt.
+        for m in &self.notices {
+            let (text, style) = styled(m);
+            for row in wrap(&text, inner_w) {
+                lines.push(Line::styled(row, style));
             }
         }
 
@@ -1084,6 +1173,133 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use futures::stream::{self, BoxStream};
+    use sepp_provider::{CompletionRequest, Provider, StreamEvent};
+
+    /// Provider-Attrappe für App-Tests: leerer Stream, kein Netz, kein Key.
+    struct FakeProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FakeProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn stream<'a>(
+            &'a self,
+            _req: CompletionRequest<'a>,
+            _cancel: CancellationToken,
+        ) -> sepp_core::Result<BoxStream<'a, StreamEvent>> {
+            Ok(Box::pin(stream::iter(Vec::new())))
+        }
+    }
+
+    /// App mit FakeProvider-Session — für Tests der Command-/Notify-Logik ohne Terminal.
+    fn test_app() -> App {
+        let session = sepp_agent::AgentSession::builder()
+            .provider(Arc::new(FakeProvider))
+            .model(crate::custom_model("test".into(), "fake"))
+            .build()
+            .expect("test session");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(
+            Arc::new(Mutex::new(session)),
+            tx,
+            Vec::new(),
+            String::new(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn quit_during_turn_cancels_and_quits() {
+        // /quit während eines laufenden Turns muss den Turn canceln (wie Ctrl+C) — sonst
+        // hängt run() nach dem Loop-Ende am Session-Mutex, bis der Turn von selbst endet.
+        let mut app = test_app();
+        let token = CancellationToken::new();
+        app.cancel = Some(token.clone());
+        app.running = true;
+        app.handle_command("quit").await;
+        assert!(token.is_cancelled());
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn notices_survive_transcript_rebuild() {
+        // Bei /hide ist die Notice die einzige sichtbare Kopie des Feedbacks — sie muss den
+        // Transcript-Neuaufbau am Turn-Ende (Done → rebuild_transcript) überleben.
+        let mut app = test_app();
+        app.show_status = false;
+        app.notify_error("/new: kaputt");
+        app.rebuild_transcript().await;
+        assert!(app
+            .notices
+            .iter()
+            .any(|m| m.kind == Kind::Error && m.text.contains("/new: kaputt")));
+        // Das Transcript selbst ist frisch aus den (leeren) Session-Messages gebaut.
+        assert!(app.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_hidden_resets_scroll_visible_keeps_it() {
+        let mut app = test_app();
+        // Versteckte Statuszeile: die Notice ist nur am Verlaufs-Ende sichtbar → Scroll-Reset.
+        app.show_status = false;
+        app.scroll_back = 5;
+        app.notify("läuft noch — bitte warten");
+        assert_eq!(app.scroll_back, 0);
+        // Sichtbare Statuszeile: der Chat-Inhalt ändert sich nicht, die Scroll-Position des
+        // Nutzers bleibt unangetastet.
+        app.show_status = true;
+        app.scroll_back = 5;
+        app.notify("Modelle: …");
+        assert_eq!(app.scroll_back, 5);
+    }
+
+    #[tokio::test]
+    async fn start_prompt_clears_notices() {
+        // Eine neue Nutzeraktion beendet die Lebenszeit des bisherigen Feedbacks.
+        let mut app = test_app();
+        app.show_status = false;
+        app.notify("alter Hinweis");
+        assert!(!app.notices.is_empty());
+        app.start_prompt("hallo".into());
+        assert!(app.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_command_keeps_input() {
+        // Ein wegen laufendem Turn abgewiesener Befehl darf die Eingabe nicht verwerfen —
+        // Parität zum Eingabe-Erhalt für normale Prompts.
+        let mut app = test_app();
+        app.running = true;
+        app.input = "/compact".into();
+        app.submit().await;
+        assert_eq!(app.input, "/compact");
+        assert_eq!(app.status, "läuft noch — bitte warten");
+    }
+
+    #[tokio::test]
+    async fn rejected_template_keeps_input() {
+        let mut app = test_app();
+        app.prompt_templates = vec![("review".into(), "Prüfe:".into())];
+        app.running = true;
+        app.input = "/review langer mühsam getippter Kontext".into();
+        app.submit().await;
+        assert_eq!(app.input, "/review langer mühsam getippter Kontext");
+    }
+
+    #[tokio::test]
+    async fn accepted_command_clears_input() {
+        let mut app = test_app();
+        app.input = "/help".into();
+        app.submit().await;
+        assert!(app.input.is_empty());
+        assert!(app
+            .transcript
+            .iter()
+            .any(|m| m.kind == Kind::Info && m.text.contains("Befehle:")));
+    }
 
     #[test]
     fn wrap_breaks_on_width() {

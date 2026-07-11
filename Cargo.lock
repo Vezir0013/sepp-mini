@@ -1837,6 +1837,7 @@ name = "sepp-cli"
 version = "0.1.12"
 dependencies = [
  "anyhow",
+ "async-trait",
  "crossterm",
  "directories",
  "futures",

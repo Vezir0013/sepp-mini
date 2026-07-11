@@ -202,6 +202,7 @@ echo '{"type":"prompt","text":"hallo"}' | sepp --rpc   # JSONL-RPC
 # OpenAI-kompatibel / lokal:
 export OPENAI_API_KEY=...
 sepp --provider openai -m gpt-4o-mini -p "..."
+# --provider local braucht OPENAI_BASE_URL (kein stiller Cloud-Fallback):
 OPENAI_BASE_URL=http://localhost:11434/v1 sepp --provider local -m llama3 -p "..."
 ```
 
@@ -217,7 +218,7 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 |----------|-------|
 | `ANTHROPIC_API_KEY` | Anthropic-Live-Aufrufe |
 | `OPENAI_API_KEY` | OpenAI (optional bei lokalen Servern; `--provider mlx` sendet ihn nur bei explizit gesetztem `OPENAI_BASE_URL`) |
-| `OPENAI_BASE_URL` | OpenAI-kompatible base_url (Ollama/vLLM/local/mlx) |
+| `OPENAI_BASE_URL` | OpenAI-kompatible base_url (Ollama/vLLM/local/mlx); Pflicht für `--provider local` |
 | `ZAI_API_KEY` | z.ai/Zhipu-GLM (Pflicht für `--provider zai`) |
 | `ZAI_BASE_URL` | z.ai base_url überschreiben (Default api.z.ai) |
 | `SEPP_PROVIDER` | Default-Provider, wenn `--provider` fehlt |

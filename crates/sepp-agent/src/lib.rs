@@ -52,6 +52,13 @@ struct PendingCall {
     input_json: String,
 }
 
+/// Default-Schwelle der Auto-Compaction für ein Modell: 3/4 des Kontextfensters (geschätzte
+/// Tokens) — lieber früher komprimieren als überlaufen. DIE eine Formel für den Start
+/// (`sepp-cli`) und Modellwechsel ([`AgentSession::set_model`]); zwei Kopien würden driften.
+pub fn default_compact_threshold(model: &Model) -> u64 {
+    model.context_window.saturating_mul(3) / 4
+}
+
 /// Eine laufende Agent-Session.
 pub struct AgentSession {
     provider: Arc<dyn Provider>,
@@ -139,9 +146,27 @@ impl AgentSession {
         }
     }
 
-    /// Wechselt das Modell für folgende Turns.
+    /// Wechselt das Modell für folgende Turns. Zieht die Auto-Compaction-Schwelle auf den
+    /// Default des neuen Modells nach, sofern Auto-Compaction aktiv ist — sonst bliebe die
+    /// beim Start eingefrorene Schwelle stehen und ein kleineres Kontextfenster liefe über,
+    /// bevor je komprimiert wird. `None` bleibt `None` (bewusst deaktiviert, z. B. Sub-Agenten).
     pub fn set_model(&mut self, model: Model) {
+        if self.auto_compact_threshold.is_some() {
+            self.auto_compact_threshold = Some(default_compact_threshold(&model));
+        }
         self.state.model = model;
+    }
+
+    /// Aktuelle Auto-Compaction-Schwelle (geschätzte Tokens); `None` = deaktiviert.
+    pub fn auto_compact_threshold(&self) -> Option<u64> {
+        self.auto_compact_threshold
+    }
+
+    /// Name des verdrahteten Providers (z. B. `"anthropic"`, `"openai"`, `"mlx"`, `"zai"`) —
+    /// für Frontends, die provider-bewusste Entscheidungen treffen (z. B. Custom-Modelle beim
+    /// TUI-`/model`), ohne das Provider-Feld selbst zu exponieren.
+    pub fn provider_name(&self) -> &str {
+        self.provider.name()
     }
 
     fn record(&mut self, payload: EntryPayload) -> Result<()> {
