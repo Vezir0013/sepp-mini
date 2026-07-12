@@ -7,6 +7,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.13] - 2026-07-12
+
 Fixes der Correctness-Funde aus dem Review des 0.1.12-Release, plus neue TUI-Status-Bar.
 
 ### Hinzugefügt
@@ -68,12 +76,6 @@ Fixes der Correctness-Funde aus dem Review des 0.1.12-Release, plus neue TUI-Sta
 - **TUI: `/trust` meldet genau eine Zeile** („Projekt vertraut · <Reload-Summary>") statt bei
   versteckter Statuszeile zwei fast identische Transcript-Zeilen zu erzeugen; Reload-Fehler
   erscheinen rot statt als Info verpackt.
-
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.12] - 2026-07-05
 
@@ -346,7 +348,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.9...v0.1.10
