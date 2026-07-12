@@ -13,6 +13,18 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.14] - 2026-07-12
+
+Kleine TUI-Politur an der in 0.1.13 eingeführten Status-Bar.
+
+### Geändert
+- **Provider-Name aus der TUI-Status-Bar entfernt.** Die Statuszeile zeigt beim Warten nur noch
+  `wartet · <t>` statt `wartet auf <provider> · <t>`, und das Modell-Segment rechts nur noch den
+  reinen Modellnamen (`qwen3.6:27b`) ohne den `(<provider>)`-Zusatz. Der Provider-Name war an
+  beiden Stellen redundant — die Bar wird ruhiger. Das dadurch ungenutzte `provider`-Feld des
+  Bar-Metrik-Caches (`MetricCache`) entfällt; die übrigen Segmente (Sparkline, Kontext-Gauge,
+  `m:`/`t:`, Session-Dauer) bleiben unverändert.
+
 ## [0.1.13] - 2026-07-12
 
 Fixes der Correctness-Funde aus dem Review des 0.1.12-Release, plus neue TUI-Status-Bar.
@@ -348,7 +360,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.10...v0.1.11
