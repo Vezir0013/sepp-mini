@@ -244,7 +244,7 @@ Verzeichnisse bleiben unangetastet.
 |------|-----|-----|
 | **Resources** | Skills (→ System-Prompt), Prompt-Templates (→ `/commands`), Themes | Dateien unter `~/.sepp/skills` · `~/.sepp/prompts` |
 | **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
-| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`) | `~/.sepp/plugins/*.wasm` + `manifest.toml` |
+| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]` | `~/.sepp/plugins/*.wasm` + `manifest.toml` |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
 
 Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
@@ -260,6 +260,22 @@ fs_write = ["./"]
 exec     = ["git"]
 ```
 
+Beispiel `manifest.toml` (WASM-Plugin mit Capabilities und Ressourcen-Limits):
+
+```toml
+name  = "string-tools"
+kind  = "wasm"
+entry = "string_tools.wasm"
+
+[capabilities]
+fs_read = ["/data"]
+
+[limits]                    # optional; fehlend = konservative Defaults
+max_memory_pages = 256      # 1 Page = 64 KiB → 16 MiB
+max_wall_time_ms = 30000    # Wanduhr-Budget pro Tool-Aufruf; 0 = unbegrenzt, aber unterbrechbar
+fuel_slice       = 1000000  # Instruktionen pro Zeitscheibe (Yield-Intervall)
+```
+
 ## Sicherheitsmodell
 
 Default ist **deny**. Eine Erweiterung bekommt nur die Rechte, die sie deklariert und der Mensch
@@ -271,7 +287,11 @@ bestätigt — und der Kern erzwingt sie an der jeweiligen Grenze:
   `sandbox_init`-Fehler), wird **fail-closed** verfahren. Auf Plattformen ohne Adapter
   (Windows/BSD) gibt es kein FS-Sandboxing — nur Env-Scrubbing, mit deutlicher Warnung.
 - **WASM:** Host-Funktionen werden nur registriert, wenn die Policy sie erlaubt — ein Plugin ohne
-  `Net` kann nachweislich nicht ins Netz.
+  `Net` kann nachweislich nicht ins Netz. Neben Zugriff ist auch **Verbrauch** gedeckelt:
+  CPU via Fuel-Slicing (die Ausführung yieldet regelmäßig an den Host und ist damit jederzeit
+  unterbrechbar — Ctrl-C wirkt auch mitten in einer Endlosschleife), Speicher via hartem
+  Page-Limit (`memory.grow` darüber liefert dem Plugin `-1`), Laufzeit via Wanduhr-Budget.
+  Kein `[limits]`-Abschnitt im Manifest heißt konservative Defaults, nicht „unbegrenzt".
 - **Secrets:** API-Keys kommen aus Env-Vars, werden nie geloggt/persistiert; das `bash`-Tool
   reicht sie nicht an Shell-Kommandos durch.
 - **Tool-Output** ist immer getrunkt, bevor er ins Kontextfenster geht.

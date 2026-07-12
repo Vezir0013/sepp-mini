@@ -115,6 +115,9 @@ pub struct Manifest {
     pub entry: Option<String>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Ressourcen-Limits (`[limits]`; fehlend = konservative Defaults, nie „unbegrenzt").
+    #[serde(default)]
+    pub limits: Limits,
 }
 
 /// Deklarierte Capabilities (Manifest- bzw. `[mcp.servers.capabilities]`-Form).
@@ -159,9 +162,61 @@ impl Capabilities {
     }
 }
 
+/// Ressourcen-Limits einer code-führenden Erweiterung (`[limits]` im Manifest).
+///
+/// Konzeptuell dieselbe Logik wie [`Capability`], nur für **Verbrauch** (CPU, Speicher, Wanduhr)
+/// statt für Zugriff: kein deklariertes Limit heißt konservativer Default, nicht „unbegrenzt".
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    /// Maximale lineare WASM-Speichergröße in 64-KiB-Pages (Default: 256 = 16 MiB).
+    pub max_memory_pages: u32,
+    /// Wanduhr-Budget eines Tool-Aufrufs in Millisekunden. `0` heißt: beliebig lange laufen
+    /// dürfen — aber weiterhin an jedem Yield-Punkt unterbrechbar (Default: 30 000).
+    pub max_wall_time_ms: u64,
+    /// Instruktionen pro Zeitscheibe — das Yield-Intervall des Fuel-Slicings (Default: 1 000 000).
+    pub fuel_slice: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_memory_pages: 256,
+            max_wall_time_ms: 30_000,
+            fuel_slice: 1_000_000,
+        }
+    }
+}
+
+impl Limits {
+    /// Speicherlimit in Bytes (Pages × 64 KiB).
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_pages as usize * 64 * 1024
+    }
+
+    /// Weist unplausible Werte zurück — lieber gar nicht laden als unkontrolliert laufen.
+    pub fn validate(&self) -> Result<()> {
+        if self.fuel_slice == 0 {
+            return Err(SeppError::Config(
+                "manifest [limits]: fuel_slice muss > 0 sein".into(),
+            ));
+        }
+        if self.max_memory_pages == 0 || self.max_memory_pages > 65_536 {
+            return Err(SeppError::Config(format!(
+                "manifest [limits]: max_memory_pages muss in 1..=65536 liegen (ist {})",
+                self.max_memory_pages
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Manifest {
     pub fn parse(toml_str: &str) -> Result<Manifest> {
-        toml::from_str(toml_str).map_err(|e| SeppError::Config(format!("manifest: {e}")))
+        let m: Manifest =
+            toml::from_str(toml_str).map_err(|e| SeppError::Config(format!("manifest: {e}")))?;
+        m.limits.validate()?;
+        Ok(m)
     }
 
     pub fn from_file(path: &Path) -> Result<Manifest> {
@@ -318,5 +373,55 @@ mod tests {
     fn manifest_without_capabilities_is_pure() {
         let m = Manifest::parse("name=\"reverse\"\nkind=\"wasm\"\nentry=\"r.wasm\"").unwrap();
         assert!(m.policy().granted.is_empty());
+    }
+
+    #[test]
+    fn manifest_without_limits_uses_conservative_defaults() {
+        let m = Manifest::parse("name=\"reverse\"\nkind=\"wasm\"\nentry=\"r.wasm\"").unwrap();
+        assert_eq!(m.limits, Limits::default());
+        assert_eq!(m.limits.max_memory_pages, 256);
+        assert_eq!(m.limits.max_wall_time_ms, 30_000);
+        assert_eq!(m.limits.fuel_slice, 1_000_000);
+        assert_eq!(m.limits.max_memory_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn manifest_parses_limits_section() {
+        let toml = r#"
+            name = "cruncher"
+            kind = "wasm"
+            entry = "c.wasm"
+
+            [limits]
+            max_memory_pages = 512
+            max_wall_time_ms = 0
+            fuel_slice = 50000
+        "#;
+        let m = Manifest::parse(toml).unwrap();
+        assert_eq!(m.limits.max_memory_pages, 512);
+        // 0 = unbegrenzt lange laufen dürfen (explizit erlaubt, aber unterbrechbar).
+        assert_eq!(m.limits.max_wall_time_ms, 0);
+        assert_eq!(m.limits.fuel_slice, 50_000);
+    }
+
+    #[test]
+    fn manifest_rejects_implausible_limits() {
+        let zero_fuel = "name=\"x\"\n[limits]\nfuel_slice = 0";
+        assert!(
+            Manifest::parse(zero_fuel).is_err(),
+            "fuel_slice=0 muss scheitern"
+        );
+
+        let huge_mem = "name=\"x\"\n[limits]\nmax_memory_pages = 100000";
+        assert!(
+            Manifest::parse(huge_mem).is_err(),
+            "max_memory_pages>65536 muss scheitern"
+        );
+
+        let zero_mem = "name=\"x\"\n[limits]\nmax_memory_pages = 0";
+        assert!(
+            Manifest::parse(zero_mem).is_err(),
+            "max_memory_pages=0 muss scheitern"
+        );
     }
 }
