@@ -132,7 +132,6 @@ enum Activity {
 #[derive(Clone, Default)]
 struct MetricCache {
     model_label: String,
-    provider: String,
     est_tokens: u64,
     threshold: Option<u64>,
     msg_count: usize,
@@ -145,7 +144,6 @@ struct MetricCache {
 fn metric_snapshot(g: &AgentSession) -> MetricCache {
     MetricCache {
         model_label: crate::model_label(g.model()).to_string(),
-        provider: g.provider_name().to_string(),
         est_tokens: g.estimated_tokens(),
         threshold: g.auto_compact_threshold(),
         msg_count: g.messages().len(),
@@ -1034,7 +1032,6 @@ impl App {
                 &self.activity,
                 &sparkline(&samples),
                 self.turn_start.map(|t| t.elapsed().as_secs()),
-                &self.metrics.provider,
             );
             let message = self.message.as_ref().map(|m| {
                 let color = match m.kind {
@@ -1164,10 +1161,10 @@ fn sparkline(samples: &[u64]) -> String {
 }
 
 /// Zustandswort fürs Statement-Segment.
-fn activity_label(a: &Activity, provider: &str) -> String {
+fn activity_label(a: &Activity) -> String {
     match a {
         Activity::Idle => "bereit".into(),
-        Activity::WaitingProvider => format!("wartet auf {provider}"),
+        Activity::WaitingProvider => "wartet".into(),
         Activity::Thinking => "denkt".into(),
         Activity::Responding => "antwortet".into(),
         Activity::Tool { name } => format!("{name} …"),
@@ -1179,12 +1176,7 @@ fn activity_label(a: &Activity, provider: &str) -> String {
 
 /// Statement-Segment: Sparkline (cyan) + Zustandswort (gelb) + Turn-Timer (dunkelgrau);
 /// Idle/Failed kommen ohne Sparkline/Timer aus.
-fn statement_parts(
-    a: &Activity,
-    spark: &str,
-    elapsed_secs: Option<u64>,
-    provider: &str,
-) -> Vec<(String, Style)> {
+fn statement_parts(a: &Activity, spark: &str, elapsed_secs: Option<u64>) -> Vec<(String, Style)> {
     let dim = Style::default().fg(Color::DarkGray);
     match a {
         Activity::Idle => vec![(
@@ -1197,10 +1189,7 @@ fn statement_parts(
         _ => {
             let mut parts = vec![
                 (format!("{spark} "), Style::default().fg(Color::Cyan)),
-                (
-                    activity_label(a, provider),
-                    Style::default().fg(Color::Yellow),
-                ),
+                (activity_label(a), Style::default().fg(Color::Yellow)),
             ];
             if let Some(s) = elapsed_secs {
                 parts.push((format!(" · {}", fmt_turn_secs(s)), dim));
@@ -1226,14 +1215,14 @@ fn gauge_color(pct: u64) -> Color {
     }
 }
 
-/// Metrik-Segmente rechts: Modell (Provider) · Kontext-Gauge · `m:`Messages · `t:`Tool-Calls
+/// Metrik-Segmente rechts: Modell · Kontext-Gauge · `m:`Messages · `t:`Tool-Calls
 /// im Turn · Session-Dauer. Bewusst OHNE rohes Token-Zahlenpaar (Gauge + Prozent genügen)
 /// und nur mit Breite-1-Glyphen (keine Emoji — East-Asian-Width-Risiko im Terminal).
 fn metric_segments(m: &MetricCache, session_secs: u64, tools_turn: usize) -> Vec<(String, Style)> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut segs = Vec::new();
     if !m.model_label.is_empty() {
-        segs.push((format!("{} ({})", m.model_label, m.provider), dim));
+        segs.push((m.model_label.clone(), dim));
     }
     if let Some(thr) = m.threshold.filter(|&t| t > 0) {
         let pct = m.est_tokens.saturating_mul(100) / thr;
@@ -1640,7 +1629,7 @@ mod tests {
         let msg = || Some(("Modell: glm-5.2".to_string(), Style::default()));
         let metrics = || {
             vec![
-                ("glm-5.2 (zai)".to_string(), Style::default()),
+                ("glm-5.2".to_string(), Style::default()),
                 ("[▆▆▁▁▁▁] 32%".to_string(), Style::default()),
                 ("m:13".to_string(), Style::default()),
             ]
