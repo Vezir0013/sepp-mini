@@ -13,6 +13,43 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.15] - 2026-07-12
+
+Ressourcen-Limits und kooperatives Scheduling für WASM-Plugins: Das Sicherheitsmodell deckte
+bisher *Zugriff* ab (Capabilities → Host-Funktionen), aber nicht *Verbrauch* — eine
+Endlosschleife fror den Tool-Dispatch ein, eine `memory.grow`-Schleife fraß Host-RAM. Diese
+Lücke ist geschlossen: Ein Plugin kann den Agenten weder aufhängen noch fluten.
+
+### Hinzugefügt
+- **`[limits]`-Abschnitt im Plugin-Manifest** (`sepp-policy`): `max_memory_pages` (Default 256
+  = 16 MiB), `max_wall_time_ms` (Default 30 000; `0` = unbegrenzt lange laufen dürfen, aber
+  weiterhin unterbrechbar) und `fuel_slice` (Default 1 000 000 Instruktionen pro Zeitscheibe).
+  Fehlender Abschnitt heißt konservative Defaults, nicht „unbegrenzt"; unplausible Werte
+  (`fuel_slice = 0`, `max_memory_pages` außerhalb `1..=65536`) lehnen das Manifest ab.
+- **Fuel-Slicing mit Refuel-Loop** (`sepp-wasm`): Die Engine läuft mit Fuel-Metering; jeder
+  Plugin-Export wird über wasmis Resumable-API (`call_resumable`/`resume`) in Zeitscheiben
+  ausgeführt. Bei leerem Tank kommt die Kontrolle zum Host zurück (Yield-Punkt), der Abbruch
+  und Wanduhr prüft, nachtankt (mindestens `required_fuel`, sonst käme eine Operation, die
+  mehr als eine Scheibe kostet, nie voran) und die Ausführung **im erhaltenen Zustand**
+  fortsetzt — kein Neustart, lange legitime Rechnungen laufen korrekt zu Ende.
+- **Mid-Call-Abbruch:** Das `CancellationToken` wandert in den `spawn_blocking`-Lauf und wird
+  an jedem Yield-Punkt geprüft — Ctrl-C bricht ein rechnendes Plugin binnen einer Fuel-Scheibe
+  ab, statt die TUI einzufrieren. Abbruch meldet sich als `SeppError::Aborted` (bestehender
+  Budget-/Abbruchpfad), Zeitbudget-Überschreitung als verwertbares Tool-Result beim LLM.
+- **Hartes Speicherlimit:** `StoreLimits`-ResourceLimiter deckelt den linearen Speicher auf
+  `max_memory_pages`; ein `memory.grow` über dem Limit liefert dem Plugin regulär `-1`
+  (kein Trap), das Host-RSS bleibt flach.
+- **Budgetierter Lade-Pfad:** Auch Instanziierung (Start-Sektion) und `sepp_spec` beim
+  Discovery laufen unter Fuel- und Wanduhr-Budget (hart gedeckelt auf 5 s, da es beim Start
+  keinen Abbruchkanal gibt) — ein bösartiges Plugin kann den Sepp-Start nicht mehr aufhängen.
+
+### Tests
+- Acht Szenarien in `sepp-wasm` (WAT-Fixtures): Endlosschleife → Wanduhr-Budget greift, Host
+  lebt · Abbruch wirkt binnen Millisekunden, auch bei `max_wall_time_ms = 0` · lange, aber
+  terminierende Rechnung überlebt viele Yield-Punkte mit korrektem Ergebnis · `memory.grow`
+  über dem Limit liefert `-1`, innerhalb des Limits bleibt erlaubt · ein rechnendes Plugin
+  blockiert den Reactor nicht. Dazu Manifest-Parsing-Tests für `[limits]` in `sepp-policy`.
+
 ## [0.1.14] - 2026-07-12
 
 Kleine TUI-Politur an der in 0.1.13 eingeführten Status-Bar.
