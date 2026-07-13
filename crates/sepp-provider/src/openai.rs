@@ -25,13 +25,20 @@ pub const MLX_BASE_URL: &str = "http://localhost:1234/v1";
 
 /// Welcher OpenAI-kompatible Dialekt gesprochen wird. Steuert anbieterspezifische Body-Felder:
 /// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
-/// würde. Default ist [`OpenAiDialect::OpenAi`] (auch für lokale Endpunkte); der dedizierte
-/// z.ai-Connector ([`crate::zai::ZaiProvider`]) setzt [`OpenAiDialect::Zai`].
+/// würde. Default ist [`OpenAiDialect::OpenAi`]; `--provider local` setzt
+/// [`OpenAiDialect::Local`], der dedizierte z.ai-Connector ([`crate::zai::ZaiProvider`])
+/// [`OpenAiDialect::Zai`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenAiDialect {
-    /// Striktes OpenAI/Chat-Completions (OpenAI, Ollama, vLLM, …) — keine Zusatzfelder.
+    /// Striktes OpenAI/Chat-Completions (OpenAI, LM Studio via mlx, …) — keine Zusatzfelder.
     #[default]
     OpenAi,
+    /// Lokaler Endpunkt via `--provider local` (Ollama/vLLM): sendet bei `ThinkingLevel::Off`
+    /// `reasoning_effort:"none"`. Ollama aktiviert Thinking für fähige Modelle sonst per
+    /// Server-Default auch über /v1 — die finale Antwort landet dann teils komplett im
+    /// `reasoning`-Feld und `content` (stdout) bleibt leer. Echtes OpenAI bekommt das Feld
+    /// bewusst NICHT (ältere o-Modelle lehnen den Wert "none" mit HTTP 400 ab).
+    Local,
     /// z.ai / Zhipu-GLM — akzeptiert zusätzlich `thinking:{type:…}`.
     Zai,
 }
@@ -74,12 +81,12 @@ impl OpenAiMapper {
                         });
                     }
                 }
-                // Reasoning-Modelle über OpenAI-kompatible Endpunkte (z. B. z.ai GLM-4.6,
-                // DeepSeek-R1) streamen ihr Denken in `reasoning_content` statt `content`.
-                // Als ThinkingDelta abbilden statt verwerfen; für reine Chat-Modelle (kein
-                // solches Feld) ist der Zweig ein No-op.
+                // Reasoning-Modelle über OpenAI-kompatible Endpunkte streamen ihr Denken in
+                // `reasoning_content` (z. B. z.ai GLM-4.6, DeepSeek-R1) oder `reasoning`
+                // (Ollama) statt `content`. Als ThinkingDelta abbilden statt verwerfen; für
+                // reine Chat-Modelle (kein solches Feld) ist der Zweig ein No-op.
                 if let Some(rc) = delta
-                    .and_then(|d| d.get("reasoning_content"))
+                    .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
                     .and_then(Value::as_str)
                 {
                     if !rc.is_empty() {
@@ -392,6 +399,11 @@ pub(crate) fn build_chat_body(req: &CompletionRequest, dialect: OpenAiDialect) -
         };
         body["thinking"] = json!({ "type": mode });
     }
+    // Abschaltung des Server-Default-Thinkings lokaler Endpunkte — Begründung und Gating
+    // siehe [`OpenAiDialect::Local`].
+    if dialect == OpenAiDialect::Local && req.thinking == ThinkingLevel::Off {
+        body["reasoning_effort"] = json!("none");
+    }
     body
 }
 
@@ -657,6 +669,43 @@ mod tests {
     }
 
     #[test]
+    fn decodes_ollama_reasoning_stream() {
+        // Aufgezeichnetes Ollama-/v1-Drahtformat (0.31.x, Thinking per Server-Default an):
+        // das Denken kommt im Delta-Feld `reasoning` (nicht `reasoning_content`), daneben
+        // steht ein leerer `content`-String — der darf kein TextDelta erzeugen.
+        let raw = include_bytes!("../tests/fixtures/ollama_reasoning.sse");
+        let events = decode_openai_sse(raw);
+        assert!(matches!(events.first(), Some(StreamEvent::MessageStart)));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
+        let thinking: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "Die Antwort muss knapp sein.");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hallo von Ollama");
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(*u),
+            _ => None,
+        });
+        assert_eq!(usage.map(|u| u.output_tokens), Some(24));
+    }
+
+    #[test]
     fn stream_without_done_marker_still_terminates() {
         // Manche OpenAI-kompatible Server (Ollama/vLLM) senden kein `data: [DONE]`.
         let raw = concat!(
@@ -728,6 +777,31 @@ mod tests {
         let m = test_model(false);
         let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn local_dialect_disables_reasoning_when_thinking_off() {
+        let p = OpenAiProvider::new(None, "x").with_dialect(OpenAiDialect::Local);
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Off));
+        assert_eq!(body["reasoning_effort"], json!("none"));
+    }
+
+    #[test]
+    fn local_dialect_leaves_reasoning_untouched_when_thinking_on() {
+        let p = OpenAiProvider::new(None, "x").with_dialect(OpenAiDialect::Local);
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_dialect_never_emits_reasoning_effort() {
+        // Echtes OpenAI darf das Feld nie bekommen — ältere o-Modelle 400en auf "none".
+        let p = OpenAiProvider::new(None, "x");
+        let m = test_model(true);
+        let body = p.build_body(&test_req(&m, ThinkingLevel::Off));
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

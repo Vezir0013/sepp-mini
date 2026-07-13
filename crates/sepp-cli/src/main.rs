@@ -23,7 +23,9 @@ use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
 use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_provider::openai::{MLX_BASE_URL, MLX_HOST_PORT};
-use sepp_provider::{models, AnthropicProvider, OpenAiProvider, Provider, ZaiProvider};
+use sepp_provider::{
+    models, AnthropicProvider, OpenAiDialect, OpenAiProvider, Provider, ZaiProvider,
+};
 use sepp_tools::{builtin_tools, Tool};
 
 use crate::session::SessionSelect;
@@ -598,10 +600,11 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             eprintln!("{msg}");
         }
     };
-    // --think/SEPP_THINK ist bei OpenAI-Dialekt-Providern wirkungslos (kein Request-seitiges
-    // Reasoning-Feld; anthropic/zai haben eins) — explizit gewünschtes Reasoning wäre sonst
-    // ein stiller No-op.
-    if thinking != ThinkingLevel::Off && (is_openai || is_mlx) {
+    // --think/SEPP_THINK ist bei openai/mlx wirkungslos (kein Request-seitiges Reasoning-Feld;
+    // anthropic/zai haben eins, local steuert Ollamas Server-Default-Thinking binär über
+    // `reasoning_effort` — OpenAiDialect::Local, openai.rs) — explizit gewünschtes Reasoning
+    // wäre sonst ein stiller No-op.
+    if thinking != ThinkingLevel::Off && (provider_kind == "openai" || is_mlx) {
         startup_notice(format!(
             "Hinweis: --think/SEPP_THINK hat bei --provider {provider_kind} keine Wirkung — \
              der Wert wird ignoriert."
@@ -719,7 +722,10 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     }
     let provider: Arc<dyn Provider> = match provider_kind.as_str() {
         "anthropic" => Arc::new(AnthropicProvider::from_env()?),
-        "openai" | "local" => Arc::new(OpenAiProvider::from_env()?),
+        "openai" => Arc::new(OpenAiProvider::from_env()?),
+        // Local-Dialekt: schaltet Ollamas Server-Default-Thinking ab (reasoning_effort
+        // "none" bei Thinking Off) — sonst bleibt stdout nach Tool-Results teils leer.
+        "local" => Arc::new(OpenAiProvider::from_env()?.with_dialect(OpenAiDialect::Local)),
         "mlx" => Arc::new(OpenAiProvider::mlx_from_env()?),
         "zai" => Arc::new(ZaiProvider::from_env()?),
         other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai|mlx)"),

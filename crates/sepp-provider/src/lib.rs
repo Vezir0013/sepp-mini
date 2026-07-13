@@ -22,7 +22,7 @@ pub mod zai;
 #[cfg(feature = "anthropic")]
 pub use anthropic::{decode_anthropic_sse, AnthropicProvider};
 #[cfg(feature = "openai")]
-pub use openai::{decode_openai_sse, OpenAiProvider};
+pub use openai::{decode_openai_sse, OpenAiDialect, OpenAiProvider};
 #[cfg(feature = "zai")]
 pub use zai::ZaiProvider;
 

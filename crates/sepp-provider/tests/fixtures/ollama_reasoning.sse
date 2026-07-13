@@ -1,0 +1,13 @@
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962473,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Die Antwort"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962473,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":" muss knapp sein."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962473,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Hallo"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962473,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":" von Ollama"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962474,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-689","object":"chat.completion.chunk","created":1783962474,"model":"qwen3.5:test","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":24,"total_tokens":36}}
+
+data: [DONE]
