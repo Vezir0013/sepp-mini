@@ -73,6 +73,12 @@ impl AnthropicMapper {
                     Some("thinking_delta") => out.push(StreamEvent::ThinkingDelta {
                         text: str_at(delta, "thinking"),
                     }),
+                    // Kommt als EIN Delta am Ende des Thinking-Blocks und schließt ihn ab.
+                    // Die Signatur muss beim Zurücksenden unverändert mitkommen (Tool-Use-
+                    // Fortsetzung), sonst lehnt die API den Folge-Request mit 400 ab.
+                    Some("signature_delta") => out.push(StreamEvent::ThinkingSignature {
+                        signature: str_at(delta, "signature"),
+                    }),
                     Some("input_json_delta") => {
                         if let Some(BlockKind::ToolUse(id)) = self.blocks.get(&index) {
                             out.push(StreamEvent::ToolUseInputDelta {
@@ -81,7 +87,7 @@ impl AnthropicMapper {
                             });
                         }
                     }
-                    _ => {} // signature_delta o. Ä. — Phase 1 ignoriert
+                    _ => {} // Unbekannte Delta-Typen ignorieren (vorwärtskompatibel)
                 }
             }
             "content_block_stop" => {
@@ -267,7 +273,24 @@ fn message_to_json(msg: &Message) -> Option<Value> {
 fn block_to_json(b: &ContentBlock) -> Option<Value> {
     match b {
         ContentBlock::Text { text } if text.trim().is_empty() => None,
-        ContentBlock::Thinking { .. } => None, // Phase 1: nicht zurücksenden
+        // Signierte Thinking-Blöcke MÜSSEN unverändert zurück: Bei aktiviertem Thinking +
+        // Tool-Use lehnt die API den Folge-Request mit 400 ab, wenn der letzte
+        // Assistant-Turn seinen Thinking-Block verliert. Frühere Turns entfernt die API
+        // selbst (nicht als Input berechnet) — immer mitsenden ist korrekt UND kostenfrei.
+        // Wire-Feld heißt `thinking`, nicht `text` — daher explizit statt serde-Derive.
+        ContentBlock::Thinking {
+            text,
+            signature: Some(sig),
+        } => Some(json!({
+            "type": "thinking",
+            "thinking": text,
+            "signature": sig,
+        })),
+        // Ohne Signatur (Fremd-Provider-Reasoning, Alt-Sessions aus Phase 1) würde die
+        // API den Block ablehnen — weiter weglassen.
+        ContentBlock::Thinking {
+            signature: None, ..
+        } => None,
         other => serde_json::to_value(other).ok(),
     }
 }
@@ -373,8 +396,38 @@ impl Provider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_consecutive_roles;
+    use super::{block_to_json, merge_consecutive_roles};
+    use sepp_core::ContentBlock;
     use serde_json::json;
+
+    #[test]
+    fn signed_thinking_block_uses_wire_format() {
+        // Rückgabe im Anthropic-Drahtformat: Feld heißt `thinking` (nicht `text` wie im
+        // sepp-core-Block), Signatur unverändert — sonst 400 bei Tool-Use-Fortsetzung.
+        let b = ContentBlock::Thinking {
+            text: "Denkprozess".into(),
+            signature: Some("sig123".into()),
+        };
+        assert_eq!(
+            block_to_json(&b),
+            Some(json!({
+                "type": "thinking",
+                "thinking": "Denkprozess",
+                "signature": "sig123",
+            }))
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_block_is_dropped() {
+        // Ohne Signatur (Fremd-Provider-Reasoning, Alt-Sessions) lehnt die API den Block
+        // ab — er darf nicht in den Request.
+        let b = ContentBlock::Thinking {
+            text: "lokales Reasoning".into(),
+            signature: None,
+        };
+        assert_eq!(block_to_json(&b), None);
+    }
 
     #[test]
     fn merges_consecutive_same_role() {

@@ -27,16 +27,19 @@ pub use openai::{decode_openai_sse, OpenAiDialect, OpenAiProvider};
 pub use zai::ZaiProvider;
 
 /// Ein normalisiertes Streaming-Ereignis. Die Reihenfolge-Invariante:
-/// `MessageStart (TextDelta|ThinkingDelta|ToolUse*)* Usage? MessageStop`.
+/// `MessageStart (TextDelta|ThinkingDelta|ThinkingSignature|ToolUse*)* Usage? MessageStop`.
 /// `ToolUseStop` kann auch mitten im Stream kommen (Server, die den tool_call-`index`
 /// recyceln, schließen den vorigen Call beim Start des nächsten), bleibt aber immer
-/// innerhalb der `ToolUse*`-Gruppe vor `Usage`/`MessageStop`.
+/// innerhalb der `ToolUse*`-Gruppe vor `Usage`/`MessageStop`. `ThinkingSignature` schließt
+/// die vorangehenden `ThinkingDelta`s zu einem signierten Block ab (Anthropic signiert je
+/// Thinking-Block; die Signatur MUSS beim Zurücksenden unverändert mitkommen).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     MessageStart,
     TextDelta { text: String },
     ThinkingDelta { text: String },
+    ThinkingSignature { signature: String },
     ToolUseStart { id: String, name: String },
     ToolUseInputDelta { id: String, partial_json: String },
     ToolUseStop { id: String },

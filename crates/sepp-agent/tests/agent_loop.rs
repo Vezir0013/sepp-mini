@@ -542,6 +542,88 @@ async fn set_thinking_updates_state() {
 }
 
 #[tokio::test]
+async fn signed_thinking_lands_in_history() {
+    // Anthropic + Thinking: die Signatur schließt den Thinking-Block ab; er muss MIT
+    // Signatur in der Assistant-Message landen — der Provider sendet ihn beim nächsten
+    // Request zurück (Pflicht bei Tool-Use-Fortsetzung, sonst 400).
+    let script = vec![
+        StreamEvent::MessageStart,
+        StreamEvent::ThinkingDelta {
+            text: "Denk".into(),
+        },
+        StreamEvent::ThinkingDelta {
+            text: "prozess".into(),
+        },
+        StreamEvent::ThinkingSignature {
+            signature: "sig123".into(),
+        },
+        StreamEvent::TextDelta {
+            text: "Antwort".into(),
+        },
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+    ];
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![script])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .build()
+        .unwrap();
+    session
+        .prompt("hallo", &|_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let assistant = &session.state().messages[1];
+    assert!(matches!(&assistant.content[0],
+        sepp_core::ContentBlock::Thinking { text, signature: Some(sig) }
+            if text == "Denkprozess" && sig == "sig123"));
+    assert!(matches!(&assistant.content[1],
+        sepp_core::ContentBlock::Text { text } if text == "Antwort"));
+}
+
+#[tokio::test]
+async fn unsigned_thinking_stays_unsigned() {
+    // OpenAI-Dialekt-Reasoning (Ollama/GLM) kennt keine Signaturen: der Buffer bleibt
+    // offen und landet als unsignierter Block — der Anthropic-Adapter lässt solche
+    // Blöcke beim Zurücksenden weiter weg.
+    let script = vec![
+        StreamEvent::MessageStart,
+        StreamEvent::ThinkingDelta {
+            text: "überlege…".into(),
+        },
+        StreamEvent::TextDelta { text: "ok".into() },
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+    ];
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![script])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .build()
+        .unwrap();
+    session
+        .prompt("hallo", &|_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let assistant = &session.state().messages[1];
+    assert!(matches!(
+        &assistant.content[0],
+        sepp_core::ContentBlock::Thinking {
+            signature: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn provider_name_reports_provider_label() {
     let provider = Arc::new(FakeProvider {
         scripts: Mutex::new(VecDeque::new()),

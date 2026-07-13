@@ -327,6 +327,9 @@ impl AgentSession {
 
             let mut text_buf = String::new();
             let mut thinking_buf = String::new();
+            // Abgeschlossene (signierte) Thinking-Blöcke in Ankunftsreihenfolge — Anthropic
+            // signiert je Block; die Signatur schließt den laufenden Buffer ab.
+            let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
             let mut calls: Vec<PendingCall> = Vec::new();
             let mut index_by_id: HashMap<String, usize> = HashMap::new();
             let mut usage: Option<Usage> = None;
@@ -342,6 +345,16 @@ impl AgentSession {
                     StreamEvent::ThinkingDelta { text } => {
                         on_event(AgentEvent::ThinkingDelta(text.clone()));
                         thinking_buf.push_str(&text);
+                    }
+                    StreamEvent::ThinkingSignature { signature } => {
+                        // Kein UI-Event: die Signatur ist reine Protokoll-Buchhaltung. Auch
+                        // bei leerem Buffer als Block behalten (Modelle mit unterdrücktem
+                        // Thinking-Text liefern leere Blöcke MIT Signatur — die API verlangt
+                        // sie beim Zurücksenden trotzdem).
+                        thinking_blocks.push(ContentBlock::Thinking {
+                            text: std::mem::take(&mut thinking_buf),
+                            signature: Some(signature),
+                        });
                     }
                     StreamEvent::ToolUseStart { id, name } => {
                         on_event(AgentEvent::ToolStart {
@@ -382,8 +395,11 @@ impl AgentSession {
                 return Err(SeppError::Aborted);
             }
 
-            // Assistant-Nachricht rekonstruieren (Thinking?, Text?, ToolUse*).
-            let mut content: Vec<ContentBlock> = Vec::new();
+            // Assistant-Nachricht rekonstruieren (Thinking*, Text?, ToolUse*). Signierte
+            // Thinking-Blöcke zuerst (Anthropic verlangt sie am Turn-Anfang), danach ein
+            // ggf. verbliebener unsignierter Rest (OpenAI-Dialekt-Reasoning kennt keine
+            // Signaturen — dort bleibt der gesamte Buffer offen).
+            let mut content: Vec<ContentBlock> = thinking_blocks;
             if !thinking_buf.is_empty() {
                 content.push(ContentBlock::Thinking {
                     text: thinking_buf,
