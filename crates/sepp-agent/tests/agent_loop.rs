@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use sepp_agent::{AgentEvent, AgentSession};
-use sepp_core::{Model, Result, Role, ToolResult, ToolSpec, Usage};
+use sepp_core::{Model, Result, Role, ThinkingLevel, ToolResult, ToolSpec, Usage};
 use sepp_provider::{CompletionRequest, Provider, StopReason, StreamEvent};
 use sepp_session::SessionStore; // Trait im Scope für `.entries()` auf konkretem JsonlSessionStore
 use sepp_tools::Tool;
@@ -519,6 +519,26 @@ async fn set_model_keeps_disabled_compaction() {
     assert_eq!(session.auto_compact_threshold(), None);
     session.set_model(test_model());
     assert_eq!(session.auto_compact_threshold(), None);
+}
+
+#[tokio::test]
+async fn set_thinking_updates_state() {
+    // TUI-/think: Umschalten zur Laufzeit muss im State landen — der Loop liest
+    // state.thinking bei jedem Request neu, mehr Verdrahtung gibt es nicht.
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::new()),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .build()
+        .unwrap();
+    assert_eq!(session.state().thinking, ThinkingLevel::Off); // Builder-Default
+
+    session.set_thinking(ThinkingLevel::Medium);
+    assert_eq!(session.state().thinking, ThinkingLevel::Medium);
+    session.set_thinking(ThinkingLevel::Off);
+    assert_eq!(session.state().thinking, ThinkingLevel::Off);
 }
 
 #[tokio::test]

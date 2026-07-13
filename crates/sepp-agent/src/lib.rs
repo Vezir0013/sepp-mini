@@ -157,6 +157,12 @@ impl AgentSession {
         self.state.model = model;
     }
 
+    /// Setzt die Reasoning-Stufe für folgende Turns (TUI-`/think`). Greift ab dem nächsten
+    /// Request — der Loop liest `state.thinking` bei jedem Turn neu.
+    pub fn set_thinking(&mut self, level: ThinkingLevel) {
+        self.state.thinking = level;
+    }
+
     /// Aktuelle Auto-Compaction-Schwelle (geschätzte Tokens); `None` = deaktiviert.
     pub fn auto_compact_threshold(&self) -> Option<u64> {
         self.auto_compact_threshold

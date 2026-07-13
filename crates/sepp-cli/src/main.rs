@@ -908,6 +908,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 SYSTEM_PROMPT.to_string(),
                 !opts.hide_thinking,
                 startup_notices,
+                provider_kind,
             )
             .await
         }

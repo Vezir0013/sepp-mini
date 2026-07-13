@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession};
-use sepp_core::{ContentBlock, Message, Role};
+use sepp_core::{ContentBlock, Message, Role, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_provider::models;
 use sepp_session::{SessionInfo, SessionStore};
@@ -135,6 +135,8 @@ struct MetricCache {
     est_tokens: u64,
     threshold: Option<u64>,
     msg_count: usize,
+    /// Aktive Reasoning-Stufe (`think`-Segment; `Off` = kein Segment).
+    thinking: ThinkingLevel,
 }
 
 /// Schnappschuss der Bar-Metriken bei gehaltenem Session-Lock. Freie Funktion statt
@@ -147,6 +149,7 @@ fn metric_snapshot(g: &AgentSession) -> MetricCache {
         est_tokens: g.estimated_tokens(),
         threshold: g.auto_compact_threshold(),
         msg_count: g.messages().len(),
+        thinking: g.state().thinking,
     }
 }
 
@@ -186,6 +189,10 @@ struct App {
     resume_sel: usize,
     prompt_templates: Vec<(String, String)>,
     base_prompt: String,
+    /// Aufgelöster CLI-Provider (z. B. `"local"` vs. `"openai"`) — `provider_name()` meldet
+    /// für beide `"openai"`; der `/think`-Hinweis („wirkungslos bei openai/mlx") braucht die
+    /// Unterscheidung, weil local Ollamas Server-Default-Thinking sehr wohl steuert.
+    provider_kind: String,
     should_quit: bool,
     /// Feedback-/Startup-Zeilen AUSSERHALB des Transcripts, gerendert unter dem Chatverlauf:
     /// überleben so rebuild_transcript (das nur aus Session-Messages baut) und gelten bis zur
@@ -196,13 +203,16 @@ struct App {
 
 /// Startet die TUI und blockiert, bis der Nutzer beendet. `startup_notices` sind Hinweise aus
 /// dem CLI-Start (z. B. „--think wirkungslos", Cross-Provider-Modellwarnung), die im Chatfenster
-/// erscheinen müssen — ein eprintln verpufft hinter dem Alternate-Screen.
+/// erscheinen müssen — ein eprintln verpufft hinter dem Alternate-Screen. `provider_kind` ist
+/// der aufgelöste CLI-Provider-String — `provider_name()` reicht nicht, weil sich
+/// `--provider local` dort als `"openai"` meldet (siehe [`App::provider_kind`]).
 pub async fn run(
     agent: AgentSession,
     prompt_templates: Vec<(String, String)>,
     base_prompt: String,
     show_thinking: bool,
     startup_notices: Vec<String>,
+    provider_kind: String,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -217,6 +227,7 @@ pub async fn run(
         prompt_templates,
         base_prompt,
         show_thinking,
+        provider_kind,
     );
     app.rebuild_transcript().await;
     // Start-Hinweise als Notices (nicht ins Transcript): rebuild_transcript baut den Verlauf
@@ -301,6 +312,7 @@ impl App {
         prompt_templates: Vec<(String, String)>,
         base_prompt: String,
         show_thinking: bool,
+        provider_kind: String,
     ) -> Self {
         App {
             session,
@@ -332,6 +344,7 @@ impl App {
             resume_sel: 0,
             prompt_templates,
             base_prompt,
+            provider_kind,
             should_quit: false,
             notices: Vec::new(),
             tx,
@@ -508,7 +521,7 @@ impl App {
         if self.running
             && matches!(
                 name,
-                "new" | "compact" | "model" | "tree" | "resume" | "reload" | "trust"
+                "new" | "compact" | "model" | "think" | "tree" | "resume" | "reload" | "trust"
             )
         {
             self.notify("läuft noch — bitte warten");
@@ -530,7 +543,7 @@ impl App {
             }
             "help" | "h" => {
                 let mut text = String::from(
-                    "Befehle: /new /resume /tree /compact /model [id] /trust /reload /hide /show /quit",
+                    "Befehle: /new /resume /tree /compact /model [id] /think [on|off] /trust /reload /hide /show /quit",
                 );
                 if !self.prompt_templates.is_empty() {
                     let names: Vec<String> = self
@@ -586,6 +599,46 @@ impl App {
                     self.notify(format!("Modelle: {}", ids.join(", ")));
                 }
             },
+            "think" => {
+                // „An" = Medium wie --think (resolve_thinking, main.rs): Anthropic verlangt
+                // budget_tokens < max_tokens — Medium (4096) ist beim Default-max_tokens sicher.
+                let explicit = match arg.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    None => None,
+                    Some("on") => Some(ThinkingLevel::Medium),
+                    Some("off") => Some(ThinkingLevel::Off),
+                    Some(other) => {
+                        self.notify_error(format!(
+                            "/think: unbekanntes Argument '{other}' (on|off)"
+                        ));
+                        return true;
+                    }
+                };
+                let mut g = self.session.lock().await;
+                // Toggle: Off → Medium, jede aktive Stufe → Off (robust gegen künftige Stufen).
+                let level = explicit.unwrap_or(if g.state().thinking == ThinkingLevel::Off {
+                    ThinkingLevel::Medium
+                } else {
+                    ThinkingLevel::Off
+                });
+                g.set_thinking(level);
+                // Bar-Cache nachziehen: der Render-Pfad lockt die Session nie (think-Segment).
+                self.metrics = metric_snapshot(&g);
+                drop(g);
+                if level == ThinkingLevel::Off {
+                    self.notify("Thinking: aus");
+                } else if matches!(self.provider_kind.as_str(), "openai" | "mlx") {
+                    // Bedingung wie der Startup-Hinweis (main.rs): openai/mlx haben kein
+                    // request-seitiges Reasoning-Feld. local bleibt hinweisfrei — es meldet
+                    // sich via provider_name() zwar auch als "openai", steuert aber Ollamas
+                    // Server-Default-Thinking (daher provider_kind statt provider_name()).
+                    self.notify(format!(
+                        "Thinking: an — Hinweis: hat bei --provider {} keine Wirkung",
+                        self.provider_kind
+                    ));
+                } else {
+                    self.notify("Thinking: an");
+                }
+            }
             "compact" => self.start_compact(),
             "tree" => {
                 // Guard vor den notify-Aufrufen (&mut self) freigeben.
@@ -1116,8 +1169,8 @@ fn short_id(id: &str) -> String {
 /// Builtin-Slash-Commands inkl. Aliase — MUSS mit dem `match name` in `handle_command`
 /// synchron bleiben. Grundlage der Kollisionswarnung beim Laden der Prompt-Templates.
 const BUILTIN_COMMANDS: &[&str] = &[
-    "quit", "exit", "q", "help", "h", "new", "model", "compact", "tree", "resume", "trust",
-    "reload", "hide", "show",
+    "quit", "exit", "q", "help", "h", "new", "model", "think", "compact", "tree", "resume",
+    "trust", "reload", "hide", "show",
 ];
 
 /// Namen der Templates, die ein Builtin-Kommando verschatten würden — der Builtin gewinnt
@@ -1215,14 +1268,20 @@ fn gauge_color(pct: u64) -> Color {
     }
 }
 
-/// Metrik-Segmente rechts: Modell · Kontext-Gauge · `m:`Messages · `t:`Tool-Calls
-/// im Turn · Session-Dauer. Bewusst OHNE rohes Token-Zahlenpaar (Gauge + Prozent genügen)
-/// und nur mit Breite-1-Glyphen (keine Emoji — East-Asian-Width-Risiko im Terminal).
+/// Metrik-Segmente rechts: Modell · `think` (nur bei aktivem Reasoning) · Kontext-Gauge ·
+/// `m:`Messages · `t:`Tool-Calls im Turn · Session-Dauer. Bewusst OHNE rohes
+/// Token-Zahlenpaar (Gauge + Prozent genügen) und nur mit Breite-1-Glyphen (keine Emoji —
+/// East-Asian-Width-Risiko im Terminal).
 fn metric_segments(m: &MetricCache, session_secs: u64, tools_turn: usize) -> Vec<(String, Style)> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut segs = Vec::new();
     if !m.model_label.is_empty() {
         segs.push((m.model_label.clone(), dim));
+    }
+    // Direkt nach dem Modell-Label: beides Konfigurationszustand, und die
+    // Rechts-nach-links-Truncation droppt den Modus-Indikator so später als die Zähler.
+    if m.thinking != ThinkingLevel::Off {
+        segs.push(("think".into(), dim));
     }
     if let Some(thr) = m.threshold.filter(|&t| t > 0) {
         let pct = m.est_tokens.saturating_mul(100) / thr;
@@ -1544,8 +1603,9 @@ mod tests {
         }
     }
 
-    /// App mit FakeProvider-Session — für Tests der Command-/Notify-Logik ohne Terminal.
-    fn test_app() -> App {
+    /// App mit FakeProvider-Session und explizitem `provider_kind` — für Tests der
+    /// provider-abhängigen Logik (z. B. /think-Hinweis bei openai/mlx vs. local).
+    fn test_app_with_provider(kind: &str) -> App {
         let session = sepp_agent::AgentSession::builder()
             .provider(Arc::new(FakeProvider))
             .model(crate::custom_model("test".into(), "fake"))
@@ -1558,7 +1618,13 @@ mod tests {
             Vec::new(),
             String::new(),
             false,
+            kind.to_string(),
         )
+    }
+
+    /// App mit FakeProvider-Session — für Tests der Command-/Notify-Logik ohne Terminal.
+    fn test_app() -> App {
+        test_app_with_provider("fake")
     }
 
     #[tokio::test]
@@ -1577,6 +1643,123 @@ mod tests {
     /// Segmenttexte zu einem String verkettet — für Truncation-Asserts.
     fn seg_text(segs: &[(String, Style)]) -> String {
         segs.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// Aktuelle Reasoning-Stufe der Session (Test-Helfer für die /think-Asserts).
+    async fn session_thinking(app: &App) -> ThinkingLevel {
+        app.session.lock().await.state().thinking
+    }
+
+    #[tokio::test]
+    async fn think_toggle_roundtrip() {
+        // /think ohne Argument toggelt Off → Medium → Off; Session-State und Bar-Cache
+        // müssen synchron wandern (der Render-Pfad liest nur den Cache).
+        let mut app = test_app();
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Off);
+
+        app.handle_command("think").await;
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Medium);
+        assert_eq!(app.metrics.thinking, ThinkingLevel::Medium);
+        assert_eq!(app.message.as_ref().unwrap().text, "Thinking: an");
+
+        app.handle_command("think").await;
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Off);
+        assert_eq!(app.metrics.thinking, ThinkingLevel::Off);
+        assert_eq!(app.message.as_ref().unwrap().text, "Thinking: aus");
+    }
+
+    #[tokio::test]
+    async fn think_explicit_on_off() {
+        // on/off setzen absolut (kein verstecktes Toggle) und case-insensitiv.
+        let mut app = test_app();
+        app.handle_command("think on").await;
+        app.handle_command("think on").await; // idempotent, kein Rückfall auf Off
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Medium);
+        app.handle_command("think off").await;
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Off);
+        app.handle_command("think ON").await;
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Medium);
+    }
+
+    #[tokio::test]
+    async fn think_unknown_arg_is_error_and_keeps_state() {
+        let mut app = test_app();
+        app.handle_command("think maybe").await;
+        let msg = app.message.as_ref().unwrap();
+        assert_eq!(msg.kind, Kind::Error);
+        assert!(msg.text.contains("/think"), "{}", msg.text);
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Off);
+        assert_eq!(app.metrics.thinking, ThinkingLevel::Off);
+    }
+
+    #[tokio::test]
+    async fn think_rejected_while_running() {
+        // Guard-Eintrag: während eines Turns hält der Prompt-Task den Session-Mutex —
+        // ein lock().await im Handler fröre die Event-Loop ein.
+        let mut app = test_app();
+        app.running = true;
+        let handled = app.handle_command("think").await;
+        assert!(!handled);
+        assert!(app.message.as_ref().unwrap().text.contains("läuft noch"));
+        app.running = false;
+        assert_eq!(session_thinking(&app).await, ThinkingLevel::Off);
+    }
+
+    #[tokio::test]
+    async fn think_hint_only_for_ineffective_providers() {
+        // openai/mlx: Reasoning-Feld wird nicht gesendet → Hinweis. local meldet sich via
+        // provider_name() zwar auch als "openai", der CLI-provider_kind unterscheidet aber —
+        // dort steuert /think Ollamas Server-Default-Thinking und bleibt hinweisfrei.
+        for kind in ["openai", "mlx"] {
+            let mut app = test_app_with_provider(kind);
+            app.handle_command("think on").await;
+            let text = &app.message.as_ref().unwrap().text;
+            assert!(text.contains("keine Wirkung"), "{kind}: {text}");
+            app.handle_command("think off").await;
+            assert_eq!(app.message.as_ref().unwrap().text, "Thinking: aus");
+        }
+        for kind in ["local", "anthropic", "zai"] {
+            let mut app = test_app_with_provider(kind);
+            app.handle_command("think on").await;
+            assert_eq!(app.message.as_ref().unwrap().text, "Thinking: an", "{kind}");
+        }
+    }
+
+    #[test]
+    fn metric_segments_show_think_only_when_on() {
+        let mut m = MetricCache {
+            model_label: "Test".into(),
+            ..Default::default()
+        };
+        assert!(!seg_text(&metric_segments(&m, 0, 0)).contains("think"));
+        m.thinking = ThinkingLevel::Medium;
+        let text = seg_text(&metric_segments(&m, 0, 0));
+        assert!(text.contains("think"), "{text}");
+        assert!(text.contains("m:") && text.contains("t:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn startup_thinking_lands_in_metric_cache() {
+        // --think-Start bzw. zai-Default: der Indikator muss ab Frame 1 stimmen — run()
+        // ruft nach App::new rebuild_transcript(), das den Cache aus der Session füllt.
+        let session = sepp_agent::AgentSession::builder()
+            .provider(Arc::new(FakeProvider))
+            .model(crate::custom_model("test".into(), "fake"))
+            .thinking(ThinkingLevel::Medium)
+            .build()
+            .expect("test session");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::new(Mutex::new(session)),
+            tx,
+            Vec::new(),
+            String::new(),
+            false,
+            "zai".to_string(),
+        );
+        assert_eq!(app.metrics.thinking, ThinkingLevel::Off); // Cache noch leer
+        app.rebuild_transcript().await;
+        assert_eq!(app.metrics.thinking, ThinkingLevel::Medium);
     }
 
     #[test]
