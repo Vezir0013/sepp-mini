@@ -4,6 +4,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
@@ -37,7 +38,11 @@ pub enum OpenAiDialect {
     /// `reasoning_effort:"none"`. Ollama aktiviert Thinking für fähige Modelle sonst per
     /// Server-Default auch über /v1 — die finale Antwort landet dann teils komplett im
     /// `reasoning`-Feld und `content` (stdout) bleibt leer. Echtes OpenAI bekommt das Feld
-    /// bewusst NICHT (ältere o-Modelle lehnen den Wert "none" mit HTTP 400 ab).
+    /// bewusst NICHT (ältere o-Modelle lehnen den Wert "none" mit HTTP 400 ab). Nicht jeder
+    /// lokale Server kennt das Feld bzw. den Wert (Ollama < 0.18: „invalid think value";
+    /// vLLM je nach Modell 400) — lehnt der Endpunkt mit 4xx ab, wiederholt der Provider den
+    /// Request einmal ohne das Feld und lässt es für den Rest der Sitzung weg
+    /// (siehe [`OpenAiProvider::stream`]).
     Local,
     /// z.ai / Zhipu-GLM — akzeptiert zusätzlich `thinking:{type:…}`.
     Zai,
@@ -279,6 +284,13 @@ pub struct OpenAiProvider {
     /// Anbieter-Label für `name()` und alle Fehlertexte (`"openai"` bzw. `"mlx"`) — ein
     /// LM-Studio-Fehler darf nicht als OpenAI-Fehler erscheinen (vgl. [`DecodeState`]).
     label: &'static str,
+    /// Der Endpunkt hat `reasoning_effort` mit 4xx abgelehnt UND der Retry ohne das Feld war
+    /// erfolgreich — weitere Requests lassen das Feld dann von vornherein weg (Local-Dialekt;
+    /// betrifft Ollama < 0.18 / vLLM-Modelle ohne "none"-Support). Nur bei erfolgreichem
+    /// Retry gesetzt, damit ein transienter 4xx die Thinking-Unterdrückung nicht dauerhaft
+    /// deaktiviert. Der Provider lebt als `Arc` über die Session — der Fallback wird pro
+    /// Sitzung genau einmal ausgehandelt.
+    reasoning_effort_rejected: AtomicBool,
 }
 
 impl OpenAiProvider {
@@ -291,6 +303,7 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             dialect: OpenAiDialect::default(),
             label: "openai",
+            reasoning_effort_rejected: AtomicBool::new(false),
         }
     }
 
@@ -506,16 +519,90 @@ impl Provider for OpenAiProvider {
         req: CompletionRequest<'a>,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'a, StreamEvent>> {
-        let body = self.build_body(&req);
-        stream_chat(
+        let mut body = self.build_body(&req);
+        if self.reasoning_effort_rejected.load(Ordering::Relaxed) {
+            remove_reasoning_effort(&mut body);
+        }
+        // Ohne das Feld gibt es nichts auszuhandeln — direkt senden (openai/mlx/zai-Pfad
+        // und Local nach ausgehandeltem Fallback).
+        if body.get("reasoning_effort").is_none() {
+            return stream_chat(
+                &self.client,
+                &self.base_url,
+                self.api_key.as_deref(),
+                body,
+                self.label,
+                cancel,
+            )
+            .await
+            .map_err(ChatError::into_sepp);
+        }
+        match stream_chat(
             &self.client,
             &self.base_url,
             self.api_key.as_deref(),
-            body,
+            body.clone(),
             self.label,
-            cancel,
+            cancel.clone(),
         )
         .await
+        {
+            Ok(s) => Ok(s),
+            // 4xx mit gesendetem reasoning_effort: mancher lokale Server kennt das Feld/den
+            // Wert "none" nicht (Ollama < 0.18, vLLM je nach Modell) — einmal ohne das Feld
+            // wiederholen statt --provider local komplett zu brechen. 5xx/Transportfehler
+            // gehen unverändert durch (dort ist das Feld nicht die Ursache).
+            Err(e) if e.status.is_some_and(|s| s.is_client_error()) => {
+                remove_reasoning_effort(&mut body);
+                let s = stream_chat(
+                    &self.client,
+                    &self.base_url,
+                    self.api_key.as_deref(),
+                    body,
+                    self.label,
+                    cancel,
+                )
+                .await
+                .map_err(ChatError::into_sepp)?;
+                self.reasoning_effort_rejected
+                    .store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "{}: Endpunkt lehnt reasoning_effort ab — Feld wird für diese Sitzung \
+                     weggelassen (Server-Default-Thinking ist damit nicht steuerbar)",
+                    self.label
+                );
+                Ok(s)
+            }
+            Err(e) => Err(e.into_sepp()),
+        }
+    }
+}
+
+/// Entfernt das `reasoning_effort`-Feld aus einem Chat-Body (Fallback des Local-Dialekts).
+fn remove_reasoning_effort(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("reasoning_effort");
+    }
+}
+
+/// Fehler aus [`stream_chat`] mit maschinenlesbarem HTTP-Status (`None` bei Transport-/
+/// Verbindungsfehlern) — Grundlage des `reasoning_effort`-Fallbacks im Local-Dialekt.
+/// Außerhalb davon via [`ChatError::into_sepp`] in den bisherigen [`SeppError`] überführen.
+pub(crate) struct ChatError {
+    pub(crate) status: Option<reqwest::StatusCode>,
+    pub(crate) error: SeppError,
+}
+
+impl ChatError {
+    fn transport(error: SeppError) -> Self {
+        ChatError {
+            status: None,
+            error,
+        }
+    }
+
+    pub(crate) fn into_sepp(self) -> SeppError {
+        self.error
     }
 }
 
@@ -531,7 +618,7 @@ pub(crate) async fn stream_chat(
     body: Value,
     label: &'static str,
     cancel: CancellationToken,
-) -> Result<BoxStream<'static, StreamEvent>> {
+) -> std::result::Result<BoxStream<'static, StreamEvent>, ChatError> {
     let url = format!("{base_url}/chat/completions");
     let mut builder = client.post(&url).json(&body);
     if let Some(key) = api_key {
@@ -541,20 +628,20 @@ pub(crate) async fn stream_chat(
         // Verbindungsfehler nennen den Endpunkt: hilfreicher bei lokalen Servern (mlx/local),
         // die zwischen Preflight und Request sterben können, statt eines rohen reqwest-Texts.
         if e.is_connect() {
-            SeppError::Provider(format!(
+            ChatError::transport(SeppError::Provider(format!(
                 "{label}: Verbindung zu {base_url} fehlgeschlagen: {e} — läuft der Server?"
-            ))
+            )))
         } else {
-            SeppError::Provider(format!("{label} request: {e}"))
+            ChatError::transport(SeppError::Provider(format!("{label} request: {e}")))
         }
     })?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(SeppError::Provider(format!(
-            "{label}: HTTP {status}: {}",
-            text.trim()
-        )));
+        return Err(ChatError {
+            status: Some(status),
+            error: SeppError::Provider(format!("{label}: HTTP {status}: {}", text.trim())),
+        });
     }
 
     let state = DecodeState {

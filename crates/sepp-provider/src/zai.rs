@@ -70,6 +70,7 @@ impl Provider for ZaiProvider {
             cancel,
         )
         .await
+        .map_err(|e| e.into_sepp())
     }
 }
 
