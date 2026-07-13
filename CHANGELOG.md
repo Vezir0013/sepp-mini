@@ -13,6 +13,46 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - Google-Provider-Adapter
 - Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
+## [0.1.16] - 2026-07-13
+
+Extended Thinking wird vom Anzeige-Feature zum korrekt verdrahteten Rundlauf: Bisher (Phase 1)
+wurden Thinking-Blöcke nach dem Streamen weggeworfen — das brach Anthropic-Thinking bei
+Tool-Use (400 im Folge-Request) und ließ Ollama-Antworten teils leer enden, weil das Denken
+unkontrolliert ins `reasoning`-Feld lief. Jetzt ist Thinking über die Provider konsistent:
+signiert zurückgesendet, lokal steuerbar und in der TUI zur Laufzeit umschaltbar.
+
+### Behoben
+- **Anthropic: Extended Thinking + Tool-Use lehnte den Folge-Request mit 400 ab**
+  (`sepp-provider`, `sepp-agent`): Die API verlangt den unveränderten Thinking-Block inkl.
+  `signature` im nächsten Request. Der SSE-Mapper erfasst `signature_delta` als neues
+  `StreamEvent::ThinkingSignature`, der Agent-Loop schließt den Thinking-Buffer je Signatur
+  zu signierten Blöcken ab, und `block_to_json` sendet sie im Wire-Format (Feld `thinking`,
+  nicht `text`) zurück. Unsignierte Blöcke (Fremd-Provider-Reasoning, Alt-Sessions) werden
+  weiterhin weggelassen — die API lehnt sie ab. Zurückgesendet wird nur in Requests, die
+  Thinking auch aktivieren: Bei deaktiviertem Thinking verbietet die API die Blöcke ebenso
+  (400 „must have thinking enabled") — ohne diesen Drop bräche nach einem Thinking-Turn
+  jede Compaction (summarisiert immer ohne Thinking), `/think off` und `--resume` ohne
+  `--think`.
+- **Ollama (`--provider local`): finale Antwort landete teils komplett im `reasoning`-Feld**,
+  stdout blieb leer (`sepp-provider`): Der neue `OpenAiDialect::Local` sendet bei
+  `ThinkingLevel::Off` `reasoning_effort: "none"` und steuert damit Ollamas
+  Server-Default-Thinking; der SSE-Mapper bildet Ollamas `reasoning`-Delta als
+  `ThinkingDelta` ab. Der Startup-Hinweis „--think/SEPP_THINK hat keine Wirkung" gilt nur
+  noch für `openai`/`mlx` — bei `local` wirkt der Schalter jetzt. Endpunkte, die das Feld
+  bzw. den Wert `"none"` nicht kennen (Ollama < 0.18: „invalid think value"; vLLM je nach
+  Modell), lehnen mit 4xx ab — der Provider wiederholt den Request dann einmal ohne das
+  Feld und lässt es für den Rest der Sitzung weg, statt dass `--provider local` gegen
+  solche Server komplett bricht.
+
+### Hinzugefügt
+- **`/think` in der TUI** (`sepp-cli`, `sepp-agent`): schaltet Reasoning zur Laufzeit —
+  ohne Argument als Toggle (Off ↔ Medium), mit `on`/`off` explizit; Medium wie `--think`
+  (Anthropic verlangt `budget_tokens < max_tokens`). Neues `AgentSession::set_thinking`;
+  der Loop liest `state.thinking` pro Request. Bei aktivem Reasoning zeigt die Status-Bar
+  ein dezentes `think`-Segment (aus dem MetricCache — der Render-Pfad lockt die Session
+  nie). Bei `openai`/`mlx` kommt der „keine Wirkung"-Hinweis auch hier; Sub-Agenten
+  (`task`) frieren die Stufe beim Start ein, wie bei `/model`.
+
 ## [0.1.15] - 2026-07-12
 
 Ressourcen-Limits und kooperatives Scheduling für WASM-Plugins: Das Sicherheitsmodell deckte
@@ -397,7 +437,9 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.15...v0.1.16
+[0.1.15]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.11...v0.1.12
