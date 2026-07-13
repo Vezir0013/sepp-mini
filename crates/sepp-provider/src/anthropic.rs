@@ -200,8 +200,17 @@ impl AnthropicProvider {
         } else {
             req.model.max_output_tokens
         };
-        let messages =
-            merge_consecutive_roles(req.messages.iter().filter_map(message_to_json).collect());
+        // Ein Flag für Request-Parameter UND History-Serialisierung: Thinking-Blöcke dürfen
+        // nur in Requests erscheinen, die den thinking-Parameter setzen — sonst 400 („must
+        // have thinking enabled"). Betroffen sind sonst compact() (summarisiert mit Off),
+        // /think off, --resume ohne --think und Modelle ohne supports_reasoning.
+        let thinking_enabled = req.thinking != ThinkingLevel::Off && req.model.supports_reasoning;
+        let messages = merge_consecutive_roles(
+            req.messages
+                .iter()
+                .filter_map(|m| message_to_json(m, thinking_enabled))
+                .collect(),
+        );
         let mut body = json!({
             "model": req.model.id,
             "max_tokens": max_tokens,
@@ -227,7 +236,7 @@ impl AnthropicProvider {
                 .collect();
             body["tools"] = json!(tools);
         }
-        if req.thinking != ThinkingLevel::Off && req.model.supports_reasoning {
+        if thinking_enabled {
             body["thinking"] = json!({
                 "type": "enabled",
                 "budget_tokens": req.thinking.budget_tokens(),
@@ -257,40 +266,45 @@ fn merge_consecutive_roles(msgs: Vec<Value>) -> Vec<Value> {
     out
 }
 
-fn message_to_json(msg: &Message) -> Option<Value> {
+fn message_to_json(msg: &Message, thinking_enabled: bool) -> Option<Value> {
     let role = match msg.role {
         Role::Assistant => "assistant",
         Role::User | Role::Tool => "user",
         Role::System => return None, // System-Prompt ist ein eigenes Feld
     };
-    let content: Vec<Value> = msg.content.iter().filter_map(block_to_json).collect();
+    let content: Vec<Value> = msg
+        .content
+        .iter()
+        .filter_map(|b| block_to_json(b, thinking_enabled))
+        .collect();
     if content.is_empty() {
         return None;
     }
     Some(json!({ "role": role, "content": content }))
 }
 
-fn block_to_json(b: &ContentBlock) -> Option<Value> {
+fn block_to_json(b: &ContentBlock, thinking_enabled: bool) -> Option<Value> {
     match b {
         ContentBlock::Text { text } if text.trim().is_empty() => None,
-        // Signierte Thinking-Blöcke MÜSSEN unverändert zurück: Bei aktiviertem Thinking +
-        // Tool-Use lehnt die API den Folge-Request mit 400 ab, wenn der letzte
+        // Signierte Thinking-Blöcke MÜSSEN unverändert zurück, solange der Request Thinking
+        // aktiviert: Bei Tool-Use lehnt die API den Folge-Request mit 400 ab, wenn der letzte
         // Assistant-Turn seinen Thinking-Block verliert. Frühere Turns entfernt die API
-        // selbst (nicht als Input berechnet) — immer mitsenden ist korrekt UND kostenfrei.
+        // selbst (nicht als Input berechnet) — mitsenden ist dann korrekt UND kostenfrei.
         // Wire-Feld heißt `thinking`, nicht `text` — daher explizit statt serde-Derive.
         ContentBlock::Thinking {
             text,
             signature: Some(sig),
-        } => Some(json!({
+        } if thinking_enabled => Some(json!({
             "type": "thinking",
             "thinking": text,
             "signature": sig,
         })),
-        // Ohne Signatur (Fremd-Provider-Reasoning, Alt-Sessions aus Phase 1) würde die
-        // API den Block ablehnen — weiter weglassen.
-        ContentBlock::Thinking {
-            signature: None, ..
-        } => None,
+        // Alle übrigen Thinking-Blöcke werden weggelassen: unsignierte (Fremd-Provider-
+        // Reasoning, Alt-Sessions aus Phase 1) lehnt die API immer ab, und bei deaktiviertem
+        // Thinking sind auch signierte verboten („Requests which include thinking blocks
+        // must have thinking enabled", 400) — sonst bräche jede Compaction (summarisiert
+        // mit Off), /think off und --resume ohne --think nach einem Thinking-Turn.
+        ContentBlock::Thinking { .. } => None,
         other => serde_json::to_value(other).ok(),
     }
 }
@@ -396,8 +410,9 @@ impl Provider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_to_json, merge_consecutive_roles};
-    use sepp_core::ContentBlock;
+    use super::{block_to_json, merge_consecutive_roles, AnthropicProvider};
+    use crate::CompletionRequest;
+    use sepp_core::{ContentBlock, Message, Model, Role, ThinkingLevel};
     use serde_json::json;
 
     #[test]
@@ -409,7 +424,7 @@ mod tests {
             signature: Some("sig123".into()),
         };
         assert_eq!(
-            block_to_json(&b),
+            block_to_json(&b, true),
             Some(json!({
                 "type": "thinking",
                 "thinking": "Denkprozess",
@@ -421,12 +436,96 @@ mod tests {
     #[test]
     fn unsigned_thinking_block_is_dropped() {
         // Ohne Signatur (Fremd-Provider-Reasoning, Alt-Sessions) lehnt die API den Block
-        // ab — er darf nicht in den Request.
+        // ab — er darf nicht in den Request, egal ob Thinking an ist.
         let b = ContentBlock::Thinking {
             text: "lokales Reasoning".into(),
             signature: None,
         };
-        assert_eq!(block_to_json(&b), None);
+        assert_eq!(block_to_json(&b, true), None);
+        assert_eq!(block_to_json(&b, false), None);
+    }
+
+    #[test]
+    fn signed_thinking_block_dropped_when_thinking_disabled() {
+        // Bei deaktiviertem Thinking lehnt die API Requests MIT thinking-Blöcken ab
+        // („must have thinking enabled") — auch signierte müssen dann raus.
+        let b = ContentBlock::Thinking {
+            text: "Denkprozess".into(),
+            signature: Some("sig123".into()),
+        };
+        assert_eq!(block_to_json(&b, false), None);
+    }
+
+    fn reasoning_model() -> Model {
+        Model {
+            id: "claude-test".into(),
+            provider: "anthropic".into(),
+            display_name: "Test".into(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+            supports_reasoning: true,
+            supports_images: false,
+        }
+    }
+
+    /// History mit einem signierten Thinking-Turn — der Zustand nach jedem Thinking+Tool-Use.
+    fn thinking_history() -> Vec<Message> {
+        vec![
+            Message::user_text("hallo"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "Denkprozess".into(),
+                        signature: Some("sig123".into()),
+                    },
+                    ContentBlock::Text {
+                        text: "Antwort".into(),
+                    },
+                ],
+                usage: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn body_keeps_signed_thinking_when_enabled() {
+        let p = AnthropicProvider::new("k");
+        let model = reasoning_model();
+        let msgs = thinking_history();
+        let body = p.build_body(&CompletionRequest {
+            model: &model,
+            system: None,
+            messages: &msgs,
+            tools: &[],
+            thinking: ThinkingLevel::Medium,
+            max_tokens: 8192,
+        });
+        assert!(body.get("thinking").is_some());
+        let assistant = &body["messages"][1]["content"];
+        assert_eq!(assistant[0]["type"], "thinking");
+        assert_eq!(assistant[0]["signature"], "sig123");
+    }
+
+    #[test]
+    fn body_drops_signed_thinking_when_disabled() {
+        // Der compact()-Pfad: summarisiert IMMER mit ThinkingLevel::Off über die volle
+        // History — ohne den Drop würde jede Compaction nach einem Thinking-Turn 400en.
+        let p = AnthropicProvider::new("k");
+        let model = reasoning_model();
+        let msgs = thinking_history();
+        let body = p.build_body(&CompletionRequest {
+            model: &model,
+            system: None,
+            messages: &msgs,
+            tools: &[],
+            thinking: ThinkingLevel::Off,
+            max_tokens: 8192,
+        });
+        assert!(body.get("thinking").is_none());
+        let rendered = body["messages"].to_string();
+        assert!(!rendered.contains("thinking"), "{rendered}");
+        assert!(rendered.contains("Antwort")); // Text-Block bleibt
     }
 
     #[test]
