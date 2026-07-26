@@ -1,7 +1,7 @@
 //! Statische Tabelle bekannter Modelle.
 //!
-//! HINWEIS: Die Model-IDs/Limits sind die zum Erstellungszeitpunkt aktuellen Werte (Anthropic
-//! bzw. z.ai/Zhipu-GLM). Vor produktivem Live-Einsatz gegen die jeweilige Anbieter-API
+//! HINWEIS: Die Model-IDs/Limits sind die zum Erstellungszeitpunkt aktuellen Werte (Anthropic,
+//! z.ai/Zhipu-GLM, Moonshot/Kimi). Vor produktivem Live-Einsatz gegen die jeweilige Anbieter-API
 //! verifizieren; Custom-Modelle kommen (Phase 5) aus `~/.sepp/models.toml`.
 
 use sepp_core::Model;
@@ -36,6 +36,28 @@ fn zai(id: &str, display_name: &str, context_window: u64, max_output_tokens: u64
     }
 }
 
+/// Moonshot-AI-Modell der Kimi-K-Generation. Bedient vom dedizierten Moonshot-Connector
+/// (`--provider moonshot`, der das OpenAI-kompatible Drahtformat teilt).
+///
+/// `supports_reasoning: true` heißt hier **nicht** „Reasoning ist abschaltbar" — Kimi K3 denkt
+/// immer; das Flag steuert nur, ob `reasoning_effort` (low|high|max) mitgesendet wird.
+///
+/// `supports_images: false` trotz nativ multimodalem K3: der OpenAI-Adapter serialisiert keine
+/// Bild-Blöcke (`message_to_openai`/`text_of` in `openai.rs` verwerfen sie ersatzlos). Das Flag
+/// beschreibt hier den Adapter, nicht das Modell — stünde `true`, verschwände ein Bild still aus
+/// dem Request und das Modell antwortete auf einen Prompt ohne Bild.
+fn moonshot(id: &str, display_name: &str, context_window: u64, max_output_tokens: u64) -> Model {
+    Model {
+        id: id.to_string(),
+        provider: "moonshot".to_string(),
+        display_name: display_name.to_string(),
+        context_window,
+        max_output_tokens,
+        supports_reasoning: true,
+        supports_images: false,
+    }
+}
+
 /// Eingebaute Modelle.
 pub fn builtin_models() -> Vec<Model> {
     vec![
@@ -50,6 +72,12 @@ pub fn builtin_models() -> Vec<Model> {
         zai("glm-4.6", "GLM-4.6", 200_000, 32_000),
         zai("glm-4.5-air", "GLM-4.5-Air", 128_000, 32_000),
         zai("glm-4.5-flash", "GLM-4.5-Flash", 128_000, 32_000),
+        // Moonshot AI / Kimi (OpenAI-kompatibler Endpunkt api.moonshot.ai/v1). kimi-k3 ist das
+        // Flaggschiff und der Default für --provider moonshot. Kontextfenster laut Anbieter-Doku
+        // 1_048_576; max_output ist bewusst NICHT Moonshots Default (131_072), sondern eine
+        // konservative Arbeitsgröße — das Feld greift nur als Fallback, wenn kein --max-tokens
+        // gesetzt ist, und Moonshots Rate-Limit rechnet gegen genau diesen Wert.
+        moonshot("kimi-k3", "Kimi K3", 1_048_576, 32_768),
     ]
 }
 
@@ -84,5 +112,17 @@ mod tests {
         assert_eq!(glm.provider, "zai");
         assert!(!glm.supports_images);
         assert!(builtin_models().iter().any(|m| m.id == "glm-4.5-flash"));
+    }
+
+    #[test]
+    fn registry_includes_moonshot_kimi_k3() {
+        // Der Eintrag ist das, was `sepp -m kimi-k3` OHNE --provider funktionieren lässt: die
+        // CLI leitet den Provider nur für registrierte IDs aus dem Modell ab.
+        let k3 = find_model("kimi-k3").expect("kimi-k3 ist registriert");
+        assert_eq!(k3.provider, "moonshot");
+        assert_eq!(k3.context_window, 1_048_576);
+        assert!(k3.supports_reasoning);
+        // Der OpenAI-Adapter serialisiert keine Bild-Blöcke — das Flag beschreibt den Adapter.
+        assert!(!k3.supports_images);
     }
 }
