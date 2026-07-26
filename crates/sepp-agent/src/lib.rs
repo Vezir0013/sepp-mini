@@ -52,11 +52,19 @@ struct PendingCall {
     input_json: String,
 }
 
+/// Absolute Obergrenze der Auto-Compaction-Schwelle, unabhängig vom Kontextfenster. 3/4 eines
+/// 1M-Fensters (Kimi K3: 786_432) wäre keine sinnvolle Arbeitsmenge: jeder Turn sendet den
+/// gesamten Kontext erneut, Kosten und Latenz wachsen linear mit. 256_000 ist das größte
+/// Kontextfenster, das vor der 1M-Generation überhaupt erreichbar war — für alle kleineren
+/// Modelle bleibt der Deckel wirkungslos, er greift erst ab Fenstern > 341_333.
+const MAX_COMPACT_THRESHOLD: u64 = 256_000;
+
 /// Default-Schwelle der Auto-Compaction für ein Modell: 3/4 des Kontextfensters (geschätzte
-/// Tokens) — lieber früher komprimieren als überlaufen. DIE eine Formel für den Start
-/// (`sepp-cli`) und Modellwechsel ([`AgentSession::set_model`]); zwei Kopien würden driften.
+/// Tokens), gedeckelt auf [`MAX_COMPACT_THRESHOLD`] — lieber früher komprimieren als überlaufen
+/// oder ein 1M-Fenster vollzuschreiben. DIE eine Formel für den Start (`sepp-cli`) und
+/// Modellwechsel ([`AgentSession::set_model`]); zwei Kopien würden driften.
 pub fn default_compact_threshold(model: &Model) -> u64 {
-    model.context_window.saturating_mul(3) / 4
+    (model.context_window.saturating_mul(3) / 4).min(MAX_COMPACT_THRESHOLD)
 }
 
 /// Eine laufende Agent-Session.

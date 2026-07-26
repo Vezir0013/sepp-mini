@@ -472,15 +472,19 @@ async fn compact_after_branch_keeps_summary_on_active_path() {
 }
 
 #[test]
-fn default_compact_threshold_is_three_quarters() {
+fn default_compact_threshold_is_three_quarters_up_to_the_cap() {
     let mut m = test_model();
     m.context_window = 200_000;
     assert_eq!(sepp_agent::default_compact_threshold(&m), 150_000);
     m.context_window = 128_000;
     assert_eq!(sepp_agent::default_compact_threshold(&m), 96_000);
-    // Saturation statt Overflow bei absurd großen Fenstern.
+    // 3/4 gilt bis 341_333; darüber deckelt MAX_COMPACT_THRESHOLD. Ein 1M-Fenster (Kimi K3)
+    // würde sonst erst bei 786_432 Tokens komprimieren — jeder Turn sendet den vollen Kontext.
+    m.context_window = 1_048_576;
+    assert_eq!(sepp_agent::default_compact_threshold(&m), 256_000);
+    // Saturation statt Overflow bei absurd großen Fenstern (der Deckel greift ohnehin zuerst).
     m.context_window = u64::MAX;
-    assert_eq!(sepp_agent::default_compact_threshold(&m), u64::MAX / 4);
+    assert_eq!(sepp_agent::default_compact_threshold(&m), 256_000);
 }
 
 #[tokio::test]
