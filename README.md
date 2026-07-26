@@ -220,7 +220,9 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 > **Reasoning bei Moonshot:** Kimi denkt immer — die API kennt kein Abschalten, nur die Stufen
 > `low|high|max`. `--no-think` senkt dort also nur den Aufwand, statt Reasoning auszuschalten
 > (sepp weist beim Start darauf hin). Weil das Denken gegen dasselbe Output-Budget zählt, ist der
-> `--max-tokens`-Default für Kimi-Modelle 32768 statt 8192.
+> `--max-tokens`-Default für Moonshot-Modelle 32768 statt 8192. Kimi K3 bringt 1M Kontext mit;
+> die Auto-Compaction verdichtet dennoch spätestens bei 256.000 Token, weil jeder Turn den
+> gesamten Kontext erneut überträgt.
 
 > Im RPC- und One-shot-Modus ist **stdout der reine Datenkanal**; alle Logs gehen nach stderr.
 

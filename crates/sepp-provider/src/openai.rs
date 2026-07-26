@@ -454,10 +454,16 @@ pub(crate) fn build_chat_body(req: &CompletionRequest, dialect: OpenAiDialect) -
         body["reasoning_effort"] = json!("none");
     }
     // Moonshot: `reasoning_effort` ist ein Kostenregler, kein An/Aus-Schalter (der API-Default
-    // ist `max`), deshalb IMMER senden — Begründung siehe [`moonshot_reasoning_effort`]. Gegated
-    // auf reasoning-fähige Modelle: die Legacy-`moonshot-v1-*` sind klassische Chat-Modelle und
-    // würden das Feld voraussichtlich mit 400 ablehnen. Das Gate hängt bewusst am Modell-Flag
-    // und nicht am Dialekt — eine Korrektur ist so eine Registry-Zeile statt einer Code-Änderung.
+    // ist `max`), deshalb IMMER senden — Begründung siehe [`moonshot_reasoning_effort`].
+    //
+    // Gegated auf reasoning-fähige Modelle: alle heute an api.moonshot.ai angebotenen Modelle
+    // (kimi-k3, kimi-k2.7-code[-highspeed], kimi-k2.6) denken, das Gate ist derzeit also immer
+    // offen. Es ist die Vorsorge für ein künftiges reines Chat-Modell, das ein unbekanntes
+    // `reasoning_effort` mit 400 ablehnen würde. Das Gate hängt bewusst am Modell-Flag und nicht
+    // am Dialekt — eine Korrektur wäre so eine Registry-Zeile statt einer Code-Änderung.
+    // ACHTUNG: `sepp-cli::custom_model` setzt `supports_reasoning: true` für unregistrierte IDs;
+    // ein solches Chat-Modell bräuchte also zusätzlich einen Registry-Eintrag, um hier
+    // durchzufallen.
     if dialect == OpenAiDialect::Moonshot && req.model.supports_reasoning {
         body["reasoning_effort"] = json!(moonshot_reasoning_effort(req.thinking));
     }

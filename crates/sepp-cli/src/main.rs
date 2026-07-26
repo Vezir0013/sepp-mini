@@ -297,7 +297,8 @@ fn print_help() {
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
          \x20 -h, --help                Diese Hilfe\n\
          \x20 -V, --version             Version\n\n\
-         TUI-Befehle: /new /resume /tree /compact /model [id] /trust /reload /hide /show /quit\n\
+         TUI-Befehle: /new /resume /tree /compact /model [id] /think [on|off] /trust /reload\n\
+         \x20            /hide /show /quit\n\
          \x20            (plus /<name> für Prompt-Templates aus ~/.sepp/prompts)\n\n\
          Umgebung:\n\
          \x20 ANTHROPIC_API_KEY         Pflicht für Anthropic-Live-Aufrufe\n\
@@ -585,7 +586,10 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     let provider_kind = opts
         .provider
         .clone()
-        .or_else(|| std::env::var("SEPP_PROVIDER").ok())
+        // `env_nonempty` statt `var().ok()`: ein leeres SEPP_PROVIDER (aus Shell-Profil oder CI)
+        // ergäbe sonst `Some("")`, übersprünge die Modell-Ableitung und endete in
+        // „unbekannter Provider: " — dieselbe Klasse Fehler wie früher bei OPENAI_BASE_URL="".
+        .or_else(|| env_nonempty("SEPP_PROVIDER"))
         .or_else(|| {
             opts.model
                 .as_deref()
@@ -630,8 +634,8 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // `low`. Ohne diesen Hinweis würde das Flag etwas versprechen, was der Anbieter nicht kann.
     if thinking == ThinkingLevel::Off && is_moonshot {
         startup_notice(
-            "Hinweis: Moonshot kann Reasoning nicht abschalten — --no-think sendet die \
-             billigste Stufe (reasoning_effort \"low\"), Kimi denkt weiterhin."
+            "Hinweis: Moonshot kann Reasoning nicht abschalten — --no-think/SEPP_THINK=off \
+             sendet die billigste Stufe (reasoning_effort \"low\"), Kimi denkt weiterhin."
                 .to_string(),
         );
     }
@@ -1131,22 +1135,31 @@ fn default_max_tokens(model: &Model) -> u64 {
     want.min(model.max_output_tokens)
 }
 
-/// Fallback-`Model` für unregistrierte IDs — provider-bewusst (Kontextfenster, Provider-Tag).
-/// Auch vom TUI-`/model`-Befehl genutzt; das Custom-Modell erbt dort den Session-Provider.
+/// Fallback-`Model` für unregistrierte IDs — provider-bewusst (Kontextfenster, Output-Budget,
+/// Provider-Tag). Auch vom TUI-`/model`-Befehl genutzt; das Custom-Modell erbt dort den
+/// Session-Provider.
 pub(crate) fn custom_model(id: String, provider: &str) -> Model {
-    // Konservatives Kontextfenster je Provider (steuert die Auto-Compaction-Schwelle):
-    // Anthropic 200k, OpenAI/lokal 128k (typisch) — lieber früher komprimieren als überlaufen.
-    let context_window = if provider == "anthropic" {
-        200_000
-    } else {
-        128_000
+    // Konservative Werte je Provider — beide steuern echtes Verhalten: `context_window` die
+    // Auto-Compaction-Schwelle, `max_output_tokens` den Deckel in [`default_max_tokens`].
+    // Anthropic 200k · Moonshot 256k (die Kimi-K2-Familie; K3 mit 1M ist registriert und läuft
+    // nie hier durch) · OpenAI/lokal 128k (typisch) — lieber früher komprimieren als überlaufen.
+    //
+    // Moonshot braucht ein größeres `max_output_tokens` als die 8192 der übrigen Provider: das
+    // dortige Reasoning ist nicht abschaltbar und zählt gegen dasselbe Budget. Stünde hier 8192,
+    // deckelte [`default_max_tokens`] seine 32768 wieder auf 8192 herunter — und jedes nicht
+    // registrierte Kimi-Modell (kimi-k2.7-code, kimi-k2.6, …) liefe still in `finish_reason:
+    // "length"`, also genau in den Fehler, den der größere Default verhindern soll.
+    let (context_window, max_output_tokens) = match provider {
+        "anthropic" => (200_000, 8_192),
+        "moonshot" => (256_000, 32_768),
+        _ => (128_000, 8_192),
     };
     Model {
         id,
         provider: provider.to_string(),
         display_name: "(custom)".into(),
         context_window,
-        max_output_tokens: 8192,
+        max_output_tokens,
         supports_reasoning: true,
         supports_images: true,
     }
@@ -1226,10 +1239,32 @@ mod tests {
         let glm = models::find_model("glm-5.2").expect("glm-5.2 ist registriert");
         assert_eq!(default_max_tokens(&glm), 8_192);
 
-        // Nie über max_output_tokens des Modells hinaus: ein unregistriertes Moonshot-Modell
-        // erbt aus custom_model 8192 — der Deckel greift, statt ein zu großes Budget zu senden.
-        let custom = custom_model("moonshot-v1-8k".into(), "moonshot");
-        assert_eq!(default_max_tokens(&custom), 8_192);
+        // Unregistrierte Moonshot-IDs (kimi-k2.7-code, kimi-k2.6, …) müssen dasselbe Budget
+        // bekommen — sonst wäre das Feature nur für das eine registrierte Modell wirksam.
+        let custom = custom_model("kimi-k2.7-code".into(), "moonshot");
+        assert_eq!(default_max_tokens(&custom), 32_768);
+
+        // Der `.min`-Deckel greift trotzdem, wenn ein Modell weniger zulässt.
+        let mut small = custom_model("kimi-winzig".into(), "moonshot");
+        small.max_output_tokens = 4_096;
+        assert_eq!(default_max_tokens(&small), 4_096);
+    }
+
+    #[test]
+    fn custom_model_is_provider_aware() {
+        // Das Kontextfenster steuert die Auto-Compaction-Schwelle, max_output_tokens den
+        // Deckel in default_max_tokens — beide müssen zum Provider passen.
+        let anthropic = custom_model("claude-neu".into(), "anthropic");
+        assert_eq!(anthropic.context_window, 200_000);
+        assert_eq!(anthropic.max_output_tokens, 8_192);
+
+        let moonshot = custom_model("kimi-k2.6".into(), "moonshot");
+        assert_eq!(moonshot.context_window, 256_000);
+        assert_eq!(moonshot.max_output_tokens, 32_768);
+
+        let local = custom_model("llama3".into(), "local");
+        assert_eq!(local.context_window, 128_000);
+        assert_eq!(local.max_output_tokens, 8_192);
     }
 
     fn args(v: &[&str]) -> Vec<String> {

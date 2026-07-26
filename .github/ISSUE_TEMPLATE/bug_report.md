@@ -17,7 +17,7 @@ Schritte / Kommando (z. B. `sepp -p "..."`, Provider, Flags):
 **Umgebung**
 - sepp-Version / Commit:
 - OS + Kernel:
-- Provider (anthropic/openai/local):
+- Provider (anthropic/openai/local/zai/moonshot/mlx):
 
 **Logs**
 Relevante stderr-Ausgabe (mit `RUST_LOG=debug`, **ohne Secrets**):
