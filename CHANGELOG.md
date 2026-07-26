@@ -7,6 +7,24 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+
+## [0.1.17] - 2026-07-26
+
+Moonshot AI (Kimi) kommt als sechster Provider dazu — und bringt zwei Annahmen ins Wanken, die
+bisher für jeden OpenAI-kompatiblen Endpunkt galten. Erstens heißt das Output-Budget dort
+`max_completion_tokens`, weil Moonshot `max_tokens` als deprecated führt und sein Rate-Limit gegen
+das neue Feld rechnet. Zweitens ist Reasoning bei Kimi **nicht abschaltbar**: die API kennt nur
+`low`/`high`/`max` und keinen Aus-Zustand, weshalb `--no-think` hier die Stufe senkt statt das
+Denken zu beenden — sichtbar gemacht durch Hinweise beim Start und im TUI. Weil das Denken gegen
+dasselbe Budget zählt und Kimi K3 ein 1M-Kontextfenster mitbringt, ziehen zwei Defaults mit: ein
+größeres Output-Budget für Moonshot-Modelle und eine absolute Obergrenze für die
+Auto-Compaction-Schwelle.
+
 ### Hinzugefügt
 - **Moonshot AI / Kimi als Provider** (`--provider moonshot` bzw. `SEPP_PROVIDER=moonshot`).
   Dedizierter Connector (`crates/sepp-provider/src/moonshot.rs`, Feature `moonshot = ["openai"]`)
@@ -31,6 +49,12 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   abschaltbare Denken zählt gegen dasselbe Output-Budget; 8192 hätte die Antwort abgeschnitten
   (`finish_reason: "length"`). Nie über `max_output_tokens` des Modells hinaus; ein explizites
   `--max-tokens` bleibt unangetastet. Für alle anderen Provider ändert sich nichts.
+- **`custom_model` ist jetzt auch beim Output-Budget provider-bewusst**, nicht nur beim
+  Kontextfenster: unregistrierte Moonshot-IDs (`kimi-k2.7-code`, `kimi-k2.6`, …) erben 256k
+  Kontext und dasselbe 32768er-Budget wie `kimi-k3`. Ohne das hätte der pauschale 8192er-Wert den
+  neuen Default sofort wieder heruntergedeckelt — das größere Budget hätte nur für das eine
+  registrierte Modell gegolten, und alle anderen Kimi-Modelle wären still in abgeschnittene
+  Antworten gelaufen.
 - **Auto-Compaction-Schwelle hat jetzt eine absolute Obergrenze** (`MAX_COMPACT_THRESHOLD` =
   256_000 in `sepp-agent`). 3/4 eines 1M-Fensters wären 786.432 Token, bevor überhaupt
   komprimiert wird — jeder Turn sendet den vollen Kontext erneut. Für alle bisherigen Modelle
@@ -47,12 +71,20 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   `max_completion_tokens` statt `max_tokens` gesendet wird.
 - **Moonshot Live-Smoke-Test** (`crates/sepp-provider/tests/moonshot_live.rs`). Per Default
   `#[ignore]`; läuft nur über `just test-live` mit gesetztem `MOONSHOT_API_KEY`.
+- **`custom_model` ist jetzt getestet** (`custom_model_is_provider_aware`): Kontextfenster und
+  Output-Budget je Provider. Der Moonshot-Fall im `default_max_tokens`-Test prüft nun eine
+  unregistrierte ID gegen 32768 statt gegen 8192 — der alte Wert war in beiden Zweigen derselbe
+  und hätte einen nie greifenden Moonshot-Zweig nicht bemerkt.
 
-### Geplant
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
+### Behoben
+- **Leeres `SEPP_PROVIDER` bricht den Start nicht mehr.** `SEPP_PROVIDER=` (aus Shell-Profil oder
+  CI) ergab `Some("")` und landete im „unbekannter Provider: "-Fehler, statt auf die Ableitung
+  aus `-m` bzw. den Anthropic-Default zurückzufallen. Die Variable wird jetzt wie alle anderen
+  Env-Werte getrimmt (leer/Whitespace = nicht gesetzt) — dieselbe Korrektur, die `OPENAI_BASE_URL`
+  in 0.1.12 bekommen hat.
+- **`sepp --help` listet `/think`** in der TUI-Befehlszeile. Der Befehl existiert seit 0.1.16, war
+  in der Hilfe aber nicht aufgeführt — bei Moonshot ist er die einzige Laufzeit-Stellschraube für
+  die Reasoning-Kosten.
 
 ## [0.1.16] - 2026-07-13
 
@@ -478,7 +510,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.13...v0.1.14
