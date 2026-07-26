@@ -43,8 +43,10 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
   Prompt-Templates→Slash-Commands), **Hooks** (in-process Rhai), **WASM-Plugins** (memory-sandboxed,
   capability-gated, via `wasmi`), **MCP-Server** (out-of-process, OS-sandboxed).
 - 🔌 **Multi-Provider hinter einem Trait:** Anthropic (Messages API) und OpenAI-kompatibel —
-  inklusive lokaler Endpunkte (Ollama/vLLM) über `OPENAI_BASE_URL`, plus **`--provider mlx`** für
-  lokale Apple-Silicon-Inferenz via **LM Studio** (verbindet automatisch zu `localhost:1234`).
+  dedizierte Connector für **z.ai/Zhipu-GLM** und **Moonshot AI/Kimi** (`--provider moonshot`,
+  Kimi K3 mit 1M-Kontext), lokale Endpunkte (Ollama/vLLM) über `OPENAI_BASE_URL`, plus
+  **`--provider mlx`** für lokale Apple-Silicon-Inferenz via **LM Studio** (verbindet automatisch
+  zu `localhost:1234`).
 - 🖥️ **Drei Modi, ein Kern:** interaktive **TUI**, **One-shot** (`-p`) und **JSONL-RPC** (`--rpc`).
 - 🌳 **Robuste Sessions:** baumstrukturiert mit Branching und Compaction, persistent als JSONL
   (Default) oder optional **SQLite** (`--features sqlite`).
@@ -204,11 +206,21 @@ export OPENAI_API_KEY=...
 sepp --provider openai -m gpt-4o-mini -p "..."
 # --provider local braucht OPENAI_BASE_URL (kein stiller Cloud-Fallback):
 OPENAI_BASE_URL=http://localhost:11434/v1 sepp --provider local -m llama3 -p "..."
+
+# Moonshot AI / Kimi:
+export MOONSHOT_API_KEY=...
+sepp -m kimi-k3 -p "..."               # Provider wird aus dem Modell abgeleitet
+sepp --provider moonshot -p "..."      # Default-Modell kimi-k3
 ```
 
 Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--model`,
-`--max-tokens`, `--provider anthropic|openai|local|zai|mlx`, `--rpc`, `--sqlite`.
+`--max-tokens`, `--provider anthropic|openai|local|zai|moonshot|mlx`, `--rpc`, `--sqlite`.
 `sepp --help` zeigt alles.
+
+> **Reasoning bei Moonshot:** Kimi denkt immer — die API kennt kein Abschalten, nur die Stufen
+> `low|high|max`. `--no-think` senkt dort also nur den Aufwand, statt Reasoning auszuschalten
+> (sepp weist beim Start darauf hin). Weil das Denken gegen dasselbe Output-Budget zählt, ist der
+> `--max-tokens`-Default für Kimi-Modelle 32768 statt 8192.
 
 > Im RPC- und One-shot-Modus ist **stdout der reine Datenkanal**; alle Logs gehen nach stderr.
 
@@ -221,6 +233,8 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 | `OPENAI_BASE_URL` | OpenAI-kompatible base_url (Ollama/vLLM/local/mlx); Pflicht für `--provider local` |
 | `ZAI_API_KEY` | z.ai/Zhipu-GLM (Pflicht für `--provider zai`) |
 | `ZAI_BASE_URL` | z.ai base_url überschreiben (Default api.z.ai) |
+| `MOONSHOT_API_KEY` | Moonshot AI/Kimi (Pflicht für `--provider moonshot`) |
+| `MOONSHOT_BASE_URL` | Moonshot base_url überschreiben (Default `https://api.moonshot.ai/v1`) |
 | `SEPP_PROVIDER` | Default-Provider, wenn `--provider` fehlt |
 | `SEPP_THINK` | Default-Reasoning (on/off), wenn `--think`/`--no-think` fehlt |
 | `RUST_LOG` | Log-Level (One-shot/RPC; Logs nach stderr) |

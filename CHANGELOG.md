@@ -7,6 +7,47 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+- **Moonshot AI / Kimi als Provider** (`--provider moonshot` bzw. `SEPP_PROVIDER=moonshot`).
+  Dedizierter Connector (`crates/sepp-provider/src/moonshot.rs`, Feature `moonshot = ["openai"]`)
+  gegen den OpenAI-kompatiblen Endpunkt `https://api.moonshot.ai/v1` — kein neuer Parser, der
+  SSE-Decoder wird geteilt. `name()` liefert `"moonshot"`, alle Fehler-/Stream-Texte tragen
+  `moonshot:` statt `openai:`. Key aus `MOONSHOT_API_KEY` (Pflicht), Endpunkt über
+  `MOONSHOT_BASE_URL` überschreibbar (z. B. China-Region `https://api.moonshot.cn/v1`). Fehlt der
+  Key, scheitert der Start früh mit einem hilfreichen Hinweis statt mit einem rohen 401.
+- **Modell `kimi-k3`** in der Registry (1.048.576 Token Kontext). Damit leitet `sepp -m kimi-k3`
+  den Provider automatisch ab, ohne `--provider`. Default-Modell für `--provider moonshot`.
+- **Zwei Moonshot-Besonderheiten im Request-Body** (`OpenAiDialect::Moonshot`): das Output-Budget
+  geht als `max_completion_tokens` raus (`max_tokens` ist bei Moonshot deprecated, und das
+  Rate-Limit-Accounting hängt am neuen Feld), und `reasoning_effort` wird als Kostenregler
+  gesendet — `low`/`high`/`max` statt eines An/Aus-Schalters.
+
+### Geändert
+- **`--no-think` bedeutet bei Moonshot „billig denken", nicht „aus".** Kimi kann Reasoning nicht
+  abschalten (die API kennt kein `"none"`), deshalb sendet `Off` die Stufe `low` statt das Feld
+  wegzulassen — ein weggelassenes Feld hieße Moonshots Default `max`, also das Gegenteil. Start
+  und TUI-`/think` weisen darauf hin. Reasoning ist bei Moonshot per Default an (wie bei z.ai).
+- **`--max-tokens`-Default ist bei Moonshot-Reasoning-Modellen 32768 statt 8192.** Das nicht
+  abschaltbare Denken zählt gegen dasselbe Output-Budget; 8192 hätte die Antwort abgeschnitten
+  (`finish_reason: "length"`). Nie über `max_output_tokens` des Modells hinaus; ein explizites
+  `--max-tokens` bleibt unangetastet. Für alle anderen Provider ändert sich nichts.
+- **Auto-Compaction-Schwelle hat jetzt eine absolute Obergrenze** (`MAX_COMPACT_THRESHOLD` =
+  256_000 in `sepp-agent`). 3/4 eines 1M-Fensters wären 786.432 Token, bevor überhaupt
+  komprimiert wird — jeder Turn sendet den vollen Kontext erneut. Für alle bisherigen Modelle
+  (größtes Fenster 200k) ist die Änderung ein No-op.
+
+### Tests
+- **Moonshot-SSE-Fixture** (`crates/sepp-provider/tests/fixtures/moonshot_basic.sse`) plus
+  Decoder-Test inklusive Ordering-Invariante. Ein zweiter Test deckt einen Kimi-Stream **ohne**
+  `reasoning_content` ab: `kimi-k3` streamt das Feld (live bestätigt), das ChoiceDelta-Schema der
+  API-Referenz listet es aber nicht — bei anderen Modellen kann es also fehlen.
+- **`moonshot_no_retry.rs`**: belegt gegen einen Mini-HTTP-Server, dass pro Turn genau ein
+  Request rausgeht (der Connector erbt den 4xx-`reasoning_effort`-Retry des OpenAI-Adapters
+  bewusst nicht — auf einer Bezahl-API träfe der auch 401 und 429) und dass
+  `max_completion_tokens` statt `max_tokens` gesendet wird.
+- **Moonshot Live-Smoke-Test** (`crates/sepp-provider/tests/moonshot_live.rs`). Per Default
+  `#[ignore]`; läuft nur über `just test-live` mit gesetztem `MOONSHOT_API_KEY`.
+
 ### Geplant
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
