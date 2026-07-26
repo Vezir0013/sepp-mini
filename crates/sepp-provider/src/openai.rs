@@ -28,7 +28,8 @@ pub const MLX_BASE_URL: &str = "http://localhost:1234/v1";
 /// z. B. das z.ai-`thinking`-Objekt, das echtes OpenAI als unbekanntes Feld mit HTTP 400 ablehnen
 /// würde. Default ist [`OpenAiDialect::OpenAi`]; `--provider local` setzt
 /// [`OpenAiDialect::Local`], der dedizierte z.ai-Connector ([`crate::zai::ZaiProvider`])
-/// [`OpenAiDialect::Zai`].
+/// [`OpenAiDialect::Zai`], der Moonshot-Connector ([`crate::moonshot::MoonshotProvider`])
+/// [`OpenAiDialect::Moonshot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenAiDialect {
     /// Striktes OpenAI/Chat-Completions (OpenAI, LM Studio via mlx, …) — keine Zusatzfelder.
@@ -46,6 +47,40 @@ pub enum OpenAiDialect {
     Local,
     /// z.ai / Zhipu-GLM — akzeptiert zusätzlich `thinking:{type:…}`.
     Zai,
+    /// Moonshot AI / Kimi. Zwei Abweichungen vom OpenAI-Basisdialekt: das Output-Budget heißt
+    /// `max_completion_tokens` (`max_tokens` ist dort als deprecated markiert, und Moonshots
+    /// Rate-Limit-Accounting hängt am neuen Feld — siehe [`max_tokens_field`]), und
+    /// `reasoning_effort` ist ein **Kostenregler statt eines Schalters**: gültig sind nur
+    /// `low`/`high`/`max` mit API-Default `max`, ein `"none"` wie im Local-Dialekt existiert
+    /// nicht. Kimi K3 denkt immer — `ThinkingLevel::Off` bedeutet hier also „so wenig wie die
+    /// API zulässt" (siehe [`moonshot_reasoning_effort`]).
+    Moonshot,
+}
+
+/// Feldname für das Output-Token-Budget. OpenAI, z.ai und lokale Endpunkte nehmen das klassische
+/// `max_tokens`; Moonshot hat es als deprecated markiert und hängt sein Rate-Limit-Accounting an
+/// `max_completion_tokens` — dort muss das neue Feld stehen, sonst greift Moonshots eigener
+/// Default (131072) und reserviert je Request ein Vielfaches des tatsächlich nötigen Budgets
+/// gegen das Limit. Bewusst erschöpfend gematcht: ein künftiger Dialekt muss sich hier aktiv
+/// entscheiden, statt still `max_tokens` zu erben.
+fn max_tokens_field(dialect: OpenAiDialect) -> &'static str {
+    match dialect {
+        OpenAiDialect::Moonshot => "max_completion_tokens",
+        OpenAiDialect::OpenAi | OpenAiDialect::Local | OpenAiDialect::Zai => "max_tokens",
+    }
+}
+
+/// Mappt die sepp-Reasoning-Stufe auf Moonshots `reasoning_effort`. Moonshot kennt nur
+/// `low|high|max` und **kein Abschalten** — Kimi K3 denkt immer. `Off` heißt deshalb „so wenig
+/// wie die API zulässt", nicht „aus". Das Feld wird immer mitgesendet: ohne es gilt Moonshots
+/// Default `max`, also die teuerste Stufe — ein weggelassenes Feld wäre das Gegenteil dessen,
+/// was `--no-think` ausdrückt.
+fn moonshot_reasoning_effort(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium | ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "max",
+    }
 }
 
 /// Übersetzt OpenAI-SSE-Deltas (zustandsbehaftet) in [`StreamEvent`].
@@ -379,9 +414,10 @@ pub(crate) fn build_chat_body(req: &CompletionRequest, dialect: OpenAiDialect) -
         "model": req.model.id,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "max_tokens": max,
         "messages": messages,
     });
+    // Feldname ist dialektabhängig (Moonshot: `max_completion_tokens`) — siehe [`max_tokens_field`].
+    body[max_tokens_field(dialect)] = json!(max);
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -416,6 +452,14 @@ pub(crate) fn build_chat_body(req: &CompletionRequest, dialect: OpenAiDialect) -
     // siehe [`OpenAiDialect::Local`].
     if dialect == OpenAiDialect::Local && req.thinking == ThinkingLevel::Off {
         body["reasoning_effort"] = json!("none");
+    }
+    // Moonshot: `reasoning_effort` ist ein Kostenregler, kein An/Aus-Schalter (der API-Default
+    // ist `max`), deshalb IMMER senden — Begründung siehe [`moonshot_reasoning_effort`]. Gegated
+    // auf reasoning-fähige Modelle: die Legacy-`moonshot-v1-*` sind klassische Chat-Modelle und
+    // würden das Feld voraussichtlich mit 400 ablehnen. Das Gate hängt bewusst am Modell-Flag
+    // und nicht am Dialekt — eine Korrektur ist so eine Registry-Zeile statt einer Code-Änderung.
+    if dialect == OpenAiDialect::Moonshot && req.model.supports_reasoning {
+        body["reasoning_effort"] = json!(moonshot_reasoning_effort(req.thinking));
     }
     body
 }
@@ -898,6 +942,90 @@ mod tests {
         let m = test_model(true);
         let body = p.build_body(&test_req(&m, ThinkingLevel::Medium));
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn moonshot_uses_max_completion_tokens_only() {
+        // Moonshot rechnet sein Rate-Limit gegen `max_completion_tokens`; `max_tokens` ist dort
+        // deprecated. Beide gleichzeitig zu senden wäre undokumentiertes Terrain — also genau eins.
+        let m = test_model(true);
+        let body = build_chat_body(
+            &test_req(&m, ThinkingLevel::Medium),
+            OpenAiDialect::Moonshot,
+        );
+        assert_eq!(body["max_completion_tokens"], json!(8192));
+        assert!(
+            body.get("max_tokens").is_none(),
+            "deprecated Feld darf nicht mitgehen: {body}"
+        );
+    }
+
+    #[test]
+    fn other_dialects_keep_max_tokens() {
+        // Der Umbau auf einen dialektabhängigen Feldnamen darf OpenAI/local/z.ai nicht anfassen.
+        let m = test_model(true);
+        for dialect in [
+            OpenAiDialect::OpenAi,
+            OpenAiDialect::Local,
+            OpenAiDialect::Zai,
+        ] {
+            let body = build_chat_body(&test_req(&m, ThinkingLevel::Medium), dialect);
+            assert_eq!(body["max_tokens"], json!(8192), "{dialect:?}");
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{dialect:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn moonshot_reasoning_effort_maps_every_level() {
+        // Moonshot kennt nur low|high|max — `Off` wird zur billigsten Stufe, NICHT weggelassen
+        // (ein fehlendes Feld hieße Moonshot-Default `max`, also das teuerste).
+        let m = test_model(true);
+        for (level, expected) in [
+            (ThinkingLevel::Off, "low"),
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "high"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "max"),
+        ] {
+            let body = build_chat_body(&test_req(&m, level), OpenAiDialect::Moonshot);
+            assert_eq!(body["reasoning_effort"], json!(expected), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn moonshot_reasoning_effort_absent_when_model_unsupported() {
+        // Die Legacy-`moonshot-v1-*` sind klassische Chat-Modelle ohne Reasoning.
+        let m = test_model(false);
+        let body = build_chat_body(&test_req(&m, ThinkingLevel::High), OpenAiDialect::Moonshot);
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn moonshot_omits_fixed_parameters() {
+        // Moonshot fixiert temperature/top_p/n/presence_penalty/frequency_penalty serverseitig
+        // und will sie nicht im Request sehen. `build_chat_body` sendet sie heute für keinen
+        // Dialekt — dieser Test macht die Invariante explizit statt zufällig.
+        let m = test_model(true);
+        let body = build_chat_body(
+            &test_req(&m, ThinkingLevel::Medium),
+            OpenAiDialect::Moonshot,
+        );
+        for k in [
+            "temperature",
+            "top_p",
+            "n",
+            "presence_penalty",
+            "frequency_penalty",
+        ] {
+            assert!(
+                body.get(k).is_none(),
+                "Moonshot fixiert '{k}' serverseitig — darf nicht gesendet werden: {body}"
+            );
+        }
     }
 
     #[test]
