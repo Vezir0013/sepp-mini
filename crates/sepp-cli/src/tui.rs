@@ -625,7 +625,17 @@ impl App {
                 self.metrics = metric_snapshot(&g);
                 drop(g);
                 if level == ThinkingLevel::Off {
-                    self.notify("Thinking: aus");
+                    if self.provider_kind == "moonshot" {
+                        // Spiegelbild des Startup-Hinweises (main.rs): Moonshots API kennt kein
+                        // "none", nur low|high|max — Kimi denkt weiter, nur billiger. Ohne den
+                        // Hinweis verspräche „aus" etwas, was der Anbieter nicht kann.
+                        self.notify(
+                            "Thinking: aus — Hinweis: Moonshot kann Reasoning nicht abschalten, \
+                             gesendet wird nur die billigste Stufe",
+                        );
+                    } else {
+                        self.notify("Thinking: aus");
+                    }
                 } else if matches!(self.provider_kind.as_str(), "openai" | "mlx") {
                     // Bedingung wie der Startup-Hinweis (main.rs): openai/mlx haben kein
                     // request-seitiges Reasoning-Feld. local bleibt hinweisfrei — es meldet
@@ -1718,10 +1728,31 @@ mod tests {
             app.handle_command("think off").await;
             assert_eq!(app.message.as_ref().unwrap().text, "Thinking: aus");
         }
-        for kind in ["local", "anthropic", "zai"] {
+        for kind in ["local", "anthropic", "zai", "moonshot"] {
             let mut app = test_app_with_provider(kind);
             app.handle_command("think on").await;
             assert_eq!(app.message.as_ref().unwrap().text, "Thinking: an", "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn think_off_warns_that_moonshot_cannot_disable_reasoning() {
+        // Umgekehrter Fall zum „keine Wirkung"-Hinweis: bei Moonshot ist „aus" nicht aus,
+        // sondern die billigste Reasoning-Stufe. Das muss sichtbar sein.
+        let mut app = test_app_with_provider("moonshot");
+        app.handle_command("think off").await;
+        let text = &app.message.as_ref().unwrap().text;
+        assert!(text.contains("nicht abschalten"), "{text}");
+
+        // Alle anderen behalten die knappe Meldung.
+        for kind in ["anthropic", "zai", "local"] {
+            let mut app = test_app_with_provider(kind);
+            app.handle_command("think off").await;
+            assert_eq!(
+                app.message.as_ref().unwrap().text,
+                "Thinking: aus",
+                "{kind}"
+            );
         }
     }
 

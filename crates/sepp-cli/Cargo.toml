@@ -18,7 +18,12 @@ sqlite = ["sepp-session/sqlite"]
 
 [dependencies]
 sepp-core = { path = "../sepp-core" }
-sepp-provider = { path = "../sepp-provider", features = ["anthropic", "openai", "zai"] }
+sepp-provider = { path = "../sepp-provider", features = [
+    "anthropic",
+    "openai",
+    "zai",
+    "moonshot",
+] }
 sepp-tools = { path = "../sepp-tools" }
 sepp-agent = { path = "../sepp-agent" }
 sepp-session = { path = "../sepp-session" }

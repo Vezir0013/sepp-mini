@@ -24,7 +24,8 @@ use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_provider::openai::{MLX_BASE_URL, MLX_HOST_PORT};
 use sepp_provider::{
-    models, AnthropicProvider, OpenAiDialect, OpenAiProvider, Provider, ZaiProvider,
+    models, AnthropicProvider, MoonshotProvider, OpenAiDialect, OpenAiProvider, Provider,
+    ZaiProvider,
 };
 use sepp_tools::{builtin_tools, Tool};
 
@@ -58,14 +59,15 @@ struct RunOpts {
     model: Option<String>,
     max_tokens: Option<u64>,
     session: SessionSelect,
-    /// `anthropic` (Default) | `openai` | `local` | `zai` | `mlx`.
+    /// `anthropic` (Default) | `openai` | `local` | `zai` | `moonshot` | `mlx`.
     provider: Option<String>,
     /// JSONL-RPC über stdin/stdout statt TUI/One-shot.
     rpc: bool,
     /// SQLite-Session-Backend statt JSONL (nur `-p`/`--rpc`; braucht Feature `sqlite`).
     sqlite: bool,
     /// `--think`/`--no-think`: `Some(true/false)` erzwingt Reasoning an/aus; `None` = Default
-    /// (z.ai an, sonst aus). Vorrang vor `SEPP_THINK`.
+    /// (z.ai und Moonshot an, sonst aus). Vorrang vor `SEPP_THINK`. Bei Moonshot bedeutet „aus"
+    /// nur die billigste Reasoning-Stufe — Kimi kann Thinking nicht abschalten.
     think: Option<bool>,
     /// `--hide-thinking`: Reasoning nicht anzeigen (Default: gedimmt sichtbar).
     hide_thinking: bool,
@@ -216,18 +218,23 @@ fn parse_think_env(v: &str) -> Option<bool> {
     }
 }
 
-/// CLI/Env → effektive Reasoning-Stufe. Default-AN ist **z.ai-spezifisch**; andere Provider
-/// bleiben Off, sofern nicht explizit `--think`/`SEPP_THINK` gesetzt wird. `--think`/`--no-think`
-/// haben Vorrang vor `SEPP_THINK` (wie `--provider` vor `SEPP_PROVIDER`). „An" = `Medium` (4096),
-/// nicht `High`: dieselbe Stufe fließt zu Anthropic, das `budget_tokens < max_tokens` verlangt —
-/// bei Default-`max_tokens=8192` wäre `High=8192` grenzwertig, `Medium` ist sicher. z.ai ignoriert
-/// das Budget (binär an/aus).
-fn resolve_thinking(flag: Option<bool>, env: Option<&str>, is_zai: bool) -> ThinkingLevel {
+/// CLI/Env → effektive Reasoning-Stufe. `default_on` gilt für Provider, deren Reasoning ohne
+/// explizite Wahl an sein soll (z.ai und Moonshot); alle anderen bleiben Off, sofern nicht
+/// `--think`/`SEPP_THINK` gesetzt wird. `--think`/`--no-think` haben Vorrang vor `SEPP_THINK`
+/// (wie `--provider` vor `SEPP_PROVIDER`). „An" = `Medium` (4096), nicht `High`: dieselbe Stufe
+/// fließt zu Anthropic, das `budget_tokens < max_tokens` verlangt — bei Default-`max_tokens=8192`
+/// wäre `High=8192` grenzwertig, `Medium` ist sicher. z.ai ignoriert das Budget (binär an/aus).
+///
+/// Die Begründung für `default_on` unterscheidet sich je Provider: bei z.ai spart `Off` echte
+/// completion_tokens (GLM hört auf zu denken), bei Moonshot denkt das Modell ohnehin — `Off`
+/// senkt dort nur `reasoning_effort` auf `low` (siehe `moonshot_reasoning_effort` in
+/// `sepp-provider`). Ein Default-`Off` gewönne bei Moonshot also nichts.
+fn resolve_thinking(flag: Option<bool>, env: Option<&str>, default_on: bool) -> ThinkingLevel {
     match flag.or_else(|| env.and_then(parse_think_env)) {
         Some(true) => ThinkingLevel::Medium,
         Some(false) => ThinkingLevel::Off,
         None => {
-            if is_zai {
+            if default_on {
                 ThinkingLevel::Medium
             } else {
                 ThinkingLevel::Off
@@ -278,10 +285,13 @@ fn print_help() {
          \x20 -c, --continue            Jüngste Session des Projekts fortsetzen\n\
          \x20 -r, --resume [id]         Session per ID-Präfix wählen (ohne id: jüngste)\n\
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
-         \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192)\n\
-         \x20     --provider <name>     anthropic (Default) | openai | local | zai | mlx\n\
-         \x20                           (ohne Angabe aus -m abgeleitet, z. B. glm-* → zai)\n\
-         \x20     --think / --no-think  Reasoning erzwingen/abschalten (z.ai: Default an)\n\
+         \x20     --max-tokens <n>      Max. Output-Tokens (Default: 8192; Moonshot 32768)\n\
+         \x20     --provider <name>     anthropic (Default) | openai | local | zai | moonshot\n\
+         \x20                           | mlx  (ohne Angabe aus -m abgeleitet, z. B.\n\
+         \x20                           glm-* → zai, kimi-k3 → moonshot)\n\
+         \x20     --think / --no-think  Reasoning erzwingen/abschalten (z.ai/Moonshot:\n\
+         \x20                           Default an; Moonshot kann es nicht abschalten,\n\
+         \x20                           --no-think senkt dort nur den Aufwand)\n\
          \x20     --hide-thinking       Reasoning nicht anzeigen (Default: gedimmt sichtbar)\n\
          \x20     --rpc                 JSONL-RPC über stdin/stdout (statt TUI/One-shot)\n\
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
@@ -298,6 +308,9 @@ fn print_help() {
          \x20                           Default http://localhost:1234/v1 = LM Studio)\n\
          \x20 ZAI_API_KEY               z.ai/Zhipu-GLM (Pflicht für --provider zai)\n\
          \x20 ZAI_BASE_URL              z.ai base_url überschreiben (Default api.z.ai)\n\
+         \x20 MOONSHOT_API_KEY          Moonshot AI/Kimi (Pflicht für --provider moonshot)\n\
+         \x20 MOONSHOT_BASE_URL         Moonshot base_url überschreiben\n\
+         \x20                           (Default https://api.moonshot.ai/v1)\n\
          \x20 SEPP_HOME                 globale Konfig-Wurzel verlegen (Default ~/.sepp)\n\
          \x20 SEPP_PROVIDER             Default-Provider, wenn --provider fehlt\n\
          \x20 SEPP_THINK                Default-Reasoning (on/off), wenn --think/--no-think fehlt\n\
@@ -582,12 +595,14 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .unwrap_or_else(|| "anthropic".into());
     let is_openai = matches!(provider_kind.as_str(), "openai" | "local");
     let is_zai = provider_kind == "zai";
+    let is_moonshot = provider_kind == "moonshot";
     let is_mlx = provider_kind == "mlx";
-    // Reasoning-Stufe auflösen: --think/--no-think > SEPP_THINK > Provider-Default (z.ai an, sonst aus).
+    // Reasoning-Stufe auflösen: --think/--no-think > SEPP_THINK > Provider-Default
+    // (z.ai und Moonshot an, sonst aus).
     let thinking = resolve_thinking(
         opts.think,
         std::env::var("SEPP_THINK").ok().as_deref(),
-        is_zai,
+        is_zai || is_moonshot,
     );
     // Start-Hinweise: im TUI-Modus gesammelt und dort im Chatfenster angezeigt — ein eprintln
     // verpufft hinter dem Alternate-Screen; bei -p/--rpc bleibt stderr der sichtbare Kanal.
@@ -609,6 +624,16 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             "Hinweis: --think/SEPP_THINK hat bei --provider {provider_kind} keine Wirkung — \
              der Wert wird ignoriert."
         ));
+    }
+    // Umgekehrter Fall bei Moonshot: Kimi kann Reasoning nicht abschalten (die API kennt kein
+    // "none", nur low|high|max mit Default max). `--no-think` senkt dort nur den Aufwand auf
+    // `low`. Ohne diesen Hinweis würde das Flag etwas versprechen, was der Anbieter nicht kann.
+    if thinking == ThinkingLevel::Off && is_moonshot {
+        startup_notice(
+            "Hinweis: Moonshot kann Reasoning nicht abschalten — --no-think sendet die \
+             billigste Stufe (reasoning_effort \"low\"), Kimi denkt weiterhin."
+                .to_string(),
+        );
     }
     // Session-Store VOR den Key-Checks bauen, damit jeder Start auditierbar ist: bricht ein
     // Key-Check ab, hängen wir einen `aborted`-Eintrag an und fsyncen — die Datei existiert auch
@@ -673,6 +698,21 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         )
         .await);
     }
+    // Moonshot AI (Kimi) braucht MOONSHOT_API_KEY — wie z.ai ist der Key Pflicht, daher hier
+    // früh + hilfreich scheitern statt erst beim 401.
+    if is_moonshot && env_nonempty("MOONSHOT_API_KEY").is_none() {
+        let msg = "MOONSHOT_API_KEY nicht gesetzt — Key auf https://platform.moonshot.ai holen \
+             und setzen:\n  \
+             export MOONSHOT_API_KEY=…\n  \
+             (optional MOONSHOT_BASE_URL für einen abweichenden Endpunkt, z. B. die China-Region \
+             https://api.moonshot.cn/v1)";
+        return Err(abort_with_audit(
+            store.as_mut(),
+            msg,
+            serde_json::json!({ "reason": "missing_api_key", "provider": provider_kind }),
+        )
+        .await);
+    }
     if is_mlx {
         // Modell muss explizit gewählt werden — sepp schreibt kein Modell vor; LM Studio bedient
         // das jeweils geladene Modell, dessen Identifier der Nutzer mit -m angibt.
@@ -728,7 +768,10 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         "local" => Arc::new(OpenAiProvider::from_env()?.with_dialect(OpenAiDialect::Local)),
         "mlx" => Arc::new(OpenAiProvider::mlx_from_env()?),
         "zai" => Arc::new(ZaiProvider::from_env()?),
-        other => anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai|mlx)"),
+        "moonshot" => Arc::new(MoonshotProvider::from_env()?),
+        other => {
+            anyhow::bail!("unbekannter Provider: {other} (anthropic|openai|local|zai|moonshot|mlx)")
+        }
     };
 
     let model = match opts.model {
@@ -755,11 +798,18 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         None if is_zai => {
             models::find_model("glm-5.2").unwrap_or_else(|| custom_model("glm-5.2".into(), "zai"))
         }
+        // Moonshot: aktuelles Flaggschiff als Default.
+        None if is_moonshot => models::find_model("kimi-k3")
+            .unwrap_or_else(|| custom_model("kimi-k3".into(), "moonshot")),
         // OpenAI hat keine Modell-Registry hier → sinnvoller Default.
         None if is_openai => custom_model("gpt-4o-mini".into(), &provider_kind),
         None => models::default_model(),
     };
     let threshold = sepp_agent::default_compact_threshold(&model);
+    // Output-Budget: explizites --max-tokens gewinnt, sonst modellbewusster Default.
+    let max_tokens = opts
+        .max_tokens
+        .unwrap_or_else(|| default_max_tokens(&model));
     // `store` wurde bereits vor den Key-Checks gebaut (Audit jeden Start).
 
     // Tier 0: Resources (Skills → System-Prompt, Prompt-Templates → Slash-Commands).
@@ -825,7 +875,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // edit/bash) Toolset, kein eigener `task` (keine Rekursion).
     let sub = SubAgentTool::new(Arc::clone(&provider), model.clone())
         .tools(builtin_tools())
-        .max_tokens(opts.max_tokens.unwrap_or(8192))
+        .max_tokens(max_tokens)
         .thinking(thinking);
     let sub_name = sepp_mcp::resolve_name(&taken, "agent", &sub.spec().name);
     taken.insert(sub_name.clone());
@@ -836,7 +886,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .model(model)
         .system_prompt(system)
         .tools(tools)
-        .max_tokens(opts.max_tokens.unwrap_or(8192))
+        .max_tokens(max_tokens)
         .thinking(thinking)
         .session(store)
         .auto_compact_threshold(threshold);
@@ -1066,6 +1116,21 @@ pub(crate) fn model_label(model: &Model) -> &str {
     }
 }
 
+/// Default für `--max-tokens`, modellbewusst. 8192 ist bei Moonshots Kimi-Modellen zu knapp:
+/// Reasoning ist dort nicht abschaltbar und zählt gegen dasselbe Output-Budget — das Denken
+/// könnte es aufbrauchen, bevor die Antwort kommt (`finish_reason: "length"`, also ein
+/// abgeschnittener Text). 32768 liegt weiterhin weit unter Moonshots eigenem API-Default
+/// (131072), das Rate-Limit-Accounting bleibt damit moderat. Nie über `max_output_tokens` des
+/// Modells hinaus. Ein explizites `--max-tokens` hat immer Vorrang.
+fn default_max_tokens(model: &Model) -> u64 {
+    let want = if model.provider == "moonshot" && model.supports_reasoning {
+        32_768
+    } else {
+        8_192
+    };
+    want.min(model.max_output_tokens)
+}
+
 /// Fallback-`Model` für unregistrierte IDs — provider-bewusst (Kontextfenster, Provider-Tag).
 /// Auch vom TUI-`/model`-Befehl genutzt; das Custom-Modell erbt dort den Session-Provider.
 pub(crate) fn custom_model(id: String, provider: &str) -> Model {
@@ -1145,6 +1210,26 @@ mod tests {
         assert_eq!(openai_local_precheck("anthropic", None, None), None);
         assert_eq!(openai_local_precheck("mlx", None, None), None);
         assert_eq!(openai_local_precheck("zai", None, None), None);
+        assert_eq!(openai_local_precheck("moonshot", None, None), None);
+    }
+
+    #[test]
+    fn default_max_tokens_is_larger_for_moonshot_only() {
+        // Kimi denkt immer und zählt das Denken gegen dasselbe Budget — 8192 würde die Antwort
+        // abschneiden. Alle anderen Provider bleiben unverändert bei 8192.
+        let k3 = models::find_model("kimi-k3").expect("kimi-k3 ist registriert");
+        assert_eq!(default_max_tokens(&k3), 32_768);
+
+        let sonnet = models::default_model();
+        assert_eq!(default_max_tokens(&sonnet), 8_192);
+
+        let glm = models::find_model("glm-5.2").expect("glm-5.2 ist registriert");
+        assert_eq!(default_max_tokens(&glm), 8_192);
+
+        // Nie über max_output_tokens des Modells hinaus: ein unregistriertes Moonshot-Modell
+        // erbt aus custom_model 8192 — der Deckel greift, statt ein zu großes Budget zu senden.
+        let custom = custom_model("moonshot-v1-8k".into(), "moonshot");
+        assert_eq!(default_max_tokens(&custom), 8_192);
     }
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -1321,7 +1406,7 @@ mod tests {
 
     #[test]
     fn resolve_thinking_defaults_and_precedence() {
-        // Provider-Default: z.ai an, sonst aus.
+        // Provider-Default: z.ai/Moonshot an, sonst aus.
         assert_eq!(resolve_thinking(None, None, true), ThinkingLevel::Medium);
         assert_eq!(resolve_thinking(None, None, false), ThinkingLevel::Off);
         // Explizite Flags überall.
