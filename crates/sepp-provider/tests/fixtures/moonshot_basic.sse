@@ -1,0 +1,21 @@
+data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Der Nutzer will "}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"das Datum."}}]}
+
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Hallo"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":" von Kimi"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_moonshot_1","type":"function","function":{"name":"get_date","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"tz\":"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"UTC\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":24,"completion_tokens":11,"total_tokens":35}}
+
+data: [DONE]

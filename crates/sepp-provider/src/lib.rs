@@ -13,6 +13,8 @@ use sepp_core::{Message, Model, Result, ThinkingLevel, ToolSpec, Usage};
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 pub mod models;
+#[cfg(feature = "moonshot")]
+pub mod moonshot;
 #[cfg(feature = "openai")]
 pub mod openai;
 pub mod sse;
@@ -21,6 +23,8 @@ pub mod zai;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::{decode_anthropic_sse, AnthropicProvider};
+#[cfg(feature = "moonshot")]
+pub use moonshot::MoonshotProvider;
 #[cfg(feature = "openai")]
 pub use openai::{decode_openai_sse, OpenAiDialect, OpenAiProvider};
 #[cfg(feature = "zai")]
