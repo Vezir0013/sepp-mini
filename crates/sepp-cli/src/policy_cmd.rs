@@ -75,6 +75,10 @@ pub struct ActorRow {
     pub actor: Actor,
     pub transport: Option<Transport>,
     pub legacy: Option<Policy>,
+    /// Nutzt dieser Server `$NAME`-Platzhalter in `[mcp.servers.headers]`? Dann sind `net` und
+    /// `env` für ihn **nicht** wirkungslos, auch wenn er remote läuft — der Secret-Broker setzt
+    /// beide durch, bevor er verbindet.
+    pub secret_headers: bool,
 }
 
 pub fn run_policy(cmd: PolicyCmd) -> ExitCode {
@@ -133,10 +137,15 @@ pub fn actor_rows(trusted: bool) -> anyhow::Result<Vec<ActorRow>> {
             Transport::Stdio
         };
         let legacy = sepp_mcp::policy_from_config(&cfg);
+        let secret_headers = cfg
+            .headers
+            .values()
+            .any(|v| !sepp_policy::placeholder_names(v).is_empty());
         rows.push(ActorRow {
             actor: Actor::Mcp(cfg.name),
             transport: Some(transport),
             legacy: (!legacy.granted.is_empty()).then_some(legacy),
+            secret_headers,
         });
     }
     for dir in session::plugin_dirs(trusted)? {
@@ -145,6 +154,7 @@ pub fn actor_rows(trusted: bool) -> anyhow::Result<Vec<ActorRow>> {
                 actor: Actor::Plugin(name),
                 transport: None,
                 legacy: None,
+                secret_headers: false,
             });
         }
     }
@@ -271,6 +281,7 @@ fn enforcer(
     caps: &SandboxCapabilities,
     transport: Option<Transport>,
     net_denied: bool,
+    secret_headers: bool,
 ) -> String {
     let fs = fs_enforcer(caps);
     // Ein Netzverbot nimmt die Gewährung zurück. Die Zeile bleibt sichtbar — sonst sähe man
@@ -290,6 +301,15 @@ fn enforcer(
             Capability::Exec { .. } => format!("Execute-Allowlist ({fs})"),
         },
         Actor::Mcp(_) => match transport {
+            // Für einen remote laufenden Server gibt es keinen Vollstrecker — mit einer
+            // Ausnahme: Sobald seine Header ein Secret verlangen, entscheiden `net` und `env`
+            // darüber, ob überhaupt verbunden wird und welcher Wert mitgeht.
+            Some(Transport::Http)
+                if secret_headers
+                    && matches!(cap, Capability::Net { .. } | Capability::Env { .. }) =>
+            {
+                "Secret-Broker (Header, vor dem Verbinden)".into()
+            }
             Some(Transport::Http) => "KEINE (remote)".into(),
             _ => match cap {
                 Capability::FsRead { .. } | Capability::FsWrite { .. } => fs.into(),
@@ -369,9 +389,12 @@ pub fn render_policy_table(
         let label = actor.to_string();
         let mut has_net = false;
         let mut has_exec = false;
-        let mut any = false;
+        // Dieselbe Prädikatsfunktion wie der Loader (`main.rs`, `grant_for`): Sie zählt auch
+        // `exec_open` mit. Eine eigene Zählung über `entries` allein meldete einen Abschnitt
+        // mit nur `exec = "system"` als nicht vorhanden — die Übersicht widerspräche dem, was
+        // beim Laden tatsächlich passiert.
+        let any = set.has_entries(actor);
         for e in set.entries.iter().filter(|e| e.actor == *actor) {
-            any = true;
             has_net |= matches!(e.cap, Capability::Net { .. });
             has_exec |= matches!(e.cap, Capability::Exec { .. });
             push_row(
@@ -381,7 +404,14 @@ pub fn render_policy_table(
                     cap_kind(&e.cap).into(),
                     e.raw.clone(),
                     short_source(&e.source),
-                    enforcer(actor, &e.cap, caps, transport, net_denied),
+                    enforcer(
+                        actor,
+                        &e.cap,
+                        caps,
+                        transport,
+                        net_denied,
+                        row_info.is_some_and(|r| r.secret_headers),
+                    ),
                 ],
             );
         }
@@ -721,6 +751,86 @@ mod tests {
     }
 
     #[test]
+    fn http_server_with_secret_headers_shows_the_broker_as_enforcer() {
+        // Für einen remoten Server steht sonst „KEINE (remote)". Sobald seine Header ein Secret
+        // verlangen, stimmt das für `net` und `env` nicht mehr — beide entscheiden dann, ob
+        // überhaupt verbunden wird. Das ist der einzige Ort, an dem ein http-Server aufhört,
+        // rechtlich ein Nullum zu sein.
+        let mut file = PolicyFile::default();
+        file.mcp.insert(
+            "gh".into(),
+            Grants {
+                net: NetGrant::Hosts(vec!["api.example.com".into()]),
+                env: vec!["TOKEN".into()],
+                ..Grants::default()
+            },
+        );
+        let set = PolicySet::merge(
+            vec![(Source::File("/proj/.sepp/policy.toml".into()), file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx(),
+        );
+        let extra = vec![ActorRow {
+            actor: Actor::Mcp("gh".into()),
+            transport: Some(Transport::Http),
+            legacy: None,
+            secret_headers: true,
+        }];
+        let out = render_policy_table(&set, &caps(true), &extra, "/proj", true);
+        assert!(out.contains("Secret-Broker (Header"), "{out}");
+
+        // Ohne Secret-Header bleibt es bei der alten, richtigen Aussage.
+        let plain = vec![ActorRow {
+            actor: Actor::Mcp("gh".into()),
+            transport: Some(Transport::Http),
+            legacy: None,
+            secret_headers: false,
+        }];
+        let out = render_policy_table(&set, &caps(true), &plain, "/proj", true);
+        assert!(!out.contains("Secret-Broker"), "{out}");
+        assert!(out.contains("KEINE (remote)"), "{out}");
+    }
+
+    #[test]
+    fn exec_only_plugin_section_is_not_reported_as_missing() {
+        // `exec = "system"` landet in `exec_open`, nicht in `entries`. Eine eigene Zählung über
+        // `entries` allein meldete den Abschnitt als nicht vorhanden — während der Loader ihn
+        // über `has_entries` sehr wohl sieht und dem Plugin eine (leere) Policy gibt.
+        let mut file = PolicyFile::default();
+        file.plugin.insert(
+            "foo".into(),
+            Grants {
+                exec: sepp_policy::ExecGrant::System,
+                ..Grants::default()
+            },
+        );
+        let set = PolicySet::merge(
+            vec![(Source::File("/proj/.sepp/policy.toml".into()), file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx(),
+        );
+        assert!(set.has_entries(&Actor::Plugin("foo".into())));
+
+        let extra = vec![ActorRow {
+            actor: Actor::Plugin("foo".into()),
+            transport: None,
+            legacy: None,
+            secret_headers: false,
+        }];
+        let out = render_policy_table(&set, &caps(true), &extra, "/proj", true);
+        let plugin_line = out
+            .lines()
+            .find(|l| l.contains("plugin.foo") || l.contains("foo"))
+            .unwrap_or("");
+        assert!(
+            !plugin_line.contains("(kein Abschnitt)"),
+            "die Übersicht widerspricht dem Loader: {out}"
+        );
+    }
+
+    #[test]
     fn render_policy_table_lists_sources_enforcers_and_unenforceable_line() {
         let mut file = PolicyFile {
             agent: Some(AgentSection {
@@ -770,16 +880,19 @@ mod tests {
                 legacy: Some(Policy::new(vec![Capability::Env {
                     name: "GIT_DIR".into(),
                 }])),
+                secret_headers: false,
             },
             ActorRow {
                 actor: Actor::Mcp("fpv7".into()),
                 transport: Some(Transport::Http),
                 legacy: None,
+                secret_headers: false,
             },
             ActorRow {
                 actor: Actor::Plugin("string-tools".into()),
                 transport: None,
                 legacy: None,
+                secret_headers: false,
             },
         ];
         let out = render_policy_table(&set, &caps(true), &extra, "/proj", true);

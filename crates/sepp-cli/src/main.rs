@@ -393,6 +393,16 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # transport = "http"
 # url = "https://mcp.example.com"
 #
+# Secrets für einen http-Server gehören in [mcp.servers.headers] als $NAME-Platzhalter —
+# nie in die url (die steht in jeder Verbindungsfehlermeldung) und nie im Klartext hier.
+# [mcp.servers.headers]
+# Authorization = "Bearer $EXAMPLE_TOKEN"
+#
+#   Dazu in der policy.toml — beide Zeilen, sonst wird gar nicht erst verbunden:
+#   [mcp.example]
+#   net = ["mcp.example.com"]   # wohin das Secret gehen darf
+#   env = ["EXAMPLE_TOKEN"]     # welches Secret der Server sehen darf
+#
 # Sepp Guard (globales Regelwerk, gleiche Grammatik wie policy.toml; `sepp policy` zeigt es):
 # [policy]
 # mode = "ask"
