@@ -7,9 +7,28 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+- **Ein Beispiel-Plugin mit Anleitung** unter `examples/textstat-plugin/`. Bis jetzt gab es im
+  ganzen Repository kein Beispiel, kein SDK und keine Vorlage; das Aufrufprotokoll stand nur in
+  Modul-Kommentaren, und die einzige Implementierung waren WAT-Schnipsel in den Tests. Damit war
+  Tier 2 ein Sicherheitsversprechen, das niemand einlösen konnte. Das Beispiel zählt Zeichen,
+  Wörter und Zeilen, zeigt den Protokollteil offen zum Kopieren und benennt die vier Fallstricke:
+  das Vorzeichen beim Packen von Adresse und Länge, das fehlende Freigeben, die erst spät
+  geprüften Exports und die Host-Funktionen, die man ohne Gewährung nicht importieren darf.
+- **`just plugin-example`** baut das Beispiel und installiert das WASM-Target bei Bedarf.
+- Ein `#[ignore]`-Test baut das Beispiel, lädt es in den Host und ruft es auf
+  (`cargo test -p sepp-wasm -- --ignored`). Er läuft nicht in der CI, weil dort kein WASM-Target
+  installiert ist, hält aber fest, dass Beispiel und Protokoll zusammenpassen.
+- Anleitung zum Plugin-Bau in README und Handbuch; bisher erwähnte beides das ABI mit keinem Wort.
+
+### Behoben
+- `.gitignore` erfasste weder das `target/` eines Unterprojekts (der Eintrag ist an der Wurzel
+  verankert) noch gebaute `*.wasm`-Dateien.
+
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
 - `host_http`/`host_fs_read` für WASM-Plugins (heute Stubs; das Capability-Gate ist echt)
+- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter
@@ -28,8 +47,8 @@ Jetzt sagt die `settings.toml`, **was läuft**, und die `policy.toml`, **was es 
   und `sepp policy` zeigt ihn als wirkungslos an. Es gibt bewusst keinen Migrationsbefehl.
 - **BRUCH: Ein WASM-Plugin ohne `[plugin.<name>]` bekommt keine Rechte.** Bisher galt in diesem
   Fall das Manifest allein. Ein Manifest liegt aber neben der wasm-Datei und stammt vom Autor des
-  Plugins; ohne Gegenzeichnung ist es eine Absichtserklärung, keine Grenze. Ein Plugin, das etwas
-  fordert, das niemand gewährt hat, lädt nicht mehr.
+  Plugins; ohne Gegenzeichnung ist es eine Absichtserklärung, keine Grenze. Durchgesetzt wird am
+  Linker: Ein Modul, das eine gegatete Host-Funktion importiert, lädt ohne die Gewährung nicht.
 - `WasmHost::discover_with` liefert zusätzlich die Meldungen zu übersprungenen Plugins;
   `WasmHost::discover` und `load_file` sind entfallen. `sepp_mcp::connect` verbindet ohne Rechte
   und ist nur noch für `examples/probe.rs` gedacht.

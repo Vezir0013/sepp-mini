@@ -410,7 +410,8 @@ pub fn render_policy_table(
                         "(kein Abschnitt)".into(),
                         "keine Rechte".into(),
                         "–".into(),
-                        "lädt nicht, wenn das Manifest etwas fordert".into(),
+                        "wasmi-Linker-Gate (lädt nicht, wenn es eine gegatete Host-Funktion importiert)"
+                            .into(),
                     ]);
                 } else if !has_net {
                     rows.push([
@@ -807,7 +808,7 @@ mod tests {
         assert!(out.contains("KEINE (remote)"), "{out}");
         // Plugin ohne [plugin.<name>]: keine Rechte, und der Grund steht daneben.
         assert!(out.contains("(kein Abschnitt)"), "{out}");
-        assert!(out.contains("lädt nicht"), "{out}");
+        assert!(out.contains("lädt nicht, wenn es eine gegatete"), "{out}");
         assert!(out.contains("Execute-Allowlist"), "{out}");
         // Der alte capabilities-Block wird gezeigt, aber als wirkungslos ausgewiesen.
         assert!(out.contains("settings.toml (veraltet)"), "{out}");

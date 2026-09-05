@@ -268,7 +268,7 @@ Verzeichnisse bleiben unangetastet.
 |------|-----|-----|
 | **Resources** | Skills (→ System-Prompt), Prompt-Templates (→ `/commands`), Themes | Dateien unter `~/.sepp/skills` · `~/.sepp/prompts` |
 | **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
-| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]` | `~/.sepp/plugins/*.wasm` + `manifest.toml` |
+| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/) |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
 
 Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
@@ -298,6 +298,24 @@ max_memory_pages = 256      # 1 Page = 64 KiB → 16 MiB
 max_wall_time_ms = 30000    # Wanduhr-Budget pro Tool-Aufruf; 0 = unbegrenzt, aber unterbrechbar
 fuel_slice       = 1000000  # Instruktionen pro Zeitscheibe (Yield-Intervall)
 ```
+
+### Ein Plugin schreiben
+
+Ein lauffähiges Beispiel samt Anleitung liegt unter
+[`examples/textstat-plugin/`](./examples/textstat-plugin/). Das Protokoll ist klein: Dein Modul
+exportiert `memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`. Der Rückgabewert `i64` trägt im
+oberen Wort die Adresse und im unteren die Länge. `sepp_spec` liefert die Werkzeugbeschreibung als
+JSON, `sepp_call` bekommt die Argumente als JSON und gibt das Ergebnis als JSON zurück.
+
+```bash
+just plugin-example                     # baut das Beispiel
+cp examples/textstat-plugin/target/wasm32-unknown-unknown/release/textstat.wasm ~/.sepp/plugins/
+cp examples/textstat-plugin/textstat.toml ~/.sepp/plugins/
+```
+
+Es gibt bewusst kein Freigeben im Protokoll: Der Host verwirft nach jedem Aufruf die ganze
+Instanz, ein Plugin hält also keinen Zustand zwischen zwei Aufrufen. Die weiteren Fallstricke
+stehen in der Anleitung.
 
 ## Sicherheitsmodell
 
@@ -387,9 +405,10 @@ net      = true                  # Hauptschalter: niemand kommt ins Netz
 ```
 
 **Wer nichts einträgt, gewährt nichts.** Ein Manifest ist die Selbstauskunft des Plugin-Autors,
-keine Grenze: Ohne `[plugin.<name>]` bekommt ein Plugin keine Rechte, und eines, das im Manifest
-etwas fordert, lädt gar nicht erst. Die Meldung dazu erscheint beim Start und nennt den fehlenden
-Abschnitt.
+keine Grenze: Ohne `[plugin.<name>]` bekommt ein Plugin keine Rechte. Durchgesetzt wird das am
+Linker — eine Host-Funktion wie `host_http` wird nur registriert, wenn das Recht gewährt ist, und
+ein Modul, das sie ohne Gewährung importiert, lässt sich nicht instanziieren und lädt gar nicht
+erst. Die Meldung dazu erscheint beim Start und nennt den fehlenden Abschnitt.
 
 `sepp init` legt die Datei an und aktiviert das Preset für erkannte Projekttypen (Rust, Node,
 Python). `sepp policy` zeigt die effektiven Rechte je Akteur mit Quelle und Vollstrecker und
@@ -477,8 +496,9 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] OAuth-Login für Subscription-Provider
 - [ ] Google-Provider-Adapter
 - [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
-- [ ] Egress-Proxy: Host-Filter für ausgehende Verbindungen (heute ist Netz „ganz oder gar nicht")
 - [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
+- [ ] `host_http`/`host_fs_read` für WASM-Plugins (heute Stubs; das Capability-Gate ist echt)
+- [ ] Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
 
 ## Mitwirken
 
