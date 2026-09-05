@@ -946,4 +946,67 @@ mod tests {
             .expect("join");
         assert!(matches!(res, Err(SeppError::Aborted)), "war: {res:?}");
     }
+
+    /// Baut das Beispiel-Plugin aus `examples/textstat-plugin` und führt es aus.
+    ///
+    /// Prüft den ganzen Weg vom Rust-Quelltext bis zum Werkzeug-Ergebnis und hält damit fest,
+    /// dass das Beispiel zum ABI passt. `#[ignore]`, weil die CI kein WASM-Target installiert
+    /// hat und ein Toolchain-Zwang für alle Mitwirkenden unverhältnismäßig wäre:
+    ///
+    /// ```bash
+    /// cargo test -p sepp-wasm -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "braucht das Target wasm32-unknown-unknown"]
+    async fn example_plugin_builds_and_runs() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/textstat-plugin");
+        let out = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--manifest-path",
+            ])
+            .arg(dir.join("Cargo.toml"))
+            .output()
+            .expect("cargo startbar");
+        assert!(
+            out.status.success(),
+            "Beispiel-Plugin baut nicht:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let wasm = dir.join("target/wasm32-unknown-unknown/release/textstat.wasm");
+        let manifest = dir.join("textstat.toml");
+        // Ohne Gewährung — das Beispiel fordert nichts an und muss trotzdem laden.
+        let plugin = WasmHost::new()
+            .load_file_with_grant(&wasm, Some(&manifest), None)
+            .expect("Beispiel-Plugin lädt");
+        assert_eq!(plugin.spec().name, "textstat");
+
+        let res = plugin
+            .execute(
+                serde_json::json!({ "text": "Hallo Welt\nZweite Zeile" }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("Aufruf gelingt");
+        assert!(!res.is_error, "{res:?}");
+        let sepp_core::ContentBlock::Text { text } = &res.content[0] else {
+            panic!("Textblock erwartet: {res:?}")
+        };
+        assert!(text.contains("2 Zeilen"), "{text}");
+        assert!(text.contains("4 Wörter"), "{text}");
+        assert_eq!(res.details["words"], 4);
+
+        // Ungültige Eingabe wird zum Fehler-Ergebnis, nicht zum Absturz.
+        let bad = plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .expect("auch der Fehlerfall liefert ein Ergebnis");
+        assert!(bad.is_error, "{bad:?}");
+    }
 }
