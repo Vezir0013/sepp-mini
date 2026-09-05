@@ -193,11 +193,14 @@ impl Tool for SubAgentTool {
 
         // Auch ein abgebrochener Lauf muss auf Platte stehen — sonst fehlt genau der Fall
         // in der Spur, den man hinterher nachlesen will. `JsonlSessionStore` hat kein `Drop`,
-        // ohne `finalize` bliebe der Puffer ungeschrieben.
+        // ohne `finalize` bliebe der Puffer ungeschrieben. Ein Schreibfehler der Spur darf
+        // dabei nie den Turn abbrechen, deshalb `let _`.
         let entries = sub.session().map(|s| s.entries().len()).unwrap_or(0);
         let _ = sub.finalize().await;
-        outcome?;
 
+        // Das Audit-Objekt entsteht VOR der Fehlerbehandlung: Sonst verlöre ausgerechnet der
+        // gescheiterte Lauf seinen Verweis, und die Kind-Session läge verwaist auf Platte,
+        // ohne dass in der Wurzel irgendetwas auf sie zeigt.
         let audit = child_id.map(|id| {
             json!({
                 AUDIT_DETAIL_KEY_KIND: "subagent",
@@ -207,6 +210,19 @@ impl Tool for SubAgentTool {
                 "entries": entries,
             })
         });
+
+        if let Err(e) = outcome {
+            // Ctrl+C reicht durch — der ganze Lauf wird gerade abgeräumt, und ein Abbruch ist
+            // kein Werkzeugfehler, auf den das Modell reagieren sollte.
+            if matches!(e, SeppError::Aborted) {
+                return Err(e);
+            }
+            // Alles andere ist ein gescheiterter Auftrag: Das Modell soll es sehen und darauf
+            // reagieren können, und die Spur behält ihren Verweis auf die Kind-Session.
+            let mut result = ToolResult::text(format!("Sub-Agent fehlgeschlagen: {e}"));
+            result.is_error = true;
+            return Ok(with_audit(result, audit));
+        }
 
         let answer = last_assistant_text(sub.messages());
         if answer.is_empty() {

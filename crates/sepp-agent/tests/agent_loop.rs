@@ -462,13 +462,82 @@ async fn compact_after_branch_keeps_summary_on_active_path() {
     session.session_mut().unwrap().branch(&first_id).unwrap();
     session.reload_from_session();
 
-    session.compact(None).await.unwrap();
+    session
+        .compact(None, CancellationToken::new())
+        .await
+        .unwrap();
 
     // Die aktive Conversation muss mit der Zusammenfassung beginnen (nicht verloren gehen).
     let msgs = session.session().unwrap().path_messages();
     assert!(!msgs.is_empty(), "Zusammenfassung ging verloren");
     assert!(matches!(&msgs[0].content[0],
         sepp_core::ContentBlock::Text { text } if text.contains("SUMMARY")));
+}
+
+/// Beantwortet den ersten Aufruf normal und hängt danach, bis der übergebene Token gecancelt
+/// wird — damit lässt sich prüfen, ob ein Aufrufer seinen Token überhaupt durchreicht.
+struct HangingProvider {
+    started: Arc<tokio::sync::Notify>,
+    first: Mutex<Option<Vec<StreamEvent>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for HangingProvider {
+    fn name(&self) -> &str {
+        "hanging"
+    }
+    async fn stream<'a>(
+        &'a self,
+        _req: CompletionRequest<'a>,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'a, StreamEvent>> {
+        if let Some(events) = self.first.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            return Ok(Box::pin(stream::iter(events)));
+        }
+        self.started.notify_one();
+        cancel.cancelled().await;
+        Ok(Box::pin(stream::iter(vec![StreamEvent::Error {
+            message: "abgebrochen".into(),
+        }])))
+    }
+}
+
+#[tokio::test]
+async fn compact_honours_the_callers_cancel_token() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HangingProvider {
+        started: started.clone(),
+        first: Mutex::new(Some(text_turn("A1"))),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    // compact() ist ein No-Op auf leerer Conversation — erst einen Turn fahren.
+    let noop = |_ev: AgentEvent| {};
+    session
+        .prompt("hallo", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        started.notified().await;
+        c2.cancel();
+    });
+
+    // Ohne durchgereichten Token bekäme der Provider einen frischen, nie gecancelten Token
+    // und die Zusammenfassung liefe bis zum Timeout durch.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.compact(None, cancel),
+    )
+    .await;
+    assert!(r.is_ok(), "compact reagierte nicht auf Ctrl+C");
 }
 
 #[test]

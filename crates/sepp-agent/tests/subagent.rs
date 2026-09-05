@@ -303,6 +303,52 @@ async fn subagent_writes_child_session_with_parent_link() {
 }
 
 #[tokio::test]
+async fn failed_subagent_run_keeps_its_audit_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = sepp_session::JsonlSessionStore::create(dir.path()).unwrap();
+    let root_id = root.id().to_string();
+
+    // Der Lauf scheitert am Provider — genau der Fall, dessen Spur bisher verlorenging.
+    let script = vec![
+        StreamEvent::MessageStart,
+        StreamEvent::Error {
+            message: "429 rate limited".into(),
+        },
+    ];
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![script])),
+    });
+
+    let path = dir.path().to_path_buf();
+    let parent = root_id.clone();
+    let res = SubAgentTool::new(provider, model())
+        .session_factory(Arc::new(move || {
+            sepp_session::JsonlSessionStore::create_child(&path, &parent)
+                .ok()
+                .map(|s| Box::new(s) as Box<dyn sepp_session::SessionStore>)
+        }))
+        .execute(
+            json!({ "description": "wird scheitern" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("gescheiterte Delegation ist ein Werkzeugfehler, kein Abbruch des Loops");
+
+    assert!(res.is_error);
+    assert!(
+        matches!(&res.content[0], ContentBlock::Text { text } if text.contains("429 rate limited")),
+        "{:?}",
+        res.content[0]
+    );
+    // Der Verweis auf die Kind-Session muss stehen, sonst liegt sie verwaist auf Platte.
+    let audit = &res.details["audit"];
+    assert_eq!(audit["kind"], "subagent");
+    let child_id = audit["session"].as_str().expect("session-id fehlt");
+    assert!(dir.path().join(format!("{child_id}.jsonl")).exists());
+}
+
+#[tokio::test]
 async fn subagent_without_factory_reports_no_audit() {
     let provider = Arc::new(FakeProvider {
         scripts: Mutex::new(VecDeque::from(vec![vec![

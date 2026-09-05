@@ -1001,14 +1001,14 @@ impl App {
         self.begin_turn(Activity::Compacting);
         self.running = true;
         let cancel = CancellationToken::new();
-        self.cancel = Some(cancel);
+        self.cancel = Some(cancel.clone());
         let sess = self.session.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let mut guard = DoneOnDrop::new(tx.clone());
             let res = {
                 let mut g = sess.lock().await;
-                g.compact(None).await
+                g.compact(None, cancel).await
             };
             guard.disarm();
             let _ = tx.send(UiMsg::Done(res.err().map(|e| e.to_string())));

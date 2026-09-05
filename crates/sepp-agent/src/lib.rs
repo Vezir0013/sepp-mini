@@ -271,7 +271,14 @@ impl AgentSession {
     /// Verdichtet die bisherige Conversation zu einer Zusammenfassung (Phase-2-Compaction).
     /// Persistiert einen `Compaction`-Eintrag (falls ein Store vorhanden ist) und ersetzt die
     /// In-Memory-Messages durch die Zusammenfassung.
-    pub async fn compact(&mut self, instructions: Option<&str>) -> Result<()> {
+    ///
+    /// `cancel` muss der Token des umgebenden Turns sein: Die Zusammenfassung ist ein voller
+    /// Provider-Roundtrip, und ohne den Token säße der Nutzer ihn nach Ctrl+C komplett ab.
+    pub async fn compact(
+        &mut self,
+        instructions: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
         if self.state.messages.is_empty() {
             return Ok(());
         }
@@ -291,7 +298,7 @@ impl AgentSession {
                 thinking: ThinkingLevel::Off,
                 max_tokens: 1024,
             };
-            let mut stream = self.provider.stream(req, CancellationToken::new()).await?;
+            let mut stream = self.provider.stream(req, cancel.clone()).await?;
             let mut summary = String::new();
             while let Some(ev) = stream.next().await {
                 match ev {
@@ -365,7 +372,7 @@ impl AgentSession {
 
         // Auto-Compaction VOR dem neuen Prompt (sonst würde er mitsummiert).
         if self.should_compact() {
-            self.compact(None).await?;
+            self.compact(None, cancel.clone()).await?;
         }
         let user_msg = Message::user_text(input_text);
         self.record(EntryPayload::Message {
