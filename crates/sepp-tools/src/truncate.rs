@@ -22,24 +22,49 @@ pub struct Truncated {
 
 /// Kürzt die Text-Blöcke eines Tool-Ergebnisses auf die Default-Grenzen — für Quellen, die nicht
 /// selbst kürzen (MCP, WASM). Nicht-Text-Blöcke (z. B. Bilder) bleiben unverändert.
+///
+/// Das Budget gilt für das **ganze Ergebnis**, nicht je Block: Sonst passierten 200 Blöcke à
+/// 50 KiB jeder für sich die Grenze und landeten als 10 MB im Kontextfenster. Ist es erschöpft,
+/// werden die restlichen Text-Blöcke durch **einen** Hinweis ersetzt.
 pub fn truncate_content_blocks(
     blocks: Vec<sepp_core::ContentBlock>,
 ) -> Vec<sepp_core::ContentBlock> {
-    blocks
-        .into_iter()
-        .map(|b| match b {
+    let mut remaining_bytes = DEFAULT_MAX_BYTES;
+    let mut remaining_lines = DEFAULT_MAX_LINES;
+    let mut dropped_blocks = 0usize;
+    let mut dropped_bytes = 0usize;
+    let mut out = Vec::with_capacity(blocks.len());
+
+    for b in blocks {
+        match b {
             sepp_core::ContentBlock::Text { text } => {
-                let t = truncate_tail(&text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-                let note = t.note();
-                let mut out = t.content;
-                if let Some(note) = note {
-                    out.push_str(&note);
+                if remaining_bytes == 0 || remaining_lines == 0 {
+                    dropped_blocks += 1;
+                    dropped_bytes += text.len();
+                    continue;
                 }
-                sepp_core::ContentBlock::Text { text: out }
+                let t = truncate_tail(&text, remaining_lines, remaining_bytes);
+                remaining_bytes -= t.shown_bytes.min(remaining_bytes);
+                remaining_lines -= t.shown_lines.min(remaining_lines);
+                let note = t.note();
+                let mut s = t.content;
+                if let Some(note) = note {
+                    s.push_str(&note);
+                }
+                out.push(sepp_core::ContentBlock::Text { text: s });
             }
-            other => other,
-        })
-        .collect()
+            other => out.push(other),
+        }
+    }
+
+    if dropped_blocks > 0 {
+        out.push(sepp_core::ContentBlock::text(format!(
+            "[Output gekürzt: {dropped_blocks} weitere Text-Blöcke ({dropped_bytes} Bytes) \
+             entfallen — das Budget von {DEFAULT_MAX_BYTES} Bytes / {DEFAULT_MAX_LINES} Zeilen \
+             gilt für das ganze Tool-Ergebnis]"
+        )));
+    }
+    out
 }
 
 impl Truncated {
@@ -53,6 +78,38 @@ impl Truncated {
             self.shown_lines, self.total_lines, self.shown_bytes, self.total_bytes
         ))
     }
+}
+
+/// Byte-Offset direkt hinter dem `n`-ten `\n`; `s.len()`, wenn es so viele nicht gibt.
+fn offset_after_newline(s: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            seen += 1;
+            if seen == n {
+                return i + 1;
+            }
+        }
+    }
+    s.len()
+}
+
+/// Schneidet `take` Zeilen ab Zeile `skip` heraus — als **Byte-Bereich des Originals**.
+///
+/// Damit bleiben `\r\n` und eine abschließende Newline erhalten. Eine Rekonstruktion über
+/// `lines().join("\n")` täte das nicht: Sie normalisiert CRLF zu LF, und das Modell verlöre
+/// danach jede Chance, einen kopierten `old_string` in einer CRLF-Datei wiederzufinden.
+/// Zeilensemantik wie [`count_lines`].
+pub fn line_slice(s: &str, skip: usize, take: Option<usize>) -> &str {
+    let start = offset_after_newline(s, skip);
+    let end = match take {
+        Some(n) => offset_after_newline(&s[start..], n) + start,
+        None => s.len(),
+    };
+    &s[start..end]
 }
 
 /// Editor-gerechte Zeilenzahl: Anzahl `\n` plus 1, falls nicht mit `\n` endend.
@@ -92,18 +149,7 @@ pub fn truncate_head(s: &str, max_lines: usize, max_bytes: usize) -> Truncated {
     let total_bytes = s.len();
     let total_lines = count_lines(s);
 
-    // Byte-Offset direkt hinter dem `max_lines`-ten `\n`.
-    let mut line_cut = s.len();
-    let mut newlines = 0;
-    for (i, b) in s.bytes().enumerate() {
-        if b == b'\n' {
-            newlines += 1;
-            if newlines == max_lines {
-                line_cut = i + 1;
-                break;
-            }
-        }
-    }
+    let line_cut = offset_after_newline(s, max_lines);
     let truncated_by_lines = line_cut < s.len();
 
     let mut cut = line_cut;
@@ -127,19 +173,7 @@ pub fn truncate_tail(s: &str, max_lines: usize, max_bytes: usize) -> Truncated {
 
     // Die ersten (total_lines - max_lines) Zeilen verwerfen.
     let drop = total_lines.saturating_sub(max_lines);
-    let mut line_start = 0;
-    if drop > 0 {
-        let mut seen = 0;
-        for (i, b) in s.bytes().enumerate() {
-            if b == b'\n' {
-                seen += 1;
-                if seen == drop {
-                    line_start = i + 1;
-                    break;
-                }
-            }
-        }
-    }
+    let line_start = offset_after_newline(s, drop);
     let truncated_by_lines = line_start > 0;
 
     let mut start = line_start;
@@ -184,6 +218,82 @@ mod tests {
             let t2 = truncate_tail(s, 10, 1000);
             assert_eq!(t2.content, s);
         }
+    }
+
+    fn text_of(b: &sepp_core::ContentBlock) -> &str {
+        match b {
+            sepp_core::ContentBlock::Text { text } => text,
+            _ => panic!("kein Text-Block"),
+        }
+    }
+
+    #[test]
+    fn line_slice_keeps_crlf_and_trailing_newline() {
+        let s = "a\r\nb\r\nc\r\n";
+        assert_eq!(line_slice(s, 1, Some(1)), "b\r\n");
+        assert_eq!(line_slice(s, 0, None), s);
+        assert_eq!(line_slice(s, 2, None), "c\r\n");
+    }
+
+    #[test]
+    fn line_slice_handles_out_of_range() {
+        let s = "a\nb";
+        assert_eq!(line_slice(s, 0, Some(99)), "a\nb");
+        assert_eq!(line_slice(s, 2, None), "");
+        assert_eq!(line_slice(s, 99, Some(1)), "");
+        assert_eq!(line_slice("", 0, None), "");
+    }
+
+    #[test]
+    fn line_slice_agrees_with_count_lines() {
+        let s = "eins\nzwei\ndrei\n";
+        for skip in 0..=count_lines(s) {
+            let rest = line_slice(s, skip, None);
+            assert_eq!(count_lines(rest), count_lines(s) - skip, "skip={skip}");
+        }
+    }
+
+    #[test]
+    fn block_budget_is_shared_across_the_whole_result() {
+        let big = "x".repeat(DEFAULT_MAX_BYTES);
+        let blocks: Vec<_> = (0..200)
+            .map(|_| sepp_core::ContentBlock::text(big.clone()))
+            .collect();
+        let out = truncate_content_blocks(blocks);
+        let total: usize = out.iter().map(|b| text_of(b).len()).sum();
+        // Ohne das gemeinsame Budget wären das 10 MB.
+        assert!(total < 2 * DEFAULT_MAX_BYTES, "{total}");
+        assert!(text_of(out.last().unwrap()).contains("weitere Text-Blöcke"));
+    }
+
+    #[test]
+    fn small_result_passes_through_verbatim() {
+        let blocks = vec![
+            sepp_core::ContentBlock::text("hallo"),
+            sepp_core::ContentBlock::text("welt\n"),
+        ];
+        let out = truncate_content_blocks(blocks);
+        assert_eq!(out.len(), 2);
+        assert_eq!(text_of(&out[0]), "hallo");
+        assert_eq!(text_of(&out[1]), "welt\n");
+    }
+
+    #[test]
+    fn non_text_blocks_survive_at_their_place() {
+        let img = sepp_core::ContentBlock::Image {
+            source: sepp_core::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AA==".into(),
+            },
+        };
+        let blocks = vec![
+            sepp_core::ContentBlock::text("x".repeat(DEFAULT_MAX_BYTES * 2)),
+            img,
+            sepp_core::ContentBlock::text("wird verworfen"),
+        ];
+        let out = truncate_content_blocks(blocks);
+        // Das Bild bleibt an seiner Stelle, obwohl das Budget davor schon erschöpft war.
+        assert!(matches!(out[1], sepp_core::ContentBlock::Image { .. }));
     }
 
     #[test]

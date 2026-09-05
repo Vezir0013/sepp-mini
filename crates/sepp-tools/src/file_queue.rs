@@ -57,18 +57,77 @@ where
     // std-Mutex nur kurz halten, um den per-Pfad-Lock zu holen — NICHT über das await.
     let lock = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        reg.entry(key)
+        reg.entry(key.clone())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     };
-    let _guard = lock.lock().await;
-    f.await
+    let out = {
+        let _guard = lock.lock().await;
+        f.await
+    };
+    // Aufräumen, sonst wächst die Registry über die Prozesslaufzeit monoton: In einer langen
+    // TUI-Sitzung oder im unbegrenzt laufenden RPC-Server bleibt sonst je berührtem Pfad ein
+    // Eintrag liegen, auch wenn die Datei längst gelöscht ist.
+    reap(&key, &lock);
+    out
+}
+
+/// Entfernt den Eintrag, wenn niemand mehr auf ihn wartet.
+///
+/// `strong_count == 2` heißt: nur die Map und der eigene Klon halten ihn. Der Registry-Mutex
+/// serialisiert das — wer den Lock haben will, muss durch ihn hindurch, also kann zwischen
+/// Zählung und `remove` kein Wartender dazukommen.
+fn reap(key: &Path, lock: &Arc<AsyncMutex<()>>) {
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if Arc::strong_count(lock) == 2 {
+        reg.remove(key);
+    }
+}
+
+/// Hält die Registry noch einen Eintrag für diesen Pfad? Nur für Tests — die Registry ist
+/// prozessweit, eine Gesamtzahl wäre gegen parallel laufende Tests nicht stabil.
+#[cfg(test)]
+fn registry_holds(path: &Path) -> bool {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&canonical_key(path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn registry_does_not_grow_over_many_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..50).map(|i| dir.path().join(format!("f{i}"))).collect();
+        for p in &paths {
+            with_file_mutation_queue(p, async {
+                tokio::fs::write(p, "x").await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        // Jeder Eintrag ist nach seinem Lauf wieder weg — sonst wüchse die Registry monoton.
+        for p in &paths {
+            assert!(!registry_holds(p), "{} blieb liegen", p.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_survives_the_failure_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("kaputt");
+        let r: Result<()> = with_file_mutation_queue(&p, async {
+            Err(sepp_core::SeppError::Tool("absichtlich".into()))
+        })
+        .await;
+        assert!(r.is_err());
+        assert!(!registry_holds(&p));
+    }
 
     #[tokio::test]
     async fn serializes_concurrent_mutations_same_path() {

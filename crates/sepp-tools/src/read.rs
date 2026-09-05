@@ -67,19 +67,16 @@ impl Tool for ReadTool {
             .await
             .map_err(|e| SeppError::Tool(format!("read {}: {e}", path.display())))?;
 
+        // Byte-Bereich statt `lines().join("\n")`: sonst würde CRLF zu LF normalisiert und eine
+        // abschließende Newline verschluckt — das Modell kopierte den `old_string` dann aus einer
+        // Ausgabe, die es so auf der Platte nicht gibt, und `edit` fände null Treffer.
         let body = if p.offset.is_some() || p.limit.is_some() {
-            let lines: Vec<&str> = data.lines().collect();
-            let start = p.offset.unwrap_or(0).min(lines.len());
-            let end = match p.limit {
-                Some(l) => start.saturating_add(l).min(lines.len()),
-                None => lines.len(),
-            };
-            lines[start..end].join("\n")
+            crate::truncate::line_slice(&data, p.offset.unwrap_or(0), p.limit)
         } else {
-            data
+            &data
         };
 
-        let t = truncate_head(&body, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let t = truncate_head(body, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
         let mut content = t.content.clone();
         if let Some(note) = t.note() {
             content.push_str(&note);
@@ -130,6 +127,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("verweigert"), "{msg}");
         assert!(msg.contains("sepp policy allow agent fs_read"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn offset_limit_keeps_crlf_and_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("win.txt");
+        std::fs::write(&p, "eins\r\nzwei\r\ndrei\r\n").unwrap();
+
+        let r = ReadTool::default()
+            .execute(
+                json!({ "path": &p, "offset": 1, "limit": 1 }),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Byte-exakt: sonst kopiert das Modell "zwei" ohne \r und `edit` findet nichts.
+        assert!(
+            matches!(&r.content[0], sepp_core::ContentBlock::Text { text } if text == "zwei\r\n"),
+            "{:?}",
+            r.content[0]
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// die geerbte stdout/stderr-Pipe offen hält. Verhindert das Blockieren auf Pipe-EOF.
 const POST_EXIT_DRAIN_MS: u64 = 1_000;
 
+/// Obergrenze je Ausgabestrom **während** der Ausführung. `truncate_tail` greift erst auf dem
+/// fertigen Puffer und kann den Host deshalb nicht schützen: `yes` oder `cat /dev/urandom`
+/// füllen bis zum Timeout den Speicher, bevor überhaupt gekürzt wird. Großzügig über dem, was
+/// am Ende behalten werden kann — es soll nur die unbegrenzte Aufnahme verhindern, nicht die
+/// Trunkierung vorwegnehmen.
+const MAX_CAPTURE_BYTES: usize = 8 * DEFAULT_MAX_BYTES;
+
 /// Provider-Secrets, die nicht an Shell-Kommandos durchgereicht werden (Exfiltrationsschutz).
 /// Mit Guard ist das Environment ohnehin Default-deny (Allowlist); diese Liste bleibt als
 /// Defense-in-depth für `--mode yolo` und Tests ohne Guard.
@@ -68,13 +75,41 @@ enum Outcome {
     Cancelled,
 }
 
+/// Aufgenommene Ausgabe eines Stroms, gedeckelt auf [`MAX_CAPTURE_BYTES`].
+#[derive(Default)]
+struct Capture {
+    buf: Vec<u8>,
+    /// Bytes, die wegen der Obergrenze verworfen wurden — für eine ehrliche Notiz am Ende.
+    dropped: u64,
+}
+
+impl Capture {
+    /// Hängt `chunk` an und wirft vorne weg, was über die Grenze läuft. Vorne, weil
+    /// `truncate_tail` am Ende ohnehin das Ende behält.
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        // Erst beim Doppelten kompaktieren: ein `drain` je Chunk würde bei jedem 16-KiB-Block
+        // den ganzen Puffer verschieben. So bleibt der Aufwand amortisiert O(1) je Byte.
+        if self.buf.len() > 2 * MAX_CAPTURE_BYTES {
+            let excess = self.buf.len() - MAX_CAPTURE_BYTES;
+            self.buf.drain(..excess);
+            self.dropped += excess as u64;
+        }
+    }
+
+    /// Nimmt den Inhalt heraus und lässt die Zählung der verworfenen Bytes stehen.
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+}
+
 /// Liest `reader` chunk-weise in `buf`, bis EOF/Fehler. Solange `stop` `false` ist, wird die
 /// Ausgabe gesammelt; danach wird nur noch geleert (Pipe drainen, ohne den Puffer wachsen zu
 /// lassen) — so bleibt ein im Hintergrund gestarteter Prozess lauffähig, ohne das Tool zu
 /// blockieren. Die Ausgabe landet im geteilten `buf`.
 fn spawn_reader<R>(
     reader: Option<R>,
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<Capture>>,
     stop: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -90,7 +125,7 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if !stop.load(Ordering::Relaxed) {
-                        buf.lock().await.extend_from_slice(&chunk[..n]);
+                        buf.lock().await.push(&chunk[..n]);
                     }
                 }
             }
@@ -182,8 +217,8 @@ impl Tool for BashTool {
         // stdout/stderr nebenläufig in geteilte Puffer lesen (verhindert Pipe-Deadlocks bei
         // großer Ausgabe). `stop` schaltet die Reader nach dem Detachen auf reines Drainen um,
         // damit ein im Hintergrund weiterlaufender Prozess die Pipe nicht füllt.
-        let out_buf = Arc::new(Mutex::new(Vec::new()));
-        let err_buf = Arc::new(Mutex::new(Vec::new()));
+        let out_buf = Arc::new(Mutex::new(Capture::default()));
+        let err_buf = Arc::new(Mutex::new(Capture::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let out_task = spawn_reader(child.stdout.take(), out_buf.clone(), stop.clone());
         let err_task = spawn_reader(child.stderr.take(), err_buf.clone(), stop.clone());
@@ -217,8 +252,15 @@ impl Tool for BashTool {
             // Detachte Reader nicht mehr in die Puffer schreiben lassen (Speicher beschränken).
             stop.store(true, Ordering::Relaxed);
         }
-        let stdout_bytes = std::mem::take(&mut *out_buf.lock().await);
-        let stderr_bytes = std::mem::take(&mut *err_buf.lock().await);
+        let (stdout_bytes, out_dropped) = {
+            let mut g = out_buf.lock().await;
+            (g.take(), g.dropped)
+        };
+        let (stderr_bytes, err_dropped) = {
+            let mut g = err_buf.lock().await;
+            (g.take(), g.dropped)
+        };
+        let dropped = out_dropped + err_dropped;
 
         // Bei Abbruch durch den Nutzer: harter Abbruch.
         if matches!(outcome, Outcome::Cancelled) {
@@ -238,6 +280,14 @@ impl Tool for BashTool {
         let mut content = t.content.clone();
         if let Some(note) = t.note() {
             content.push_str(&note);
+        }
+        if dropped > 0 {
+            // Ohne diesen Satz nennt die Notiz oben eine Gesamtgröße, die nur den aufgenommenen
+            // Teil zählt — der Rest ist schon während der Ausführung weggeworfen worden.
+            content.push_str(&format!(
+                "\n[bash: {dropped} weitere Bytes wurden während der Ausführung verworfen \
+                 (Aufnahmegrenze {MAX_CAPTURE_BYTES} Bytes je Strom)]"
+            ));
         }
 
         let (is_error, exit_code, status_line) = match outcome {
@@ -328,6 +378,40 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn capture_keeps_small_output_verbatim() {
+        let mut c = Capture::default();
+        c.push(b"hallo ");
+        c.push(b"welt");
+        assert_eq!(c.take(), b"hallo welt");
+        assert_eq!(c.dropped, 0);
+    }
+
+    #[test]
+    fn capture_caps_growth_and_counts_dropped_bytes() {
+        let mut c = Capture::default();
+        let chunk = vec![b'x'; 16 * 1024];
+        // Deutlich mehr als die Grenze einspeisen und dabei prüfen, dass der Puffer nie über
+        // das Kompaktierungsfenster hinauswächst — das ist die eigentliche Zusage.
+        let mut fed = 0u64;
+        for _ in 0..200 {
+            c.push(&chunk);
+            fed += chunk.len() as u64;
+            assert!(c.buf.len() <= 2 * MAX_CAPTURE_BYTES, "{}", c.buf.len());
+        }
+        assert!(c.dropped > 0);
+        assert_eq!(c.buf.len() as u64 + c.dropped, fed);
+    }
+
+    #[test]
+    fn capture_keeps_the_end_not_the_beginning() {
+        let mut c = Capture::default();
+        c.push(&vec![b'a'; 2 * MAX_CAPTURE_BYTES + 1]);
+        c.push(b"ENDE");
+        let out = c.take();
+        assert!(out.ends_with(b"ENDE"));
     }
 
     fn run(cmd: &str, timeout_ms: Option<u64>) -> ToolResult {
