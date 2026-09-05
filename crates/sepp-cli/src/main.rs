@@ -366,30 +366,32 @@ fn print_help() {
 }
 
 /// Vorlage für eine frische `~/.sepp/settings.toml` — **komplett auskommentiert** und damit gültig
-/// (parst zu „keine Server"). Zeigt je einen `stdio`- und `http`-MCP-Server samt Capabilities.
+/// (parst zu „keine Server"). Zeigt je einen `stdio`- und `http`-MCP-Server. Rechte stehen hier
+/// bewusst nicht: diese Datei sagt, **was läuft**, die `policy.toml` sagt, **was es darf**.
 const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sepp/settings.toml)
 #
-# Hier werden MCP-Server als Tool-Quellen deklariert. Jeder Server braucht capabilities
-# (Default DENY). Entferne die Kommentarzeichen und passe an. Doppelte `name` sind ein Fehler;
-# eine leere/komplett auskommentierte Datei ist gültig.
+# Hier werden MCP-Server als Tool-Quellen deklariert: Name, Transport, Startbefehl.
+# Was ein Server DARF, steht in der policy.toml unter [mcp.<name>] — nicht hier.
+# Doppelte `name` sind ein Fehler; eine leere/komplett auskommentierte Datei ist gültig.
 #
 # Beispiel: stdio-Server (lokaler Subprozess)
 # [[mcp.servers]]
 # name = "git"
 # transport = "stdio"
 # command = ["uvx", "mcp-server-git"]
-# [mcp.servers.capabilities]
-# fs_read  = ["./"]
-# fs_write = ["./"]
-# exec     = ["git"]
 #
-# Beispiel: http-Server (entfernter Endpunkt)
+#   Dazu in der policy.toml:
+#   [mcp.git]
+#   fs_read  = ["./"]
+#   fs_write = ["./"]
+#   exec     = ["git"]
+#
+# Beispiel: http-Server (entfernter Endpunkt — läuft auf fremder Hardware, dort ist nichts
+# durchzusetzen; ein [deny] net verhindert immerhin, dass sepp ihn überhaupt verbindet)
 # [[mcp.servers]]
 # name = "example"
 # transport = "http"
 # url = "https://mcp.example.com"
-# [mcp.servers.capabilities]
-# net = ["mcp.example.com"]
 #
 # Sepp Guard (globales Regelwerk, gleiche Grammatik wie policy.toml; `sepp policy` zeigt es):
 # [policy]
@@ -924,6 +926,11 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 .to_string(),
         );
     }
+    // Warnungen zum Regelwerk sind unabhängig vom Modus richtig — auch unter yolo sollte man
+    // erfahren, dass eine Zeile in der policy.toml nichts bewirkt.
+    for w in &policy_set.warnings {
+        startup_notice(format!("Policy: {w}"));
+    }
     let sandbox_caps = kernel_capabilities();
     let guard: Option<Arc<Guard>> = if policy_set.mode == Mode::Yolo {
         startup_notice(
@@ -974,9 +981,6 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 o.grant.display()
             ));
         }
-        for w in &policy_set.warnings {
-            startup_notice(format!("Policy: {w}"));
-        }
         if policy_set.mode == Mode::Ask {
             startup_notice(
                 "Sepp Guard: Modus ask — außerhalb der Policy wird nachgefragt \
@@ -1009,18 +1013,36 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     let mut taken: HashSet<String> = tools.iter().map(|t| t.spec().name).collect();
     let connect_timeout = std::time::Duration::from_secs(20);
     let mcp_configs = sepp_mcp::load_settings(&session::settings_paths(trusted)?)?;
-    let deny_rules = policy_set.deny_rules();
+    // Rechte stehen ausschließlich in der policy.toml. Trägt eine settings.toml noch den alten
+    // capabilities-Block, wirkt er nicht mehr — das muss man erfahren, sonst sucht man den
+    // Fehler beim Server.
+    for cfg in &mcp_configs {
+        if !cfg.capabilities.is_empty() {
+            startup_notice(format!(
+                "MCP '{name}': capabilities in der settings.toml wirken nicht mehr — die Rechte gehören nach [mcp.{name}] in die policy.toml.",
+                name = cfg.name
+            ));
+        }
+    }
+    // Ein http-Server läuft auf einem fremden Rechner; die einzige Verbindung, die wir
+    // kontrollieren können, ist die eigene. Unter einem Netzverbot bauen wir sie nicht auf.
+    let net_denied = policy_set.deny_net.is_some();
     let mcp_results = futures::future::join_all(mcp_configs.iter().map(|cfg| {
-        // Sepp Guard: Legacy-Deklaration ∪ [mcp.<name>] aus der Policy-Datei, minus Verbote.
-        let policy = sepp_mcp::policy_from_config(cfg)
-            .union(&policy_set.policy_for(&Actor::Mcp(cfg.name.clone())))
-            .without_denied(&deny_rules)
-            .0;
+        let policy = policy_set.policy_for(&Actor::Mcp(cfg.name.clone()));
+        let blocked = net_denied && cfg.transport == "http";
         async move {
+            if blocked {
+                return (cfg.name.clone(), None);
+            }
             (
                 cfg.name.clone(),
-                tokio::time::timeout(connect_timeout, sepp_mcp::connect_with_policy(cfg, &policy))
+                Some(
+                    tokio::time::timeout(
+                        connect_timeout,
+                        sepp_mcp::connect_with_policy(cfg, &policy),
+                    )
                     .await,
+                ),
             )
         }
     }))
@@ -1028,23 +1050,29 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // Ergebnisse sequenziell auswerten → deterministische Namens-Vergabe in Config-Reihenfolge.
     for (name, res) in mcp_results {
         match res {
-            Ok(Ok(conn)) => {
+            Some(Ok(Ok(conn))) => {
                 let n = conn.tool_count();
                 tools.append(&mut conn.into_tools(&mut taken));
                 eprintln!("MCP '{name}': {n} Tools verbunden");
             }
-            Ok(Err(e)) => eprintln!("MCP '{name}' übersprungen: {e}"),
-            Err(_) => eprintln!(
+            // Übersprungene Server über startup_notice, damit sie in der TUI nicht verschwinden.
+            Some(Ok(Err(e))) => startup_notice(format!("MCP '{name}' übersprungen: {e}")),
+            Some(Err(_)) => startup_notice(format!(
                 "MCP '{name}' übersprungen: Timeout ({}s) beim Verbinden",
                 connect_timeout.as_secs()
-            ),
+            )),
+            None => startup_notice(format!(
+                "MCP '{name}' übersprungen: [deny] net verbietet ausgehende Verbindungen"
+            )),
         }
     }
 
-    // Tier 2: WASM-Plugins (capability-gated; Namens-Präfix `wasm__` bei Kollision). Mit
-    // Gewährung aus [plugin.<name>] gilt der Schnitt aus Manifest und Gewährung.
+    // Tier 2: WASM-Plugins (capability-gated; Namens-Präfix `wasm__` bei Kollision). Es gilt der
+    // Schnitt aus Manifest-Anfrage und Gewährung aus [plugin.<name>] — ohne Abschnitt bleibt
+    // nichts übrig, und ein Plugin, das etwas fordert, lädt nicht.
     let wasm_host = sepp_wasm::WasmHost::new();
     let mut n_wasm = 0usize;
+    let mut wasm_notes: Vec<String> = Vec::new();
     let grant_for = |name: &str| {
         let actor = Actor::Plugin(name.to_string());
         policy_set
@@ -1052,13 +1080,20 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
             .then(|| policy_set.policy_for(&actor))
     };
     for dir in session::plugin_dirs(trusted)? {
-        for mut plugin in wasm_host.discover_with(&dir, &grant_for) {
+        let (plugins, notes) = wasm_host.discover_with(&dir, &grant_for);
+        wasm_notes.extend(notes);
+        for mut plugin in plugins {
             let exposed = sepp_mcp::resolve_name(&taken, "wasm", &plugin.spec().name);
             taken.insert(exposed.clone());
             plugin.rename(exposed);
             tools.push(Arc::new(plugin));
             n_wasm += 1;
         }
+    }
+    // Erst hier melden: `grant_for` borgt `policy_set`, `startup_notice` borgt `startup_notices`.
+    // Übersprungene Plugins müssen sichtbar sein — in der TUI gibt es kein Log zum Nachsehen.
+    for note in wasm_notes {
+        startup_notice(note);
     }
     if n_wasm > 0 {
         eprintln!("WASM: {n_wasm} Plugins geladen");

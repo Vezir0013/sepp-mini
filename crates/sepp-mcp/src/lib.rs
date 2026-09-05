@@ -149,20 +149,24 @@ pub fn resolve_name(taken: &HashSet<String>, server: &str, raw: &str) -> String 
     }
 }
 
-/// Die Policy aus der Legacy-Deklaration `[mcp.servers.capabilities]` des Servers.
+/// Die Policy aus dem **veralteten** `[mcp.servers.capabilities]`-Block eines Servers.
+///
+/// Sie wird nicht mehr durchgesetzt: Rechte stehen ausschließlich in der `policy.toml` unter
+/// `[mcp.<name>]`. Die Funktion bleibt, damit `sepp policy` anzeigen kann, dass in einer
+/// settings.toml noch etwas steht, das nichts mehr bewirkt.
 pub fn policy_from_config(cfg: &McpServerConfig) -> Policy {
     cfg.capabilities.to_policy()
 }
 
-/// Verbindet zu einem MCP-Server und listet seine Tools; stdio-Server laufen mit der Policy aus
-/// `[mcp.servers.capabilities]` in der Sandbox.
+/// Verbindet zu einem MCP-Server und listet seine Tools, **ohne** Rechte. Nur für Werkzeuge
+/// ohne Policy-Kontext (`examples/probe.rs`); der Agent nutzt [`connect_with_policy`].
 pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
-    connect_with_policy(cfg, &policy_from_config(cfg)).await
+    connect_with_policy(cfg, &Policy::default()).await
 }
 
-/// Wie [`connect`], aber mit einer bereits zusammengeführten Policy (Sepp Guard: Legacy-
-/// Deklaration ∪ `[mcp.<name>]` aus der Policy-Datei, minus Verbote). Für `http` ist die Policy
-/// ohne Wirkung — der Server läuft auf einem fremden Rechner.
+/// Wie [`connect`], aber mit der Policy des Servers aus `policy.toml [mcp.<name>]` (Verbote
+/// bereits angewendet). Für `http` ist die Policy ohne Wirkung — der Server läuft auf einem
+/// fremden Rechner.
 pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Result<McpConnection> {
     let service: Service = match cfg.transport.as_str() {
         "http" => {
@@ -385,8 +389,10 @@ mod tests {
         }));
     }
 
+    /// Der veraltete Block wird noch geparst — nur damit `sepp policy` melden kann, dass dort
+    /// etwas steht, das nicht mehr wirkt. Durchgesetzt wird er nirgends.
     #[test]
-    fn policy_from_config_uses_legacy_capabilities() {
+    fn legacy_capabilities_are_still_parsed_for_display() {
         let toml = r#"
             [[mcp.servers]]
             name = "git"

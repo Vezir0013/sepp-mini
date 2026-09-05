@@ -5,6 +5,12 @@
 //! Ein Plugin ohne `Net`-Capability importiert `host_http`, das
 //! dann nicht existiert → Instanziierung schlägt fehl → es kann nachweislich nicht ins Netz.
 //!
+//! Die Policy ist der **Schnitt** aus der Manifest-Anfrage und der Gewährung in
+//! `policy.toml [plugin.<name>]`. Ohne Gewährung ist der Schnitt **leer**: Das Manifest liegt
+//! neben der wasm-Datei und stammt vom Autor des Plugins, es ist eine Selbstauskunft und ohne
+//! Gegenzeichnung keine Grenze. Ein Plugin, dessen Manifest etwas fordert, das niemand gewährt
+//! hat, lädt deshalb gar nicht.
+//!
 //! Neben *Zugriff* (Capabilities) ist auch *Verbrauch* gedeckelt ([`Limits`] aus dem
 //! `[limits]`-Manifest-Abschnitt, fehlend = konservative Defaults): CPU über **Fuel-Slicing**
 //! (die Ausführung yieldet nach `fuel_slice` Instruktionen an den Host), Speicher über ein
@@ -311,14 +317,10 @@ impl WasmHost {
         })
     }
 
-    /// Lädt ein Plugin aus einer Datei; Capabilities und Limits aus dem (optionalen) Manifest.
-    pub fn load_file(&self, wasm_path: &Path, manifest_path: Option<&Path>) -> Result<WasmPlugin> {
-        self.load_file_with_grant(wasm_path, manifest_path, None)
-    }
-
-    /// Wie [`WasmHost::load_file`], zusätzlich mit einer Gewährung aus der Policy-Datei
+    /// Lädt ein Plugin aus einer Datei, mit der Gewährung aus der Policy-Datei
     /// (`[plugin.<name>]`, Sepp Guard): effektiv gilt der **Schnitt** aus Manifest-Anfrage und
-    /// Gewährung. Ohne Gewährung (`None`) gilt die Manifest-Policy (bisheriges Verhalten).
+    /// Gewährung. Ohne Gewährung (`None`) ist der Schnitt leer — das Plugin bekommt keine
+    /// Rechte, und eines, das im Manifest etwas fordert, lädt nicht.
     pub fn load_file_with_grant(
         &self,
         wasm_path: &Path,
@@ -336,28 +338,27 @@ impl WasmHost {
         };
         let policy = match grant {
             Some(g) => g.intersect(&requested),
-            None => requested,
+            None => Policy::default(),
         };
         self.load(&wasm, policy, limits)
     }
 
     /// Findet `*.wasm` in `dir` (Manifest: `<stem>.toml` oder `manifest.toml` daneben) und lädt
-    /// sie mit der Manifest-Policy. Fehlerhafte Plugins werden übersprungen (geloggt).
-    pub fn discover(&self, dir: &Path) -> Vec<WasmPlugin> {
-        self.discover_with(dir, &|_| None)
-    }
-
-    /// Wie [`WasmHost::discover`], mit Gewährung je Plugin-Name (Manifest-`name`, sonst
-    /// Dateistamm): `grant_for(name)` liefert `Some(policy)` aus `[plugin.<name>]` oder `None`
-    /// (dann gilt das Manifest).
+    /// sie mit der Gewährung aus `[plugin.<name>]`, aufgelöst über `grant_for(name)` (Name aus
+    /// dem Manifest, sonst der Dateistamm). Ohne Gewährung bekommt das Plugin keine Rechte.
+    ///
+    /// Liefert die geladenen Plugins **und** je übersprungenem Plugin eine erklärende Zeile.
+    /// Der zweite Rückgabewert existiert, weil das Frontend die Meldung sehen muss: Die TUI
+    /// initialisiert kein Tracing, ein geloggter Fehler verschwände dort spurlos.
     pub fn discover_with(
         &self,
         dir: &Path,
         grant_for: &dyn Fn(&str) -> Option<Policy>,
-    ) -> Vec<WasmPlugin> {
+    ) -> (Vec<WasmPlugin>, Vec<String>) {
         let mut out = Vec::new();
+        let mut notes = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else {
-            return out;
+            return (out, notes);
         };
         for entry in rd.flatten() {
             let path = entry.path();
@@ -378,18 +379,41 @@ impl WasmHost {
                 .and_then(|s| s.to_str())
                 .unwrap_or("plugin")
                 .to_string();
-            let name = manifest
-                .as_deref()
-                .and_then(|m| Manifest::from_file(m).ok())
+            // Ein unlesbares Manifest fiele auf den Dateistamm zurück und ergäbe damit den
+            // falschen Akteur — also nicht die Rechte, die gemeint waren. Das muss auffallen.
+            let parsed = manifest.as_deref().map(Manifest::from_file);
+            if let Some(Err(e)) = &parsed {
+                notes.push(format!(
+                    "WASM-Plugin {}: Manifest nicht lesbar ({e}) — der Name fällt auf \"{stem}\" \
+                     zurück, Rechte werden unter diesem Namen gesucht",
+                    path.display()
+                ));
+            }
+            let name = parsed
+                .and_then(|r| r.ok())
                 .map(|m| m.name)
-                .unwrap_or(stem);
+                .unwrap_or_else(|| stem.clone());
             let grant = grant_for(&name);
             match self.load_file_with_grant(&path, manifest.as_deref(), grant.as_ref()) {
                 Ok(p) => out.push(p),
-                Err(e) => tracing::warn!("wasm-plugin {} übersprungen: {e}", path.display()),
+                Err(e) => {
+                    tracing::warn!("wasm-plugin {} übersprungen: {e}", path.display());
+                    let hint = if grant.is_none() {
+                        format!(
+                            " — es gibt keinen Abschnitt [plugin.{name}] in der policy.toml, \
+                             das Plugin bekommt deshalb keine Rechte"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    notes.push(format!(
+                        "WASM-Plugin {} übersprungen: {e}{hint}",
+                        path.display()
+                    ));
+                }
             }
         }
-        out
+        (out, notes)
     }
 }
 
@@ -667,7 +691,8 @@ mod tests {
 
     #[test]
     fn grant_intersection_removes_net_import() {
-        // Manifest VERLANGT net; die Gewährung entscheidet. Ohne Gewährung gilt das Manifest.
+        // Das Manifest VERLANGT net, die Gewährung entscheidet. Ohne Gewährung gibt es nichts:
+        // das Manifest ist die Selbstauskunft des Autors, keine Grenze.
         let tmp = tempfile::tempdir().unwrap();
         let wasm = tmp.path().join("netter.wasm");
         std::fs::write(&wasm, net_wat()).unwrap();
@@ -695,17 +720,56 @@ mod tests {
             .unwrap();
         assert!(ok.policy().net_allowed());
 
-        // Keine Gewährung → Manifest-Policy (kompatibel).
-        let legacy = host
-            .load_file_with_grant(&wasm, Some(&manifest), None)
-            .unwrap();
-        assert!(legacy.policy().net_allowed());
+        // Keine Gewährung → keine Rechte → host_http fehlt → lädt ebenfalls nicht.
+        assert!(
+            host.load_file_with_grant(&wasm, Some(&manifest), None)
+                .is_err(),
+            "ohne Abschnitt in der policy.toml zählt das Manifest allein nicht"
+        );
 
-        // discover_with: Gewährung per Name; `netter` ohne net wird übersprungen.
-        let none = host.discover_with(tmp.path(), &|name| (name == "netter").then(Policy::default));
-        assert!(none.is_empty());
-        let some = host.discover_with(tmp.path(), &|_| None);
-        assert_eq!(some.len(), 1);
+        // discover_with: leere Gewährung und gar keine Gewährung führen beide zum Überspringen,
+        // aber nur die fehlende Gewährung nennt den fehlenden Abschnitt.
+        let (plugins, notes) =
+            host.discover_with(tmp.path(), &|name| (name == "netter").then(Policy::default));
+        assert!(plugins.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(!notes[0].contains("[plugin.netter]"), "{}", notes[0]);
+
+        let (plugins, notes) = host.discover_with(tmp.path(), &|_| None);
+        assert!(plugins.is_empty(), "ohne Gewährung lädt nichts");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("[plugin.netter]"),
+            "die Meldung nennt den fehlenden Abschnitt: {}",
+            notes[0]
+        );
+
+        // Mit passender Gewährung lädt es über discover_with.
+        let (plugins, notes) = host.discover_with(tmp.path(), &|name| {
+            (name == "netter").then(|| {
+                Policy::new(vec![Capability::Net {
+                    host: "example.com".into(),
+                }])
+            })
+        });
+        assert_eq!(plugins.len(), 1);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn unreadable_manifest_is_reported_not_swallowed() {
+        // Ein kaputtes Manifest fällt beim Namen auf den Dateistamm zurück. Unter der Regel
+        // „ohne Abschnitt keine Rechte" hieße das: Rechte werden unter dem falschen Namen
+        // gesucht. Das darf nicht still passieren.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("kaputt.wasm"), compute_wat()).unwrap();
+        std::fs::write(tmp.path().join("kaputt.toml"), "das ist kein toml [[[").unwrap();
+        let host = WasmHost::new();
+        let (_plugins, notes) = host.discover_with(tmp.path(), &|_| None);
+        assert!(
+            notes.iter().any(|n| n.contains("Manifest nicht lesbar")),
+            "{notes:?}"
+        );
     }
 
     #[tokio::test]
