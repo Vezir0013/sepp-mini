@@ -728,7 +728,13 @@ mod tests {
             "{out}"
         );
         // Vollstrecker je Akteur.
-        assert!(out.contains("Landlock (bash) · Pfadprüfung"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "{} (bash) · Pfadprüfung",
+                fs_enforcer(&caps(true))
+            )),
+            "{out}"
+        );
         assert!(out.contains("KEINE (remote)"), "{out}");
         assert!(out.contains("(Manifest)"), "{out}");
         assert!(out.contains("Execute-Allowlist"), "{out}");
@@ -749,7 +755,7 @@ mod tests {
             out.contains("Nicht durchsetzbar auf diesem System: keine"),
             "{out}"
         );
-        assert!(out.contains("Landlock TCP-Verbot"), "{out}");
+        assert!(out.contains(&net_deny_enforcer(&caps(true), None)), "{out}");
         assert!(out.contains("nicht vertraut"), "{out}");
         // Kernel ohne Netz-Regeln → Zeile erscheint.
         let out = render_policy_table(&plain, &caps(false), &[], "/proj", false);
