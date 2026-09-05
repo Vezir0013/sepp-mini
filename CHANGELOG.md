@@ -7,6 +7,16 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst
+- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.1.18] - 2026-09-05
+
 Sepp Guard, Phase 1: **ein Regelwerk, ein Entscheider, ein Audit, mehrere Vollstrecker.** Bisher
 waren Erweiterungen eingesperrt, der Agent selbst nicht — `bash`, `read`, `write` und `edit` liefen
 mit vollen Nutzerrechten, ohne Pfadgrenze und ohne Bestätigung; das bash-Tool entfernte nur vier
@@ -78,14 +88,6 @@ und `sepp policy` zeigt, wer was darf und wer es durchsetzt.
   unter Landlock (`#[ignore]`).
 - CLI: `--mode`, `policy`-Unterbefehl, Modus-Präzedenz, Tabellen-Renderer, Template, Preset-Erkennung,
   `init` idempotent; `hooks`: `print()` im Hook; `mcp`: Legacy-Policy; `wasm`: Gewährungs-Schnitt.
-
-### Geplant
-- Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst
-- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.1.17] - 2026-07-26
 
@@ -584,7 +586,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.14...v0.1.15
