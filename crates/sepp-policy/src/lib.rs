@@ -296,10 +296,20 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
+/// Vorgabe für [`Manifest::abi`]: ein Manifest ohne Angabe meint Version 1.
+fn abi_v1() -> u32 {
+    1
+}
+
 /// Manifest einer code-führenden Erweiterung (`manifest.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub name: String,
+    /// Version des Plugin-Protokolls, gegen das dieses Modul gebaut wurde. Der Host lehnt ab,
+    /// was er nicht kennt — ohne diese Angabe bräche jede spätere Protokolländerung stumm
+    /// jedes vorhandene Plugin. Fehlend = 1.
+    #[serde(default = "abi_v1")]
+    pub abi: u32,
     #[serde(default)]
     pub version: Option<String>,
     /// `"wasm"` | `"mcp"`.
@@ -315,6 +325,12 @@ pub struct Manifest {
     /// Ressourcen-Limits (`[limits]`; fehlend = konservative Defaults, nie „unbegrenzt").
     #[serde(default)]
     pub limits: Limits,
+    /// Alles, was der Host nicht kennt. Wird gelesen, ignoriert und **gemeldet**: Ein Tippfehler
+    /// wie `capabilites` bliebe sonst stumm und kostet den Autor eine lange Suche. Striktes
+    /// Ablehnen wäre die Alternative, würde aber jedes neuere Paket auf einem älteren sepp
+    /// scheitern lassen.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Deklarierte Capabilities (Manifest- bzw. `[mcp.servers.capabilities]`-Form).
@@ -441,6 +457,11 @@ impl Manifest {
 
     pub fn policy(&self) -> Policy {
         self.capabilities.to_policy()
+    }
+
+    /// Namen der Felder, die der Host nicht kennt — sortiert, für eine stabile Meldung.
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
     }
 }
 
@@ -671,6 +692,32 @@ mod tests {
         assert!(!pol.allows(&Capability::Net {
             host: "evil.com".into()
         }));
+    }
+
+    #[test]
+    fn manifest_abi_defaults_to_one_and_is_read() {
+        let m = Manifest::parse("name = \"x\"").unwrap();
+        assert_eq!(m.abi, 1, "ohne Angabe gilt Version 1");
+        let m = Manifest::parse("name = \"x\"\nabi = 2").unwrap();
+        assert_eq!(m.abi, 2);
+    }
+
+    #[test]
+    fn manifest_collects_unknown_fields_without_failing() {
+        // Ein Tippfehler soll das Manifest nicht ablehnen, aber auch nicht stumm verschwinden.
+        let m = Manifest::parse(
+            "name = \"x\"\nkind = \"wasm\"\nentry = \"x.wasm\"\n\
+             gibtsnicht = 42\n\
+             [capabilites]\nnet = [\"a\"]\n\
+             [limits]\nmax_memory_pages = 8\n",
+        )
+        .unwrap();
+        // Bekannte Felder landen NICHT in der Restkarte.
+        assert_eq!(m.name, "x");
+        assert_eq!(m.limits.max_memory_pages, 8);
+        assert!(m.capabilities.net.is_empty(), "der Tippfehler zählt nicht");
+        // Der Tippfehler und das unbekannte Feld schon.
+        assert_eq!(m.unknown_keys(), vec!["capabilites", "gibtsnicht"]);
     }
 
     #[test]
