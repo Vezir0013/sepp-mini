@@ -115,6 +115,16 @@ fn show() -> anyhow::Result<String> {
     let set = load_policy_set(&sources, &defaults, mode_override, &ResolveCtx::from_env())?;
     let caps = kernel_capabilities();
 
+    let rows = actor_rows(trusted)?;
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    Ok(render_policy_table(&set, &caps, &rows, &cwd, trusted))
+}
+
+/// MCP-Server und Plugins als Zeilen der Rechteübersicht. Von `sepp policy` **und** vom
+/// TUI-Befehl `/policy` genutzt — sonst zeigte die TUI ein anderes Bild als das Terminal.
+pub fn actor_rows(trusted: bool) -> anyhow::Result<Vec<ActorRow>> {
     let mut rows: Vec<ActorRow> = Vec::new();
     for cfg in sepp_mcp::load_settings(&session::settings_paths(trusted)?)? {
         let transport = if cfg.transport == "http" {
@@ -138,10 +148,7 @@ fn show() -> anyhow::Result<String> {
             });
         }
     }
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "?".into());
-    Ok(render_policy_table(&set, &caps, &rows, &cwd, trusted))
+    Ok(rows)
 }
 
 /// Plugin-Namen eines Plugin-Verzeichnisses ohne WASM-Compile: Manifest-`name`, sonst Dateistamm.
@@ -263,8 +270,14 @@ fn enforcer(
     cap: &Capability,
     caps: &SandboxCapabilities,
     transport: Option<Transport>,
+    net_denied: bool,
 ) -> String {
     let fs = fs_enforcer(caps);
+    // Ein Netzverbot nimmt die Gewährung zurück. Die Zeile bleibt sichtbar — sonst sähe man
+    // nicht, dass jemand sie eingetragen hat — aber sie darf nicht „erlaubt" behaupten.
+    if net_denied && matches!(cap, Capability::Net { .. }) {
+        return "zurückgenommen durch [deny] net".into();
+    }
     match actor {
         Actor::Agent => match cap {
             Capability::FsRead { .. } | Capability::FsWrite { .. } => {
@@ -347,6 +360,7 @@ pub fn render_policy_table(
             actors.push(r.actor.clone());
         }
     }
+    let net_denied = set.deny_net.is_some();
 
     let mut rows: Vec<[String; 5]> = Vec::new();
     for actor in &actors {
@@ -367,21 +381,24 @@ pub fn render_policy_table(
                     cap_kind(&e.cap).into(),
                     e.raw.clone(),
                     short_source(&e.source),
-                    enforcer(actor, &e.cap, caps, transport),
+                    enforcer(actor, &e.cap, caps, transport, net_denied),
                 ],
             );
         }
+        // Der alte capabilities-Block wird nur noch angezeigt, nicht mehr durchgesetzt. Er zählt
+        // deshalb auch nicht als Gewährung (`any` bleibt unberührt), sonst verschwände die Zeile
+        // „net aus" für einen Server, der faktisch kein Netz hat.
         if let Some(legacy) = row_info.and_then(|r| r.legacy.as_ref()) {
             for c in &legacy.granted {
-                any = true;
-                has_net |= matches!(c, Capability::Net { .. });
-                has_exec |= matches!(c, Capability::Exec { .. });
                 rows.push([
                     label.clone(),
                     cap_kind(c).into(),
                     cap_value(c),
-                    "settings.toml (capabilities)".into(),
-                    enforcer(actor, c, caps, transport),
+                    "settings.toml (veraltet)".into(),
+                    format!(
+                        "wirkungslos — gehört nach [{}] in die policy.toml",
+                        section_label(actor)
+                    ),
                 ]);
             }
         }
@@ -390,10 +407,10 @@ pub fn render_policy_table(
                 if !any {
                     rows.push([
                         label.clone(),
-                        "(Manifest)".into(),
-                        "Gewährung = Manifest-Anfrage".into(),
+                        "(kein Abschnitt)".into(),
+                        "keine Rechte".into(),
                         "–".into(),
-                        "wasmi-Linker-Gate".into(),
+                        "lädt nicht, wenn das Manifest etwas fordert".into(),
                     ]);
                 } else if !has_net {
                     rows.push([
@@ -461,6 +478,12 @@ pub fn render_policy_table(
     }
 
     out.push_str("\nVerbote (gewinnen immer):\n");
+    if let Some(src) = &set.deny_net {
+        out.push_str(&format!(
+            "  net  [jeder Akteur, jede Quelle]  ({})\n",
+            short_source(src)
+        ));
+    }
     for (rule, src) in &set.deny {
         out.push_str(&format!(
             "  {}  [{}]  ({})\n",
@@ -498,10 +521,11 @@ pub fn render_policy_table(
             ));
         }
     }
-    if set
-        .entries
-        .iter()
-        .any(|e| matches!(&e.cap, Capability::Net { host } if host != "*"))
+    if set.deny_net.is_none()
+        && set
+            .entries
+            .iter()
+            .any(|e| matches!(&e.cap, Capability::Net { host } if host != "*"))
     {
         unenforceable
             .push("Host-Filter für net-Listen (TCP gesamt erlaubt; Egress-Proxy folgt)".into());
@@ -610,6 +634,8 @@ pub fn policy_template(preset: Option<Preset>) -> String {
 # Projektlokal (lädt erst nach Trust: `sepp init` oder /trust); global: ~/.sepp/policy.toml
 # oder der Abschnitt [policy] in ~/.sepp/settings.toml. `sepp policy` zeigt das Ergebnis.
 #
+# Diese Datei sagt, WAS ETWAS DARF. Die settings.toml sagt nur, was läuft.
+#
 # Die eingebauten Defaults gelten IMMER — Einträge hier erweitern sie, [deny] schränkt ein:
 #   lesen:      ./ und Systempfade        schreiben: ./ und $TMPDIR
 #   ausführen:  alle Systemprogramme       Netz:      aus (TCP verboten)
@@ -628,15 +654,18 @@ pub fn policy_template(preset: Option<Preset>) -> String {
 # [agent.ask]                   # Rückfrage-Muster (Komfort, keine Sicherheitsgrenze)
 # patterns = ["rm -rf", "git push --force"]
 #
-# [mcp.git]                     # ergänzt [mcp.servers.capabilities] aus settings.toml
-# fs_write = ["./"]
+# [mcp.git]                     # die EINZIGE Rechtequelle für einen MCP-Server
+# fs_write = ["./"]              # (settings.toml sagt nur, was läuft — nicht, was es darf)
 # exec     = ["git"]
 #
-# [plugin.string-tools]         # Gewährung für ein WASM-Plugin (effektiv: Schnitt mit dem Manifest)
-# net      = ["api.example.com"]
+# [plugin.string-tools]         # Gewährung für ein WASM-Plugin: Schnitt mit dem Manifest.
+# net      = ["api.example.com"] # Ohne Abschnitt bekommt ein Plugin NICHTS, und eines, das im
+#                               # Manifest etwas fordert, lädt gar nicht.
 #
-# [deny]                        # gewinnt immer; fs_read sperrt Lesen+Schreiben, fs_write nur Schreiben
-# fs_read  = ["~/.config/secrets"]
+# [deny]                        # gewinnt gegen jede Quelle und jeden Akteur
+# fs_read  = ["~/.config/secrets"]   # sperrt Lesen UND Schreiben
+# fs_write = ["~/.cargo/config.toml"] # sperrt nur Schreiben
+# net      = true               # Hauptschalter: niemand kommt ins Netz (exec/env kann [deny] nicht)
 #
 # Presets (Kommentarzeichen entfernen, um eines zu aktivieren):
 #   Rust:   [agent] fs_read=["~/.cargo","~/.rustup"] fs_write=["~/.cargo"] net=true env=["CARGO_HOME","RUSTUP_HOME"]
@@ -776,9 +805,13 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("KEINE (remote)"), "{out}");
-        assert!(out.contains("(Manifest)"), "{out}");
+        // Plugin ohne [plugin.<name>]: keine Rechte, und der Grund steht daneben.
+        assert!(out.contains("(kein Abschnitt)"), "{out}");
+        assert!(out.contains("lädt nicht"), "{out}");
         assert!(out.contains("Execute-Allowlist"), "{out}");
-        assert!(out.contains("settings.toml (capabilities)"), "{out}");
+        // Der alte capabilities-Block wird gezeigt, aber als wirkungslos ausgewiesen.
+        assert!(out.contains("settings.toml (veraltet)"), "{out}");
+        assert!(out.contains("gehört nach [mcp.git]"), "{out}");
         // Netz-Liste → Host-Filter nicht durchsetzbar.
         assert!(out.contains("Host-Filter für net-Listen"), "{out}");
         assert!(out.contains("Verbote (gewinnen immer)"), "{out}");
@@ -831,6 +864,25 @@ mod tests {
         ] {
             assert!(parse_allow_args(&a(&bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn deny_net_appears_in_the_ban_list_and_silences_the_host_filter_note() {
+        let f = PolicyFile::parse("[agent]\nnet = [\"api.example.com\"]\n[deny]\nnet = true\n")
+            .unwrap();
+        let set = PolicySet::merge(
+            vec![(sepp_policy::Source::File(PathBuf::from("/p")), f)],
+            &BuiltinDefaults {
+                extra_deny: Vec::new(),
+                default_mode: Mode::Ask,
+            },
+            None,
+            &ctx(),
+        );
+        let out = render_policy_table(&set, &caps(true), &[], "/proj", true);
+        assert!(out.contains("net  [jeder Akteur, jede Quelle]"), "{out}");
+        // Ein Hinweis auf den fehlenden Host-Filter wäre unter einem Vollverbot gegenstandslos.
+        assert!(!out.contains("Host-Filter für net-Listen"), "{out}");
     }
 
     #[test]

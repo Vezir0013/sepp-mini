@@ -859,10 +859,13 @@ impl App {
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|_| "?".into());
                         let trusted = session::is_project_trusted().unwrap_or(false);
+                        // Dieselben Zeilen wie `sepp policy` im Terminal, sonst fehlten hier
+                        // MCP-Server und Plugins komplett.
+                        let extra = crate::policy_cmd::actor_rows(trusted).unwrap_or_default();
                         let table = crate::policy_cmd::render_policy_table(
                             g.policy_set(),
                             &caps,
-                            &[],
+                            &extra,
                             &cwd,
                             trusted,
                         );
