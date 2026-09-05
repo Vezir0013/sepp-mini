@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
+use sepp_policy::{PolicySource, SourceKind};
 use sepp_session::{JsonlSessionStore, SessionInfo, SessionStore};
 
 /// Welche Session beim Start verwendet wird.
@@ -169,6 +170,43 @@ pub fn plugin_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
         dirs.push(project_root()?.join("plugins"));
     }
     Ok(dirs)
+}
+
+// ---- Sepp Guard: Policy-Quellen ---------------------------------------------
+
+/// Projektlokale Policy-Datei `<cwd>/.sepp/policy.toml` (lädt nur nach Trust).
+pub fn project_policy_path() -> Result<PathBuf> {
+    Ok(project_root()?.join("policy.toml"))
+}
+
+/// Policy-Quellen in Ladereihenfolge: `settings.toml` (Abschnitt `[policy]`), globale
+/// `policy.toml`, projektlokale `policy.toml` (nur nach Trust). Fehlende Dateien werden vom
+/// Loader übersprungen.
+pub fn policy_paths(project_trusted: bool) -> Result<Vec<PolicySource>> {
+    let cfg = config_root()?;
+    let mut out = vec![
+        PolicySource {
+            path: cfg.join("settings.toml"),
+            kind: SourceKind::SettingsToml,
+        },
+        PolicySource {
+            path: cfg.join("policy.toml"),
+            kind: SourceKind::PolicyToml,
+        },
+    ];
+    if project_trusted {
+        out.push(PolicySource {
+            path: project_policy_path()?,
+            kind: SourceKind::PolicyToml,
+        });
+    }
+    Ok(out)
+}
+
+/// Eingebaute Verbote des Frontends: config_root (Keys, künftig `auth.json`) und state_root
+/// (Sessions mit allem, was der Agent je gelesen hat, `trust.json`).
+pub fn builtin_deny_roots() -> Result<Vec<PathBuf>> {
+    Ok(vec![config_root()?, state_root()?])
 }
 
 // ---- Trust (Vorstufe zu sepp-policy, Phase 4) ---------------------------
@@ -344,6 +382,20 @@ mod tests {
         let root = project_root().unwrap();
         assert!(root.ends_with(".sepp"));
         assert_eq!(root, std::env::current_dir().unwrap().join(".sepp"));
+    }
+
+    #[test]
+    fn policy_paths_order_and_trust_gate() {
+        let untrusted = policy_paths(false).unwrap();
+        assert_eq!(untrusted.len(), 2);
+        assert_eq!(untrusted[0].kind, SourceKind::SettingsToml);
+        assert!(untrusted[0].path.ends_with("settings.toml"));
+        assert_eq!(untrusted[1].kind, SourceKind::PolicyToml);
+        assert!(untrusted[1].path.ends_with("policy.toml"));
+        let trusted = policy_paths(true).unwrap();
+        assert_eq!(trusted.len(), 3);
+        assert_eq!(trusted[2].path, project_policy_path().unwrap());
+        assert!(trusted[2].path.ends_with(".sepp/policy.toml"));
     }
 
     #[test]

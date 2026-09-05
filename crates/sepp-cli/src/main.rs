@@ -7,6 +7,7 @@
 //! Daten-/Text-Kanal. Im TUI-Modus wird Tracing nicht initialisiert (sonst würde stderr die
 //! Oberfläche zerstören).
 
+mod policy_cmd;
 mod session;
 mod tui;
 
@@ -22,12 +23,16 @@ use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
 use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
+use sepp_policy::{
+    default_sandbox, kernel_capabilities, load_policy_set, probe_sandbox, Actor, BuiltinDefaults,
+    Guard, Mode, ResolveCtx,
+};
 use sepp_provider::openai::{MLX_BASE_URL, MLX_HOST_PORT};
 use sepp_provider::{
     models, AnthropicProvider, MoonshotProvider, OpenAiDialect, OpenAiProvider, Provider,
     ZaiProvider,
 };
-use sepp_tools::{builtin_tools, Tool};
+use sepp_tools::{builtin_tools_with, Tool};
 
 use crate::session::SessionSelect;
 
@@ -50,12 +55,17 @@ enum Cmd {
     Uninstall {
         purge: bool,
     },
+    /// `sepp policy [show | allow …]` — effektives Regelwerk von Sepp Guard anzeigen.
+    Policy(policy_cmd::PolicyCmd),
     Run(RunOpts),
 }
 
 struct RunOpts {
     /// `Some` → One-shot; `None` → interaktive TUI (außer `rpc`).
     prompt: Option<String>,
+    /// `--mode ask|auto|yolo` (Sepp Guard); `None` = `SEPP_MODE`, Policy-Datei, dann Default
+    /// (`ask` in der TUI, `auto` bei `-p`/`--rpc`).
+    mode: Option<Mode>,
     model: Option<String>,
     max_tokens: Option<u64>,
     session: SessionSelect,
@@ -86,6 +96,7 @@ fn main() -> ExitCode {
         }
         Ok(Cmd::Init { scope }) => run_init(scope),
         Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
+        Ok(Cmd::Policy(cmd)) => policy_cmd::run_policy(cmd),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
             eprintln!("Fehler: {e}\n");
@@ -122,6 +133,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             }
             return Ok(Cmd::Uninstall { purge });
         }
+        Some("policy") => {
+            return policy_cmd::parse_policy_args(&args[1..]).map(Cmd::Policy);
+        }
         _ => {}
     }
 
@@ -134,6 +148,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
     let mut sqlite = false;
     let mut think: Option<bool> = None;
     let mut hide_thinking = false;
+    let mut mode: Option<Mode> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -145,6 +160,13 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             "--think" => think = Some(true),
             "--no-think" => think = Some(false),
             "--hide-thinking" => hide_thinking = true,
+            "--mode" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--mode braucht ein Argument (ask|auto|yolo)")?;
+                mode = Some(v.parse::<Mode>().map_err(|e| e.to_string())?);
+            }
             "--provider" => {
                 i += 1;
                 provider = Some(
@@ -198,6 +220,7 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
 
     Ok(Cmd::Run(RunOpts {
         prompt,
+        mode,
         model,
         max_tokens,
         session: select,
@@ -207,6 +230,12 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         think,
         hide_thinking,
     }))
+}
+
+/// Modus-Übersteuerung aus CLI/Env: `--mode` schlägt `SEPP_MODE`; ein ungültiger Env-Wert wird
+/// ignoriert (dann gelten Policy-Datei und Frontend-Default, siehe `BuiltinDefaults`).
+fn resolve_mode_override(flag: Option<Mode>, env: Option<&str>) -> Option<Mode> {
+    flag.or_else(|| env.and_then(|v| v.parse::<Mode>().ok()))
 }
 
 /// `SEPP_THINK`-Wert → optionaler Bool (Unbekanntes ⇒ `None`, damit der Default greift).
@@ -279,9 +308,12 @@ fn print_help() {
          \x20 sepp init                 Konfig-Skelett in ./.sepp anlegen (+ Projekt vertrauen)\n\
          \x20 sepp init --global        stattdessen in ~/.sepp (bzw. $SEPP_HOME)\n\
          \x20 sepp init --system        FHS-Layout: /etc/sepp (config) + /var/lib/sepp (state)\n\
+         \x20 sepp policy               Sepp Guard: effektive Rechte je Akteur samt Vollstrecker\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
+         \x20     --mode <m>            Sepp Guard: ask (TUI-Default) | auto (Default bei -p/--rpc)\n\
+         \x20                           | yolo (keine Sandbox für bash/read/write/edit)\n\
          \x20 -c, --continue            Jüngste Session des Projekts fortsetzen\n\
          \x20 -r, --resume [id]         Session per ID-Präfix wählen (ohne id: jüngste)\n\
          \x20 -m, --model <id>          Modell-ID (Default: {default})\n\
@@ -314,6 +346,7 @@ fn print_help() {
          \x20                           (Default https://api.moonshot.ai/v1)\n\
          \x20 SEPP_HOME                 globale Konfig-Wurzel verlegen (Default ~/.sepp)\n\
          \x20 SEPP_PROVIDER             Default-Provider, wenn --provider fehlt\n\
+         \x20 SEPP_MODE                 Guard-Modus (ask|auto|yolo), wenn --mode fehlt\n\
          \x20 SEPP_THINK                Default-Reasoning (on/off), wenn --think/--no-think fehlt\n\
          \x20 RUST_LOG                  Log-Level (One-shot/RPC; Logs nach stderr)",
         default = models::DEFAULT_MODEL_ID
@@ -345,6 +378,12 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # url = "https://mcp.example.com"
 # [mcp.servers.capabilities]
 # net = ["mcp.example.com"]
+#
+# Sepp Guard (globales Regelwerk, gleiche Grammatik wie policy.toml; `sepp policy` zeigt es):
+# [policy]
+# mode = "ask"
+# [policy.agent]
+# net = true
 "#;
 
 /// `sepp init [--global|--system]` — legt das Konfig-Skelett samt kommentierter Beispiel-
@@ -361,7 +400,23 @@ fn run_init(scope: session::InitScope) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = init_config_at(&config) {
+    // Projektlokal: Projekttyp erkennen (Cargo.toml, package.json, pyproject.toml) und das
+    // passende Guard-Preset in policy.toml aktivieren — sonst könnte der Agent z. B. `cargo`
+    // aus ~/.cargo/bin nicht einmal starten.
+    let preset = if scope == session::InitScope::Project {
+        let entries: Vec<String> = std::env::current_dir()
+            .and_then(std::fs::read_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        policy_cmd::select_preset(&entries)
+    } else {
+        None
+    };
+    if let Err(e) = init_config_at(&config, preset) {
         eprintln!("Fehler: {e}");
         return ExitCode::FAILURE;
     }
@@ -405,10 +460,12 @@ fn run_init(scope: session::InitScope) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Erzeugt das **Config**-Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`) und eine kommentierte
-/// `settings.toml` unterhalb `root`; vorhandene Pfade bleiben unverändert. Die Subdir-Namen müssen
-/// **exakt** den Lese-Literalen in `session.rs` entsprechen, sonst wird das Angelegte nie gelesen.
-fn init_config_at(root: &Path) -> anyhow::Result<()> {
+/// Erzeugt das **Config**-Skelett (`skills/`, `prompts/`, `hooks/`, `plugins/`), eine kommentierte
+/// `settings.toml` und eine kommentierte `policy.toml` (Sepp Guard; mit `preset` aktiviertem
+/// `[agent]`-Abschnitt) unterhalb `root`; vorhandene Pfade bleiben unverändert. Die Subdir-Namen
+/// müssen **exakt** den Lese-Literalen in `session.rs` entsprechen, sonst wird das Angelegte nie
+/// gelesen.
+fn init_config_at(root: &Path, preset: Option<policy_cmd::Preset>) -> anyhow::Result<()> {
     ensure_dir(root)?;
     for sub in ["skills", "prompts", "hooks", "plugins"] {
         ensure_dir(&root.join(sub))?;
@@ -419,6 +476,20 @@ fn init_config_at(root: &Path) -> anyhow::Result<()> {
     } else {
         std::fs::write(&settings, SETTINGS_TEMPLATE)?;
         println!("angelegt: {}", settings.display());
+    }
+    let policy = root.join("policy.toml");
+    if policy.exists() {
+        println!("übersprungen (existiert): {}", policy.display());
+    } else {
+        std::fs::write(&policy, policy_cmd::policy_template(preset))?;
+        println!(
+            "angelegt: {}{}",
+            policy.display(),
+            match preset {
+                Some(p) => format!(" (Preset {p:?} aktiviert)"),
+                None => String::new(),
+            }
+        );
     }
     Ok(())
 }
@@ -816,8 +887,88 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .unwrap_or_else(|| default_max_tokens(&model));
     // `store` wurde bereits vor den Key-Checks gebaut (Audit jeden Start).
 
-    // Tier 0: Resources (Skills → System-Prompt, Prompt-Templates → Slash-Commands).
     let trusted = session::is_project_trusted().unwrap_or(false);
+
+    // Sepp Guard: Regelwerk laden, Sandbox prüfen (fail-closed), Entscheider bauen. Die
+    // Policy-Menge wird auch ohne Guard gebraucht (MCP-/Plugin-Gewährungen gelten immer).
+    let policy_sources = session::policy_paths(trusted)?;
+    let guard_defaults = BuiltinDefaults {
+        extra_deny: session::builtin_deny_roots()?,
+        default_mode: if interactive { Mode::Ask } else { Mode::Auto },
+    };
+    let mode_override = resolve_mode_override(opts.mode, env_nonempty("SEPP_MODE").as_deref());
+    let policy_set = load_policy_set(
+        &policy_sources,
+        &guard_defaults,
+        mode_override,
+        &ResolveCtx::from_env(),
+    )?;
+    let sandbox_caps = kernel_capabilities();
+    let guard: Option<Arc<Guard>> = if policy_set.mode == Mode::Yolo {
+        startup_notice(
+            "Sepp Guard AUS (--mode yolo): bash, read, write und edit laufen ohne Sandbox und \
+             ohne Pfadgrenze."
+                .to_string(),
+        );
+        None
+    } else {
+        if !sandbox_caps.fs_enforceable {
+            let msg = format!(
+                "Sandbox nicht durchsetzbar: {}.\n  \
+                 Der Agent startet nicht ohne Schutz (fail-closed). Bewusst ohne Sandbox: --mode yolo",
+                sandbox_caps.detail
+            );
+            return Err(abort_with_audit(
+                store.as_mut(),
+                &msg,
+                serde_json::json!({ "reason": "sandbox_unenforceable", "detail": sandbox_caps.detail }),
+            )
+            .await);
+        }
+        let sandbox = default_sandbox();
+        if let Err(e) = probe_sandbox(sandbox.as_ref()).await {
+            let msg = format!(
+                "Sandbox-Probe fehlgeschlagen: {e}\n  \
+                 Der Agent startet nicht ohne Schutz (fail-closed). Bewusst ohne Sandbox: --mode yolo"
+            );
+            return Err(abort_with_audit(
+                store.as_mut(),
+                &msg,
+                serde_json::json!({ "reason": "sandbox_probe_failed", "detail": e.to_string() }),
+            )
+            .await);
+        }
+        if !sandbox_caps.net_enforceable {
+            startup_notice(format!(
+                "Hinweis: Netz-Sperre für Kindprozesse nicht durchsetzbar ({}) — bash und \
+                 MCP-Server haben Netzzugriff.",
+                sandbox_caps.detail
+            ));
+        }
+        for o in policy_set.deny_overlaps(&Actor::Agent) {
+            startup_notice(format!(
+                "Hinweis: Verbot {} liegt unter der Gewährung {} — für bash nicht durchsetzbar \
+                 (Landlock ist additiv); read/write/edit halten es ein.",
+                o.deny.display(),
+                o.grant.display()
+            ));
+        }
+        for w in &policy_set.warnings {
+            startup_notice(format!("Policy: {w}"));
+        }
+        if policy_set.mode == Mode::Ask {
+            startup_notice(
+                "Sepp Guard: Modus ask — der Nachfrage-Dialog folgt; außerhalb der Policy wird \
+                 vorerst verweigert (Rechte: sepp policy)."
+                    .to_string(),
+            );
+        }
+        Some(Arc::new(
+            Guard::new(policy_set.clone(), sandbox).with_hint_file(session::project_policy_path()?),
+        ))
+    };
+
+    // Tier 0: Resources (Skills → System-Prompt, Prompt-Templates → Slash-Commands).
     let resources = ResourceSet::load(&session::resource_roots(trusted)?);
     let system = format!("{SYSTEM_PROMPT}{}", resources.system_prompt_addition());
 
@@ -832,15 +983,24 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // Tier 3: MCP-Server (built-in + MCP in EINEM Toolset; Namens-Präfix bei Kollision).
     // Connects laufen NEBENLÄUFIG (join_all), jeder zeitlich begrenzt — ein hängender Server
     // verzögert so höchstens um ein Timeout, nicht um die Summe aller Timeouts (Cold-Start).
-    let mut tools = builtin_tools();
+    let mut tools = builtin_tools_with(guard.clone());
     let mut taken: HashSet<String> = tools.iter().map(|t| t.spec().name).collect();
     let connect_timeout = std::time::Duration::from_secs(20);
     let mcp_configs = sepp_mcp::load_settings(&session::settings_paths(trusted)?)?;
-    let mcp_results = futures::future::join_all(mcp_configs.iter().map(|cfg| async move {
-        (
-            cfg.name.clone(),
-            tokio::time::timeout(connect_timeout, sepp_mcp::connect(cfg)).await,
-        )
+    let deny_rules = policy_set.deny_rules();
+    let mcp_results = futures::future::join_all(mcp_configs.iter().map(|cfg| {
+        // Sepp Guard: Legacy-Deklaration ∪ [mcp.<name>] aus der Policy-Datei, minus Verbote.
+        let policy = sepp_mcp::policy_from_config(cfg)
+            .union(&policy_set.policy_for(&Actor::Mcp(cfg.name.clone())))
+            .without_denied(&deny_rules)
+            .0;
+        async move {
+            (
+                cfg.name.clone(),
+                tokio::time::timeout(connect_timeout, sepp_mcp::connect_with_policy(cfg, &policy))
+                    .await,
+            )
+        }
     }))
     .await;
     // Ergebnisse sequenziell auswerten → deterministische Namens-Vergabe in Config-Reihenfolge.
@@ -859,11 +1019,18 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         }
     }
 
-    // Tier 2: WASM-Plugins (capability-gated; Namens-Präfix `wasm__` bei Kollision).
+    // Tier 2: WASM-Plugins (capability-gated; Namens-Präfix `wasm__` bei Kollision). Mit
+    // Gewährung aus [plugin.<name>] gilt der Schnitt aus Manifest und Gewährung.
     let wasm_host = sepp_wasm::WasmHost::new();
     let mut n_wasm = 0usize;
+    let grant_for = |name: &str| {
+        let actor = Actor::Plugin(name.to_string());
+        policy_set
+            .has_entries(&actor)
+            .then(|| policy_set.policy_for(&actor))
+    };
     for dir in session::plugin_dirs(trusted)? {
-        for mut plugin in wasm_host.discover(&dir) {
+        for mut plugin in wasm_host.discover_with(&dir, &grant_for) {
             let exposed = sepp_mcp::resolve_name(&taken, "wasm", &plugin.spec().name);
             taken.insert(exposed.clone());
             plugin.rename(exposed);
@@ -876,9 +1043,9 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     }
 
     // Phase 4: nativer Sub-Agent als Tool (`task`) — isolierter Kontext, eigenes (read/write/
-    // edit/bash) Toolset, kein eigener `task` (keine Rekursion).
+    // edit/bash) Toolset unter demselben Guard, kein eigener `task` (keine Rekursion).
     let sub = SubAgentTool::new(Arc::clone(&provider), model.clone())
-        .tools(builtin_tools())
+        .tools(builtin_tools_with(guard.clone()))
         .max_tokens(max_tokens)
         .thinking(thinking);
     let sub_name = sepp_mcp::resolve_name(&taken, "agent", &sub.spec().name);
@@ -1378,7 +1545,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join(".sepp");
 
-        init_config_at(&root).unwrap();
+        init_config_at(&root, None).unwrap();
         let settings = root.join("settings.toml");
         let first = std::fs::read_to_string(&settings).unwrap();
         for sub in ["skills", "prompts", "hooks", "plugins"] {
@@ -1390,10 +1557,85 @@ mod tests {
             "sessions/ ist config-only nicht hier"
         );
         assert!(!root.join(".gitignore").exists(), "keine .gitignore mehr");
+        // Sepp Guard: policy.toml wird angelegt und parst zu „keine Änderung".
+        let policy = root.join("policy.toml");
+        let policy_text = std::fs::read_to_string(&policy).unwrap();
+        assert_eq!(
+            sepp_policy::PolicyFile::parse(&policy_text).unwrap(),
+            sepp_policy::PolicyFile::default()
+        );
 
-        // Zweiter Lauf: kein Fehler, settings.toml unverändert (Nutzerinhalt wird nie überschrieben).
-        init_config_at(&root).unwrap();
+        // Zweiter Lauf (mit Preset): kein Fehler, settings.toml und policy.toml unverändert
+        // (Nutzerinhalt wird nie überschrieben).
+        init_config_at(&root, Some(policy_cmd::Preset::Rust)).unwrap();
         assert_eq!(first, std::fs::read_to_string(&settings).unwrap());
+        assert_eq!(policy_text, std::fs::read_to_string(&policy).unwrap());
+    }
+
+    #[test]
+    fn init_config_activates_preset_in_fresh_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".sepp");
+        init_config_at(&root, Some(policy_cmd::Preset::Rust)).unwrap();
+        let f = sepp_policy::PolicyFile::parse(
+            &std::fs::read_to_string(root.join("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        let agent = f.agent.expect("Preset setzt [agent]");
+        assert_eq!(agent.grants.net, sepp_policy::NetGrant::All);
+        assert!(agent.grants.fs_read.iter().any(|p| p == "~/.cargo"));
+    }
+
+    #[test]
+    fn parse_mode_flag_and_rejects_unknown() {
+        let auto = parse(&args(&["--mode", "auto", "-p", "x"])).unwrap();
+        assert!(matches!(
+            auto,
+            Cmd::Run(RunOpts {
+                mode: Some(Mode::Auto),
+                ..
+            })
+        ));
+        let yolo = parse(&args(&["--mode", "YOLO", "-p", "x"])).unwrap();
+        assert!(matches!(
+            yolo,
+            Cmd::Run(RunOpts {
+                mode: Some(Mode::Yolo),
+                ..
+            })
+        ));
+        let none = parse(&args(&["-p", "x"])).unwrap();
+        assert!(matches!(none, Cmd::Run(RunOpts { mode: None, .. })));
+        assert!(parse(&args(&["--mode", "egal", "-p", "x"])).is_err());
+        assert!(parse(&args(&["--mode"])).is_err());
+    }
+
+    #[test]
+    fn resolve_mode_override_precedence() {
+        assert_eq!(resolve_mode_override(None, None), None);
+        assert_eq!(resolve_mode_override(None, Some("auto")), Some(Mode::Auto));
+        assert_eq!(
+            resolve_mode_override(Some(Mode::Yolo), Some("auto")),
+            Some(Mode::Yolo)
+        );
+        // Ungültiger Env-Wert wird ignoriert (Datei/Default greifen).
+        assert_eq!(resolve_mode_override(None, Some("vielleicht")), None);
+    }
+
+    #[test]
+    fn parse_policy_subcommand_only_first_arg() {
+        assert!(matches!(
+            parse(&args(&["policy"])).unwrap(),
+            Cmd::Policy(policy_cmd::PolicyCmd::Show)
+        ));
+        assert!(matches!(
+            parse(&args(&["policy", "allow", "agent", "net", "true"])).unwrap(),
+            Cmd::Policy(policy_cmd::PolicyCmd::Allow(v)) if v.len() == 3
+        ));
+        assert!(parse(&args(&["policy", "bogus"])).is_err());
+        // Nicht erstes Token → Prompt.
+        let cmd = parse(&args(&["-p", "policy"])).unwrap();
+        assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "policy"));
     }
 
     #[test]

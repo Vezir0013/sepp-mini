@@ -25,6 +25,7 @@ sepp-provider = { path = "../sepp-provider", features = [
     "moonshot",
 ] }
 sepp-tools = { path = "../sepp-tools" }
+sepp-policy = { path = "../sepp-policy" }
 sepp-agent = { path = "../sepp-agent" }
 sepp-session = { path = "../sepp-session" }
 sepp-hooks = { path = "../sepp-hooks" }

@@ -1846,6 +1846,7 @@ dependencies = [
  "sepp-core",
  "sepp-hooks",
  "sepp-mcp",
+ "sepp-policy",
  "sepp-provider",
  "sepp-session",
  "sepp-tools",
@@ -1902,6 +1903,7 @@ dependencies = [
 name = "sepp-policy"
 version = "0.1.17"
 dependencies = [
+ "async-trait",
  "landlock",
  "sepp-core",
  "serde",
@@ -1952,6 +1954,7 @@ dependencies = [
  "libc",
  "schemars",
  "sepp-core",
+ "sepp-policy",
  "serde",
  "serde_json",
  "tempfile",
