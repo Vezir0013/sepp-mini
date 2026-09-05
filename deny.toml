@@ -10,6 +10,9 @@ yanked = "deny"
 ignore = [
     # paste: unmaintained (kein Code-Defekt, kein sicheres Upgrade); nur transitiv via ratatui (TUI).
     "RUSTSEC-2024-0436",
+    # smartstring: unmaintained seit 2026-05 (Repo archiviert; kein Code-Defekt, kein sicheres
+    # Upgrade); nur transitiv via rhai (Hooks). Beobachten, ob rhai auf compact_str/smol_str wechselt.
+    "RUSTSEC-2026-0249",
 ]
 
 [licenses]
