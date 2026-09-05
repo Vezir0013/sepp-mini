@@ -24,7 +24,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,7 @@ use sepp_agent::resources::ResourceSet;
 use sepp_agent::{AgentEvent, AgentSession};
 use sepp_core::{ContentBlock, Message, Role, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
+use sepp_policy::{Guard, PermissionAnswer, PermissionPrompter, PermissionRequest};
 use sepp_provider::models;
 use sepp_session::{SessionInfo, SessionStore};
 
@@ -53,15 +54,59 @@ struct DisplayMsg {
     text: String,
 }
 
+#[derive(Debug, PartialEq)]
 enum Mode {
     Chat,
     Tree,
     Resume,
+    /// Rückfrage von Sepp Guard (Modus `ask`) — blockiert den fragenden Tool-Aufruf, der
+    /// laufende Turn geht weiter.
+    Permission,
 }
 
 enum UiMsg {
     Agent(AgentEvent),
     Done(Option<String>),
+    /// Sepp Guard fragt nach; die Antwort geht über den `oneshot` zurück an das wartende Tool.
+    Permission(PermissionRequest, oneshot::Sender<PermissionAnswer>),
+}
+
+/// Die vier Antworten des Dialogs, in Anzeigereihenfolge (Taste, Beschriftung, Antwort).
+const PERMISSION_CHOICES: &[(char, &str, PermissionAnswer)] = &[
+    ('e', "einmal erlauben", PermissionAnswer::Once),
+    ('s', "für diese Sitzung erlauben", PermissionAnswer::Session),
+    (
+        'd',
+        "dauerhaft erlauben (schreibt in policy.toml)",
+        PermissionAnswer::Always,
+    ),
+    ('n', "ablehnen", PermissionAnswer::No),
+];
+
+/// Eine offene Rückfrage samt Antwortkanal.
+struct PendingPermission {
+    req: PermissionRequest,
+    reply: oneshot::Sender<PermissionAnswer>,
+    selected: usize,
+}
+
+/// [`PermissionPrompter`] der TUI: schickt die Anfrage in die Ereignisschleife und wartet auf
+/// die Antwort. Läuft im Tool-Task — der Prompt-Task hält dabei den Session-Mutex, deshalb darf
+/// der Dialog in der UI **niemals** die Session locken.
+struct TuiPrompter {
+    tx: mpsc::UnboundedSender<UiMsg>,
+}
+
+#[async_trait::async_trait]
+impl PermissionPrompter for TuiPrompter {
+    async fn ask(&self, req: PermissionRequest) -> PermissionAnswer {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(UiMsg::Permission(req, tx)).is_err() {
+            return PermissionAnswer::No;
+        }
+        // Kanal geschlossen (Ctrl+C, UI beendet) ⇒ ablehnen, nie stillschweigend erlauben.
+        rx.await.unwrap_or(PermissionAnswer::No)
+    }
 }
 
 /// Sendet beim Drop ein `Done`, falls nicht entschärft — so bleibt die UI nie im Zustand
@@ -199,6 +244,11 @@ struct App {
     /// nächsten Nutzeraktion (start_prompt/start_compact bzw. Kontextwechsel leeren sie).
     notices: Vec<DisplayMsg>,
     tx: mpsc::UnboundedSender<UiMsg>,
+    /// Offene Guard-Rückfragen (Tools laufen parallel — es können mehrere anstehen).
+    /// Die vorderste wird angezeigt; nach der Antwort rückt die nächste nach.
+    permissions: VecDeque<PendingPermission>,
+    /// Guard der Session — liefert die Meldungen nach „dauerhaft erlauben".
+    guard: Option<Arc<Guard>>,
 }
 
 /// Startet die TUI und blockiert, bis der Nutzer beendet. `startup_notices` sind Hinweise aus
@@ -206,6 +256,7 @@ struct App {
 /// erscheinen müssen — ein eprintln verpufft hinter dem Alternate-Screen. `provider_kind` ist
 /// der aufgelöste CLI-Provider-String — `provider_name()` reicht nicht, weil sich
 /// `--provider local` dort als `"openai"` meldet (siehe [`App::provider_kind`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     agent: AgentSession,
     prompt_templates: Vec<(String, String)>,
@@ -213,6 +264,7 @@ pub async fn run(
     show_thinking: bool,
     startup_notices: Vec<String>,
     provider_kind: String,
+    guard: Option<Arc<Guard>>,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -221,6 +273,11 @@ pub async fn run(
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // Rückfrage-Kanal erst jetzt setzen: der Guard steckt seit dem CLI-Start in den Tools,
+    // den mpsc-Sender gibt es aber erst hier.
+    if let Some(g) = &guard {
+        g.set_prompter(Arc::new(TuiPrompter { tx: tx.clone() }));
+    }
     let mut app = App::new(
         Arc::new(Mutex::new(agent)),
         tx,
@@ -229,6 +286,7 @@ pub async fn run(
         show_thinking,
         provider_kind,
     );
+    app.guard = guard;
     app.rebuild_transcript().await;
     // Start-Hinweise als Notices (nicht ins Transcript): rebuild_transcript baut den Verlauf
     // bei jedem Turn-Ende aus den Session-Messages neu — dort eingefügte Zeilen verschwänden
@@ -348,6 +406,8 @@ impl App {
             should_quit: false,
             notices: Vec::new(),
             tx,
+            permissions: VecDeque::new(),
+            guard: None,
         }
     }
 
@@ -413,6 +473,7 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+            self.reject_all_permissions();
             if let Some(c) = self.cancel.take() {
                 c.cancel();
             }
@@ -423,6 +484,88 @@ impl App {
             Mode::Chat => self.on_chat_key(k.code).await,
             Mode::Tree => self.on_tree_key(k.code).await,
             Mode::Resume => self.on_resume_key(k.code).await,
+            Mode::Permission => self.on_permission_key(k.code),
+        }
+    }
+
+    /// Tastenbelegung des Rückfrage-Dialogs: Direkttasten `e`/`s`/`d`/`n`, dazu ↑/↓ + Enter wie
+    /// in `/tree` und `/resume`; Esc lehnt ab. Lockt bewusst NICHT die Session (der Prompt-Task
+    /// hält den Mutex, solange das fragende Tool wartet).
+    fn on_permission_key(&mut self, code: KeyCode) {
+        let Some(p) = self.permissions.front_mut() else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        let answer = match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.selected = p.selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.selected = (p.selected + 1).min(PERMISSION_CHOICES.len() - 1);
+                return;
+            }
+            KeyCode::Enter => PERMISSION_CHOICES[p.selected].2,
+            KeyCode::Esc => PermissionAnswer::No,
+            KeyCode::Char(c) => {
+                match PERMISSION_CHOICES
+                    .iter()
+                    .find(|(key, _, _)| *key == c.to_ascii_lowercase())
+                {
+                    Some((_, _, a)) => *a,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        self.answer_permission(answer);
+    }
+
+    /// Beantwortet die vorderste Rückfrage, meldet das Ergebnis und zeigt die nächste an.
+    fn answer_permission(&mut self, answer: PermissionAnswer) {
+        let Some(p) = self.permissions.pop_front() else {
+            self.mode = Mode::Chat;
+            return;
+        };
+        let label = PERMISSION_CHOICES
+            .iter()
+            .find(|(_, _, a)| *a == answer)
+            .map(|(_, l, _)| *l)
+            .unwrap_or("beantwortet");
+        // Empfänger weg (Tool abgebrochen) ist kein Fehler — dann galt bereits „abgelehnt".
+        let _ = p.reply.send(answer);
+        if answer == PermissionAnswer::No {
+            self.notify_error(format!("{}: {label}", p.req.action));
+        } else {
+            self.notify(format!("{}: {label}", p.req.action));
+        }
+        // Meldungen des Guards (z. B. „dauerhaft in policy.toml eingetragen") nachreichen.
+        for note in self
+            .guard
+            .as_ref()
+            .map(|g| g.take_notices())
+            .unwrap_or_default()
+        {
+            self.notices.push(DisplayMsg {
+                kind: Kind::Info,
+                text: note,
+            });
+        }
+        self.scroll_back = 0;
+        self.mode = if self.permissions.is_empty() {
+            Mode::Chat
+        } else {
+            Mode::Permission
+        };
+    }
+
+    /// Lehnt alle offenen Rückfragen ab (Turn-Ende, Abbruch, Beenden).
+    fn reject_all_permissions(&mut self) {
+        while let Some(p) = self.permissions.pop_front() {
+            let _ = p.reply.send(PermissionAnswer::No);
+        }
+        if self.mode == Mode::Permission {
+            self.mode = Mode::Chat;
         }
     }
 
@@ -435,6 +578,7 @@ impl App {
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Esc => {
                 if let Some(c) = self.cancel.take() {
+                    self.reject_all_permissions();
                     c.cancel();
                     self.activity = Activity::Cancelling;
                 } else {
@@ -688,6 +832,36 @@ impl App {
                 }
                 Err(e) => self.notify_error(format!("/trust: {e}")),
             },
+            "policy" => {
+                // Volle Tabelle als Notices unter dem Verlauf — `sepp policy` zeigt dasselbe
+                // im Terminal. Ohne Guard (--mode yolo) gibt es nichts durchzusetzen.
+                match &self.guard {
+                    Some(g) => {
+                        let caps = sepp_policy::kernel_capabilities();
+                        let cwd = std::env::current_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "?".into());
+                        let trusted = session::is_project_trusted().unwrap_or(false);
+                        let table = crate::policy_cmd::render_policy_table(
+                            g.policy_set(),
+                            &caps,
+                            &[],
+                            &cwd,
+                            trusted,
+                        );
+                        self.notices.clear();
+                        for line in table.lines() {
+                            self.notices.push(DisplayMsg {
+                                kind: Kind::Info,
+                                text: line.to_string(),
+                            });
+                        }
+                        self.scroll_back = 0;
+                        self.notify("Regelwerk unten · Details: sepp policy");
+                    }
+                    None => self.notify("Sepp Guard ist aus (--mode yolo) — keine Rechte-Grenzen"),
+                }
+            }
             "reload" => {
                 if let Some(summary) = self.reload_resources().await {
                     self.notify(summary);
@@ -893,7 +1067,19 @@ impl App {
     async fn on_ui_msg(&mut self, msg: UiMsg) {
         match msg {
             UiMsg::Agent(ev) => self.on_agent_event(ev),
+            UiMsg::Permission(req, reply) => {
+                self.permissions.push_back(PendingPermission {
+                    req,
+                    reply,
+                    selected: 0,
+                });
+                self.mode = Mode::Permission;
+                self.scroll_back = 0;
+            }
             UiMsg::Done(err) => {
+                // Ein Turn kann nicht enden, solange ein Tool auf eine Antwort wartet; sollte
+                // doch etwas offen sein (Abbruch), gilt „abgelehnt".
+                self.reject_all_permissions();
                 self.finalize_streaming();
                 self.running = false;
                 self.cancel = None;
@@ -1033,6 +1219,11 @@ impl App {
                     self.resume_sel,
                 );
             }
+            Mode::Permission => match self.permissions.front() {
+                Some(p) => render_permission(f, area, p, self.permissions.len()),
+                // Kann nur nach einem Abbruch auftreten — dann zurück in den Chat.
+                None => self.render_chat(f, area),
+            },
         }
     }
 
@@ -1151,6 +1342,56 @@ fn styled(m: &DisplayMsg) -> (String, Style) {
     }
 }
 
+/// Rückfrage von Sepp Guard: worum es geht, warum gefragt wird, und die vier Antworten.
+/// Reine Anzeige — die Entscheidung trifft [`App::on_permission_key`].
+fn render_permission(f: &mut Frame, area: Rect, p: &PendingPermission, open: usize) {
+    let title = if open > 1 {
+        format!("Berechtigung — Sepp Guard  ({open} offen)")
+    } else {
+        "Berechtigung — Sepp Guard".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("Akteur  ", dim),
+            Span::raw(p.req.actor.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Aktion  ", dim),
+            Span::styled(
+                p.req.action.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Grund   ", dim),
+            Span::raw(p.req.reason.clone()),
+        ]),
+        Line::from(""),
+    ];
+    for (i, (key, label, _)) in PERMISSION_CHOICES.iter().enumerate() {
+        let style = if i == p.selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("  [{key}]  {label}"), style));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  ↑/↓ wählen · Enter bestätigen · Esc oder [n] ablehnen",
+        dim,
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_list(f: &mut Frame, area: Rect, title: &str, items: &[String], selected: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1180,7 +1421,7 @@ fn short_id(id: &str) -> String {
 /// synchron bleiben. Grundlage der Kollisionswarnung beim Laden der Prompt-Templates.
 const BUILTIN_COMMANDS: &[&str] = &[
     "quit", "exit", "q", "help", "h", "new", "model", "think", "compact", "tree", "resume",
-    "trust", "reload", "hide", "show",
+    "trust", "reload", "hide", "show", "policy",
 ];
 
 /// Namen der Templates, die ein Builtin-Kommando verschatten würden — der Builtin gewinnt
@@ -2094,6 +2335,146 @@ mod tests {
         assert_eq!(cursor_x(area, 5), 8);
         // ~70k Zeichen (Paste): kein u16-Overflow-Panic, Clamp auf die rechte Innenkante.
         assert_eq!(cursor_x(area, 70_000), 79);
+    }
+
+    // ---- Sepp Guard: Rückfrage-Dialog ------------------------------------------------------
+
+    fn permission_request(action: &str) -> PermissionRequest {
+        PermissionRequest {
+            actor: sepp_policy::Actor::Agent,
+            action: action.to_string(),
+            reason: "außerhalb der Policy".to_string(),
+        }
+    }
+
+    /// Stellt eine Rückfrage in die App (wie es `UiMsg::Permission` täte) und liefert den
+    /// Empfänger der Antwort.
+    fn push_permission(app: &mut App, action: &str) -> oneshot::Receiver<PermissionAnswer> {
+        let (tx, rx) = oneshot::channel();
+        app.permissions.push_back(PendingPermission {
+            req: permission_request(action),
+            reply: tx,
+            selected: 0,
+        });
+        app.mode = Mode::Permission;
+        rx
+    }
+
+    #[tokio::test]
+    async fn permission_request_switches_mode_and_queues() {
+        let mut app = test_app();
+        let (tx1, _rx1) = oneshot::channel();
+        app.on_ui_msg(UiMsg::Permission(permission_request("schreiben /a"), tx1))
+            .await;
+        assert_eq!(app.mode, Mode::Permission);
+        assert_eq!(app.permissions.len(), 1);
+        // Zweite Anfrage (Tools laufen parallel) reiht sich ein, statt die erste zu verdrängen.
+        let (tx2, _rx2) = oneshot::channel();
+        app.on_ui_msg(UiMsg::Permission(permission_request("schreiben /b"), tx2))
+            .await;
+        assert_eq!(app.permissions.len(), 2);
+        assert_eq!(app.permissions.front().unwrap().req.action, "schreiben /a");
+    }
+
+    #[tokio::test]
+    async fn permission_direct_keys_answer_and_close() {
+        for (key, expected) in [
+            ('e', PermissionAnswer::Once),
+            ('s', PermissionAnswer::Session),
+            ('d', PermissionAnswer::Always),
+            ('n', PermissionAnswer::No),
+        ] {
+            let mut app = test_app();
+            let mut rx = push_permission(&mut app, "schreiben /x");
+            app.on_permission_key(KeyCode::Char(key));
+            assert_eq!(rx.try_recv(), Ok(expected), "Taste {key}");
+            assert_eq!(app.mode, Mode::Chat);
+            assert!(app.permissions.is_empty());
+            // Jede Antwort erzeugt sichtbares Feedback.
+            assert!(app.message.is_some(), "Taste {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_arrow_keys_select_and_enter_confirms() {
+        let mut app = test_app();
+        let mut rx = push_permission(&mut app, "lesen /x");
+        app.on_permission_key(KeyCode::Down); // → Sitzung
+        app.on_permission_key(KeyCode::Down); // → dauerhaft
+        app.on_permission_key(KeyCode::Up); // zurück → Sitzung
+        assert_eq!(app.permissions.front().unwrap().selected, 1);
+        app.on_permission_key(KeyCode::Enter);
+        assert_eq!(rx.try_recv(), Ok(PermissionAnswer::Session));
+
+        // Auswahl ist am oberen/unteren Rand geklemmt.
+        let mut app = test_app();
+        let mut rx = push_permission(&mut app, "lesen /y");
+        app.on_permission_key(KeyCode::Up);
+        for _ in 0..10 {
+            app.on_permission_key(KeyCode::Down);
+        }
+        assert_eq!(
+            app.permissions.front().unwrap().selected,
+            PERMISSION_CHOICES.len() - 1
+        );
+        app.on_permission_key(KeyCode::Enter);
+        assert_eq!(rx.try_recv(), Ok(PermissionAnswer::No));
+    }
+
+    #[tokio::test]
+    async fn permission_esc_rejects_and_unknown_key_is_noop() {
+        let mut app = test_app();
+        let mut rx = push_permission(&mut app, "bash: rm -rf x");
+        app.on_permission_key(KeyCode::Char('z'));
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        assert_eq!(app.mode, Mode::Permission);
+        app.on_permission_key(KeyCode::Esc);
+        assert_eq!(rx.try_recv(), Ok(PermissionAnswer::No));
+        assert_eq!(app.mode, Mode::Chat);
+    }
+
+    #[tokio::test]
+    async fn permission_queue_advances_to_next_request() {
+        let mut app = test_app();
+        let mut rx1 = push_permission(&mut app, "schreiben /a");
+        let mut rx2 = push_permission(&mut app, "schreiben /b");
+        app.on_permission_key(KeyCode::Char('e'));
+        assert_eq!(rx1.try_recv(), Ok(PermissionAnswer::Once));
+        // Zweite Anfrage bleibt im Dialog stehen.
+        assert_eq!(app.mode, Mode::Permission);
+        assert_eq!(app.permissions.front().unwrap().req.action, "schreiben /b");
+        app.on_permission_key(KeyCode::Char('n'));
+        assert_eq!(rx2.try_recv(), Ok(PermissionAnswer::No));
+        assert_eq!(app.mode, Mode::Chat);
+    }
+
+    #[tokio::test]
+    async fn turn_end_and_quit_reject_open_permissions() {
+        // Turn-Ende: offene Rückfragen gelten als abgelehnt (nie stillschweigend erlauben).
+        let mut app = test_app();
+        let mut rx = push_permission(&mut app, "schreiben /a");
+        app.on_ui_msg(UiMsg::Done(None)).await;
+        assert_eq!(rx.try_recv(), Ok(PermissionAnswer::No));
+        assert_eq!(app.mode, Mode::Chat);
+
+        // Ctrl+C ebenso.
+        let mut app = test_app();
+        let mut rx = push_permission(&mut app, "schreiben /b");
+        app.on_term_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        assert_eq!(rx.try_recv(), Ok(PermissionAnswer::No));
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn policy_command_without_guard_reports_yolo() {
+        let mut app = test_app();
+        assert!(app.handle_command("policy").await);
+        let msg = app.message.as_ref().expect("Meldung");
+        assert!(msg.text.contains("yolo"), "{}", msg.text);
     }
 
     #[test]

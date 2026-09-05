@@ -309,6 +309,8 @@ fn print_help() {
          \x20 sepp init --global        stattdessen in ~/.sepp (bzw. $SEPP_HOME)\n\
          \x20 sepp init --system        FHS-Layout: /etc/sepp (config) + /var/lib/sepp (state)\n\
          \x20 sepp policy               Sepp Guard: effektive Rechte je Akteur samt Vollstrecker\n\
+         \x20 sepp policy allow …       Recht eintragen, z. B. `allow agent fs_write ~/.cache`\n\
+         \x20                           (mit --global in die globale policy.toml)\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -329,8 +331,8 @@ fn print_help() {
          \x20     --sqlite              SQLite-Session-Backend (nur -p/--rpc; Feature 'sqlite')\n\
          \x20 -h, --help                Diese Hilfe\n\
          \x20 -V, --version             Version\n\n\
-         TUI-Befehle: /new /resume /tree /compact /model [id] /think [on|off] /trust /reload\n\
-         \x20            /hide /show /quit\n\
+         TUI-Befehle: /new /resume /tree /compact /model [id] /think [on|off] /policy /trust\n\
+         \x20            /reload /hide /show /quit\n\
          \x20            (plus /<name> für Prompt-Templates aus ~/.sepp/prompts)\n\n\
          Umgebung:\n\
          \x20 ANTHROPIC_API_KEY         Pflicht für Anthropic-Live-Aufrufe\n\
@@ -897,12 +899,21 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         default_mode: if interactive { Mode::Ask } else { Mode::Auto },
     };
     let mode_override = resolve_mode_override(opts.mode, env_nonempty("SEPP_MODE").as_deref());
-    let policy_set = load_policy_set(
+    let mut policy_set = load_policy_set(
         &policy_sources,
         &guard_defaults,
         mode_override,
         &ResolveCtx::from_env(),
     )?;
+    // Ohne Terminal gibt es niemanden zu fragen: `ask` (aus Datei oder --mode) würde jede
+    // Aktion außerhalb der Policy verweigern. Deshalb bei -p/--rpc auf `auto` zurückfallen.
+    if !interactive && policy_set.mode == Mode::Ask {
+        policy_set.mode = Mode::Auto;
+        startup_notice(
+            "Hinweis: Modus ask braucht die TUI (Rückfrage-Dialog) — bei -p/--rpc gilt auto."
+                .to_string(),
+        );
+    }
     let sandbox_caps = kernel_capabilities();
     let guard: Option<Arc<Guard>> = if policy_set.mode == Mode::Yolo {
         startup_notice(
@@ -958,13 +969,14 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         }
         if policy_set.mode == Mode::Ask {
             startup_notice(
-                "Sepp Guard: Modus ask — der Nachfrage-Dialog folgt; außerhalb der Policy wird \
-                 vorerst verweigert (Rechte: sepp policy)."
+                "Sepp Guard: Modus ask — außerhalb der Policy wird nachgefragt \
+                 (e einmal · s Sitzung · d dauerhaft · n nein). Rechte: sepp policy."
                     .to_string(),
             );
         }
         Some(Arc::new(
-            Guard::new(policy_set.clone(), sandbox).with_hint_file(session::project_policy_path()?),
+            Guard::new(policy_set.clone(), sandbox)
+                .with_policy_file(session::project_policy_path()?),
         ))
     };
 
@@ -1130,6 +1142,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 !opts.hide_thinking,
                 startup_notices,
                 provider_kind,
+                guard,
             )
             .await
         }

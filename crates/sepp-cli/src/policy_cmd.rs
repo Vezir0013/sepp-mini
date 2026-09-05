@@ -19,7 +19,7 @@ pub enum PolicyCmd {
     Allow(Vec<String>),
 }
 
-/// `sepp policy [show | allow <akteur> <recht> <wert>]`.
+/// `sepp policy [show | allow [--global] <akteur> <recht> <wert>]`.
 pub fn parse_policy_args(args: &[String]) -> Result<PolicyCmd, String> {
     match args.first().map(String::as_str) {
         None | Some("show") => Ok(PolicyCmd::Show),
@@ -28,6 +28,37 @@ pub fn parse_policy_args(args: &[String]) -> Result<PolicyCmd, String> {
             "policy: unbekannter Unterbefehl '{other}' (erlaubt: show, allow)"
         )),
     }
+}
+
+/// Zerlegt die `allow`-Argumente: optionales `--global`, dann Akteur, Recht, Wert.
+/// Reine Funktion (testbar ohne Dateisystem).
+pub fn parse_allow_args(args: &[String]) -> Result<(bool, Actor, String, String), String> {
+    let usage = "Verwendung: sepp policy allow [--global] <agent | mcp.<name> | plugin.<name>> \
+                 <fs_read | fs_write | net | env | exec> <wert>";
+    let mut global = false;
+    let mut rest: Vec<&String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--global" | "-g" => global = true,
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "policy allow: unbekannte Option '{other}'\n{usage}"
+                ))
+            }
+            _ => rest.push(a),
+        }
+    }
+    let [actor_raw, right, value] = rest.as_slice() else {
+        return Err(usage.to_string());
+    };
+    let actor = sepp_policy::policy_edit::parse_actor(actor_raw)
+        .ok_or_else(|| format!("policy allow: unbekannter Akteur '{actor_raw}'\n{usage}"))?;
+    if !sepp_policy::policy_edit::RIGHTS.contains(&right.as_str()) {
+        return Err(format!(
+            "policy allow: unbekanntes Recht '{right}'\n{usage}"
+        ));
+    }
+    Ok((global, actor, right.to_string(), value.to_string()))
 }
 
 /// Transport eines MCP-Servers — entscheidet über den Vollstrecker (`http` = kein Sandboxing).
@@ -48,13 +79,16 @@ pub struct ActorRow {
 
 pub fn run_policy(cmd: PolicyCmd) -> ExitCode {
     match cmd {
-        PolicyCmd::Allow(args) => {
-            println!(
-                "{}",
-                render_allow_hint(&args, session::project_policy_path().ok().as_deref())
-            );
-            ExitCode::SUCCESS
-        }
+        PolicyCmd::Allow(args) => match run_allow(&args) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("Fehler: {e}");
+                ExitCode::from(2)
+            }
+        },
         PolicyCmd::Show => match show() {
             Ok(s) => {
                 println!("{s}");
@@ -487,38 +521,44 @@ pub fn render_policy_table(
     out
 }
 
-/// Hinweis-Stub für `sepp policy allow <akteur> <recht> <wert>`: nennt Datei und TOML-Schnipsel,
-/// bis der Befehl selbst schreibt (Phase 2).
-pub fn render_allow_hint(args: &[String], project_policy: Option<&Path>) -> String {
-    let usage = "Verwendung: sepp policy allow <agent | mcp.<name> | plugin.<name>> <fs_read | fs_write | net | env | exec> <wert>";
-    let (Some(actor), Some(right), Some(value)) = (args.first(), args.get(1), args.get(2)) else {
-        return usage.to_string();
+/// `sepp policy allow [--global] <akteur> <recht> <wert>` — trägt das Recht in die Policy-Datei
+/// ein (projektlokal `<cwd>/.sepp/policy.toml`, mit `--global` in `<config_root>/policy.toml`).
+/// Kommentare und Formatierung der Datei bleiben erhalten; ein vorhandener Wert ist ein No-op.
+fn run_allow(args: &[String]) -> anyhow::Result<String> {
+    let (global, actor, right, value) =
+        parse_allow_args(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let path = if global {
+        session::config_root()?.join("policy.toml")
+    } else {
+        session::project_policy_path()?
     };
-    if !matches!(
-        right.as_str(),
-        "fs_read" | "fs_write" | "net" | "env" | "exec"
-    ) {
-        return format!("Unbekanntes Recht '{right}'.\n{usage}");
+    let written = sepp_policy::policy_edit::allow(&path, &actor, &right, &value)?;
+    let mut out = if written {
+        format!(
+            "Eingetragen in {}: [{}] {right} = \"{value}\"",
+            path.display(),
+            section_label(&actor)
+        )
+    } else {
+        format!("Stand bereits in {}: {right} = \"{value}\"", path.display())
+    };
+    if !global && !session::is_project_trusted().unwrap_or(false) {
+        out.push_str(
+            "\nHinweis: Das Projekt ist noch nicht vertraut — die Datei wirkt erst nach \
+             `sepp init` bzw. `/trust` in der TUI.",
+        );
     }
-    let section = if actor == "agent" || actor.starts_with("mcp.") || actor.starts_with("plugin.") {
-        actor.clone()
-    } else {
-        return format!("Unbekannter Akteur '{actor}'.\n{usage}");
-    };
-    let line = if right == "net" && (value == "true" || value == "false") {
-        format!("net = {value}")
-    } else {
-        format!("{right} = [{value:?}]")
-    };
-    let file = project_policy
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| ".sepp/policy.toml".into());
-    format!(
-        "`sepp policy allow` schreibt in einer späteren Version selbst in die Policy-Datei. Bis dahin von Hand:\n\n  \
-         Datei: {file}   (global: ~/.sepp/policy.toml)\n\n  [{section}]\n  {line}\n\n\
-         Einträge erweitern die eingebauten Defaults; die Datei lädt beim nächsten Start \
-         (projektlokal nur nach Trust). Kontrolle: sepp policy"
-    )
+    out.push_str("\nWirksam beim nächsten Start. Kontrolle: sepp policy");
+    Ok(out)
+}
+
+/// TOML-Abschnittsname eines Akteurs (`agent`, `mcp.git`, `plugin.string-tools`).
+fn section_label(actor: &Actor) -> String {
+    match actor {
+        Actor::Agent => "agent".into(),
+        Actor::Mcp(n) => format!("mcp.{n}"),
+        Actor::Plugin(n) => format!("plugin.{n}"),
+    }
 }
 
 /// Projekttyp-Presets für `sepp init` (erkannt an Dateien im Projekt).
@@ -763,22 +803,41 @@ mod tests {
     }
 
     #[test]
-    fn render_allow_hint_builds_toml_snippet() {
-        let hint = render_allow_hint(
-            &["agent".into(), "fs_write".into(), "/x".into()],
-            Some(Path::new("/proj/.sepp/policy.toml")),
-        );
-        assert!(hint.contains("[agent]"));
-        assert!(hint.contains("fs_write = [\"/x\"]"));
-        assert!(hint.contains("/proj/.sepp/policy.toml"));
-        let net = render_allow_hint(&["mcp.git".into(), "net".into(), "true".into()], None);
-        assert!(net.contains("[mcp.git]"));
-        assert!(net.contains("net = true"));
-        assert!(render_allow_hint(&[], None).starts_with("Verwendung"));
+    fn parse_allow_args_forms_and_errors() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (global, actor, right, value) =
+            parse_allow_args(&a(&["agent", "fs_write", "/srv/data"])).unwrap();
+        assert!(!global);
+        assert_eq!(actor, Actor::Agent);
+        assert_eq!((right.as_str(), value.as_str()), ("fs_write", "/srv/data"));
+
+        let (global, actor, ..) =
+            parse_allow_args(&a(&["--global", "mcp.git", "exec", "git"])).unwrap();
+        assert!(global);
+        assert_eq!(actor, Actor::Mcp("git".into()));
+
+        // Reihenfolge der Option ist egal.
         assert!(
-            render_allow_hint(&["x".into(), "fs_read".into(), "/y".into()], None)
-                .contains("Unbekannter Akteur")
+            parse_allow_args(&a(&["agent", "net", "true", "-g"]))
+                .unwrap()
+                .0
         );
+
+        for bad in [
+            vec!["agent", "fs_write"],
+            vec!["quatsch", "fs_write", "/x"],
+            vec!["agent", "quatsch", "/x"],
+            vec!["agent", "fs_write", "/x", "--unbekannt"],
+        ] {
+            assert!(parse_allow_args(&a(&bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn section_label_matches_toml_sections() {
+        assert_eq!(section_label(&Actor::Agent), "agent");
+        assert_eq!(section_label(&Actor::Mcp("git".into())), "mcp.git");
+        assert_eq!(section_label(&Actor::Plugin("st".into())), "plugin.st");
     }
 
     #[test]

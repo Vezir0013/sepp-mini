@@ -33,6 +33,7 @@ sepp-mcp = { path = "../sepp-mcp" }
 sepp-wasm = { path = "../sepp-wasm" }
 
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -45,4 +46,3 @@ crossterm = { version = "=0.28.1", features = ["event-stream"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-async-trait = { workspace = true }
