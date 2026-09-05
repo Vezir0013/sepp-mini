@@ -29,7 +29,8 @@
 //! Argument-JSON und liefert ToolResult-JSON (beides im linearen Speicher).
 //!
 //! Importe aus dem Modul `env`: `host_log(i32,i32)` und `host_result_read(i32,i32)->i32` immer,
-//! `host_fs_read(i32,i32)->i32` mit `FsRead`, `host_http(i32,i32)->i32` mit `Net`.
+//! `host_fs_read(i32,i32)->i32` und `host_fs_read_bytes(i32,i32)->i32` mit `FsRead` (oder
+//! `FsWrite`, das Lesen einschließt), `host_http(i32,i32)->i32` mit `Net`.
 //!
 //! **Der Abholweg:** Eine Fähigkeit führt aus, legt ihr Ergebnis im Host ab und meldet dessen
 //! Größe; `host_result_read` kopiert es in einen Puffer, den das Plugin passend dimensioniert
@@ -37,6 +38,13 @@
 //! wäre, dass der Host aus der Host-Funktion heraus `sepp_alloc` aufruft — dieser Rücksprung
 //! läuft nicht resumierbar und kollidiert mit dem Fuel-Slicing. Eine Fähigkeit liefert immer
 //! ein JSON-Objekt, auch im Fehlerfall (`{"error":"…"}`), und trappt nie.
+//!
+//! **Ausnahme `host_fs_read_bytes`.** Sie legt die Datei **roh** ab, ohne JSON-Hülle, und
+//! signalisiert über das Vorzeichen: `n >= 0` = `n` Bytes Nutzdaten, `n < 0` = `-n - 1` Bytes
+//! UTF-8-Fehlertext. Der Grund ist der Speicher des Moduls: Base64 in einer JSON-Hülle zwänge
+//! das Plugin, Kodierung **und** Ergebnis gleichzeitig zu halten — grob das 2,3-fache der
+//! Dateigröße gegen ein 16-MiB-Limit. `host_fs_read` bleibt unverändert (Text, verlustbehaftet)
+//! und ist für Textdateien weiterhin der bequemere Weg.
 
 use std::path::Path;
 use std::time::Instant;
@@ -397,6 +405,23 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
                 },
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_fs_read: {e}")))?;
+        // Dasselbe Gate, binäre Rückgabe. Additiv: Ein Modul, das die Funktion nicht importiert,
+        // merkt von ihr nichts — das ABI bleibt bei Version 1.
+        linker
+            .func_wrap(
+                "env",
+                "host_fs_read_bytes",
+                |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                    let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                        return -1;
+                    };
+                    let Some(raw) = read_input(&caller, &mem, ptr, len) else {
+                        return stage_raw_err(&mut caller, "Eingabe liegt außerhalb des Speichers");
+                    };
+                    host_fs_read_bytes(&mut caller, &raw)
+                },
+            )
+            .map_err(|e| SeppError::Tool(format!("wasm linker host_fs_read_bytes: {e}")))?;
     }
     // host_http: nur mit Net-Capability — DAS ist das Capability-Gate. Noch eine Attrappe, aber
     // eine ehrliche: Sie erklärt, statt eine Null zu liefern.
@@ -429,44 +454,94 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
 /// `write` und `edit` benutzen — ein Plugin kommt also nicht weiter als der Agent selbst.
 /// Ein Fehler wird nie zum Trap: Das Modell kann mit einer Erklärung etwas anfangen, mit
 /// einem abgestürzten Werkzeug nicht.
-fn host_fs_read(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
-    let args: Value = match serde_json::from_slice(input) {
-        Ok(v) => v,
-        Err(e) => return stage_err(caller, format!("host_fs_read: ungültige Eingabe: {e}")),
-    };
-    let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
-        return stage_err(caller, "host_fs_read: Feld 'path' fehlt");
-    };
+/// Löst den Pfad auf, prüft ihn gegen die Policy des Plugins und liest die Datei.
+///
+/// Gemeinsame Hälfte von [`host_fs_read`] und [`host_fs_read_bytes`] — die beiden unterscheiden
+/// sich nur darin, **wie** sie das Ergebnis zurückgeben, nicht darin, was sie dürfen. Zwei
+/// Kopien dieser Prüfung wären genau die Sorte Duplikat, bei der eine Seite später vergessen
+/// wird.
+fn read_granted_file(
+    policy: &Policy,
+    input: &[u8],
+    who: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let args: Value =
+        serde_json::from_slice(input).map_err(|e| format!("{who}: ungültige Eingabe: {e}"))?;
+    let raw_path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{who}: Feld 'path' fehlt"))?;
     let ctx = sepp_policy::ResolveCtx::from_env();
     let path = sepp_policy::canonicalize_lenient(&sepp_policy::resolve_path_with(raw_path, &ctx));
-    if !caller.data().policy.allows_path(&path, false) {
-        return stage_err(
-            caller,
-            format!(
-                "host_fs_read: {} liegt außerhalb der Rechte dieses Plugins",
-                path.display()
-            ),
-        );
+    if !policy.allows_path(&path, false) {
+        return Err(format!(
+            "{who}: {} liegt außerhalb der Rechte dieses Plugins",
+            path.display()
+        ));
     }
     // Erst die Größe prüfen, dann lesen — sonst zöge eine riesige Datei den Host in eine
     // Allokation, die das Modul ohnehin nicht abholen könnte.
     match std::fs::metadata(&path) {
         Ok(m) if m.len() > MAX_PLUGIN_BYTES as u64 => {
-            return stage_err(
-                caller,
-                format!(
-                    "host_fs_read: {} ist zu groß ({} > {MAX_PLUGIN_BYTES} Bytes)",
-                    path.display(),
-                    m.len()
-                ),
-            )
+            return Err(format!(
+                "{who}: {} ist zu groß ({} > {MAX_PLUGIN_BYTES} Bytes)",
+                path.display(),
+                m.len()
+            ))
         }
         Ok(_) => {}
-        Err(e) => return stage_err(caller, format!("host_fs_read: {}: {e}", path.display())),
+        Err(e) => return Err(format!("{who}: {}: {e}", path.display())),
     }
-    let bytes = match std::fs::read(&path) {
+    std::fs::read(&path).map_err(|e| format!("{who}: {}: {e}", path.display()))
+}
+
+/// Liest eine Datei **binär**: rohe Bytes, keine Text-Umwandlung, keine JSON-Hülle.
+///
+/// `host_fs_read` liefert `from_utf8_lossy` — für ein PDF, ZIP oder Bild kommt dort Ersatzmüll
+/// an. Base64 in der JSON-Hülle wäre keine Lösung: Das Modul müsste die Kodierung **und** das
+/// Ergebnis gleichzeitig im linearen Speicher halten, also grob das 2,3-fache der Dateigröße
+/// gegen ein 16-MiB-Limit.
+///
+/// Rückgabe weicht deshalb bewusst von der JSON-Konvention der anderen Fähigkeiten ab:
+///
+/// * `n >= 0` — Erfolg, `n` **rohe** Bytes liegen bereit (`host_result_read`)
+/// * `n < 0` — Fehler, `-n - 1` Bytes UTF-8-Fehlertext liegen bereit
+fn host_fs_read_bytes(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
+    match read_granted_file(&caller.data().policy, input, "host_fs_read_bytes") {
+        Ok(bytes) => stage_raw(caller, bytes),
+        Err(msg) => stage_raw_err(caller, msg),
+    }
+}
+
+/// Legt rohe Bytes bereit und liefert deren Anzahl.
+fn stage_raw(caller: &mut Caller<'_, HostState>, bytes: Vec<u8>) -> i32 {
+    if bytes.len() > MAX_PLUGIN_BYTES as usize {
+        return stage_raw_err(
+            caller,
+            format!(
+                "Ergebnis zu groß ({} > {MAX_PLUGIN_BYTES} Bytes)",
+                bytes.len()
+            ),
+        );
+    }
+    let n = bytes.len() as i32;
+    caller.data_mut().result = bytes;
+    n
+}
+
+/// Legt einen Fehlertext bereit und liefert `-len - 1` (siehe [`host_fs_read_bytes`]).
+fn stage_raw_err(caller: &mut Caller<'_, HostState>, msg: impl std::fmt::Display) -> i32 {
+    let mut bytes = msg.to_string().into_bytes();
+    bytes.truncate(MAX_PLUGIN_BYTES as usize);
+    let n = bytes.len() as i32;
+    caller.data_mut().result = bytes;
+    -n - 1
+}
+
+fn host_fs_read(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
+    let bytes = match read_granted_file(&caller.data().policy, input, "host_fs_read") {
         Ok(b) => b,
-        Err(e) => return stage_err(caller, format!("host_fs_read: {}: {e}", path.display())),
+        Err(msg) => return stage_err(caller, msg),
     };
     let text = String::from_utf8_lossy(&bytes);
     // Genau die Frage, die `from_utf8_lossy` beantwortet. Ein Längenvergleich läge daneben,
@@ -1361,6 +1436,47 @@ mod tests {
     /// Ein Modul, das eine Datei liest: Anfrage bauen, `host_fs_read` rufen, mit
     /// `host_result_read` abholen und das Ergebnis als Werkzeug-Ergebnis zurückgeben.
     /// Führt den kompletten Abholweg vor.
+    /// Plugin gegen `host_fs_read_bytes`: ruft die Fähigkeit und vergleicht den Rückgabewert
+    /// mit `expect`. Meldet `ok` oder `bad` — damit prüft der Test die **Zahl** und nicht den
+    /// Inhalt, was den Unterschied zwischen roh und lossy sichtbar macht.
+    fn bytes_reader_wat(request: &str, expect: i32) -> Vec<u8> {
+        let spec =
+            r#"{"name":"breader","label":"B","description":"x","parameters":{"type":"object"}}"#;
+        let ok = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let bad = r#"{"content":[{"type":"text","text":"bad"}]}"#;
+        let wat = format!(
+            r#"(module
+  (import "env" "host_fs_read_bytes" (func $fsb (param i32 i32) (result i32)))
+  (import "env" "host_result_read" (func $read (param i32 i32) (result i32)))
+  (memory (export "memory") 4)
+  (data (i32.const 8) "{spec}")
+  (data (i32.const 2048) "{req}")
+  (data (i32.const 3072) "{ok}")
+  (data (i32.const 3584) "{bad}")
+  (func (export "sepp_alloc") (param $n i32) (result i32) (i32.const 8192))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64)
+    (local $n i32)
+    (local.set $n (call $fsb (i32.const 2048) (i32.const {reqlen})))
+    ;; Nutzdaten wirklich abholen, damit der ganze Weg durchlaufen wird.
+    (drop (call $read (i32.const 65536) (i32.const 65536)))
+    (if (result i64) (i32.eq (local.get $n) (i32.const {expect}))
+      (then (i64.or (i64.shl (i64.const 3072) (i64.const 32)) (i64.const {oklen})))
+      (else (i64.or (i64.shl (i64.const 3584) (i64.const 32)) (i64.const {badlen})))))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+            req = esc(request),
+            reqlen = request.len(),
+            ok = esc(ok),
+            oklen = ok.len(),
+            bad = esc(bad),
+            badlen = bad.len(),
+        );
+        wat::parse_str(&wat).expect("bytes reader wat")
+    }
+
     fn fs_reader_wat(request: &str) -> Vec<u8> {
         let spec = r#"{"name":"reader","label":"Reader","description":"x","parameters":{"type":"object"}}"#;
         // Das Ergebnis der Fähigkeit ist ein Objekt und wandert deshalb nach `details`;
@@ -1434,6 +1550,84 @@ mod tests {
         assert_eq!(res.details["text"], "Hallo Welt");
         assert_eq!(res.details["bytes"], 10);
         assert_eq!(res.details["lossy"], false);
+    }
+
+    #[tokio::test]
+    async fn host_fs_read_bytes_delivers_raw_bytes_not_lossy_text() {
+        // Zwei ungültige UTF-8-Bytes. Über `host_fs_read` kämen daraus zwei Ersatzzeichen
+        // à 3 Bytes = 6; roh sind es 2. Die Zahl unterscheidet die beiden Wege eindeutig.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("binaer.pdf");
+        std::fs::write(&file, [0xFFu8, 0xFE]).unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, file.display());
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: dir.path().canonicalize().unwrap(),
+        }]);
+
+        let res = WasmHost::new()
+            .load(&bytes_reader_wat(&req, 2), grant, Limits::default())
+            .expect("lädt")
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(text_of(&res), "ok", "roh erwartet, nicht lossy");
+    }
+
+    #[tokio::test]
+    async fn host_fs_read_bytes_signals_errors_negatively() {
+        // Außerhalb der Rechte → n < 0, und `-n - 1` ist die Länge des Fehlertexts.
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("geheim.bin");
+        std::fs::write(&secret, [0u8; 4]).unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, secret.display());
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: inside.path().canonicalize().unwrap(),
+        }]);
+
+        // Die exakte Länge kennt der Test nicht — geprüft wird, dass es NICHT die Bytezahl der
+        // Datei ist (4) und dass der Wert im negativen Bereich liegt.
+        let res = WasmHost::new()
+            .load(&bytes_reader_wat(&req, 4), grant, Limits::default())
+            .expect("lädt")
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            text_of(&res),
+            "bad",
+            "verweigerter Zugriff darf nicht wie ein Erfolg aussehen"
+        );
+    }
+
+    #[test]
+    fn read_granted_file_enforces_the_policy_and_returns_bytes_verbatim() {
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let f = inside.path().join("a.bin");
+        let raw: Vec<u8> = vec![0x00, 0xFF, 0x1B, 0x9F];
+        std::fs::write(&f, &raw).unwrap();
+        std::fs::write(outside.path().join("b.bin"), b"x").unwrap();
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: inside.path().canonicalize().unwrap(),
+        }]);
+
+        let req = format!(r#"{{"path":"{}"}}"#, f.display());
+        assert_eq!(
+            read_granted_file(&grant, req.as_bytes(), "t").unwrap(),
+            raw,
+            "byte-identisch, keine Umwandlung"
+        );
+
+        let outside_req = format!(r#"{{"path":"{}"}}"#, outside.path().join("b.bin").display());
+        let e = read_granted_file(&grant, outside_req.as_bytes(), "t").unwrap_err();
+        assert!(e.contains("außerhalb der Rechte"), "{e}");
+
+        let e = read_granted_file(&grant, b"kein json", "t").unwrap_err();
+        assert!(e.contains("ungültige Eingabe"), "{e}");
+
+        let e = read_granted_file(&grant, br#"{"kein_pfad":1}"#, "t").unwrap_err();
+        assert!(e.contains("'path' fehlt"), "{e}");
     }
 
     #[tokio::test]

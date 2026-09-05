@@ -61,6 +61,7 @@ fn emit(bytes: &[u8]) -> i64 {
 ///
 /// Alle vier Felder sind Pflicht. `parameters` ist ein JSON-Schema und wird unverändert an den
 /// Anbieter durchgereicht, deshalb schlank halten: kein `$schema`, kein `title`.
+
 const SPEC: &str = r#"{
   "name": "textstat",
   "label": "Textstatistik",
@@ -85,9 +86,13 @@ pub extern "C" fn sepp_spec() -> i64 {
 // Ebenfalls immer verfügbar wäre `host_result_read(ptr, cap) -> i32`, mit dem man das Ergebnis
 // einer Fähigkeit abholt. Dieses Beispiel braucht es nicht, weil es keine Fähigkeit benutzt.
 //
-// Die beiden Fähigkeiten `host_fs_read` und `host_http` dürfen hier NICHT deklariert werden:
-// Der Host registriert sie nur bei passender Gewährung in der policy.toml, und ein Import ohne
-// sie verhindert die Instanziierung. Das Plugin würde dann gar nicht laden.
+// Die Fähigkeiten `host_fs_read`, `host_fs_read_bytes` und `host_http` dürfen hier NICHT
+// deklariert werden: Der Host registriert sie nur bei passender Gewährung in der policy.toml,
+// und ein Import ohne sie verhindert die Instanziierung. Das Plugin würde dann gar nicht laden.
+//
+// Für Textdateien ist `host_fs_read` bequemer (liefert `{"bytes":…,"text":…,"lossy":…}`);
+// für PDF, ZIP oder Bilder braucht es `host_fs_read_bytes`, das die Datei ROH ablegt:
+// Rückgabe `n >= 0` = n Bytes Nutzdaten, `n < 0` = `-n - 1` Bytes Fehlertext.
 extern "C" {
     fn host_log(ptr: i32, len: i32);
 }

@@ -7,6 +7,25 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Vorarbeiten für Plugin-Pakete, aber unabhängig davon nützlich.
+
+### Hinzugefügt
+- **`host_fs_read_bytes` für WASM-Plugins.** `host_fs_read` liefert `from_utf8_lossy`; für ein
+  PDF, ZIP oder Bild kommt dort Ersatzmüll an — es gab bisher überhaupt keinen Weg, binäre
+  Dateien in ein Plugin zu bekommen. Die neue Fähigkeit legt die Datei **roh** ab und
+  signalisiert über das Vorzeichen: `n >= 0` sind `n` Bytes Nutzdaten, `n < 0` sind `-n - 1`
+  Bytes Fehlertext. Diese Abweichung von der JSON-Konvention ist Absicht: Base64 in einer Hülle
+  zwänge das Modul, Kodierung und Ergebnis gleichzeitig zu halten — grob das 2,3-fache der
+  Dateigröße gegen ein 16-MiB-Limit. Dasselbe Gate wie `host_fs_read` (`fs_read`, oder
+  `fs_write`, das Lesen einschließt), und **additiv**: Ein Modul, das die Funktion nicht
+  importiert, merkt nichts. Das ABI bleibt bei Version 1.
+
+### Tests
+- `host_fs_read_bytes` liefert rohe Bytes statt verlustbehaftetem Text (zwei ungültige
+  UTF-8-Bytes: roh 2, lossy wären 6 — die Zahl unterscheidet beide Wege eindeutig); ein
+  verweigerter Zugriff meldet sich negativ; die gemeinsame Prüfhälfte `read_granted_file` gegen
+  Policy, Eingabefehler und byte-identische Rückgabe.
+
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
 - `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
