@@ -7,8 +7,100 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Eine Review über alle Crates hat fünfzehn Befunde ergeben, und sie fielen in Muster: Grenzen, die
+erst hinter der Schranke greifen; Zusagen der Doku, die der Code nicht hält; Meldungen, die im
+interessanten Fall schweigen. Kein einzelner davon war dramatisch — zusammen beschreiben sie
+Stellen, an denen `sepp` etwas versprach, das er nicht hielt. Das ist bei einem Werkzeug, dessen
+Alleinstellungsmerkmal die Rechteverwaltung ist, die teuerste Sorte Fehler.
+
+### Hinzugefügt
+- **Secrets für entfernte MCP-Server.** `[mcp.servers.headers]` nimmt HTTP-Header, deren Werte
+  `$NAME`-Platzhalter enthalten dürfen; der Secret-Broker setzt sie **vor** dem Verbinden ein.
+  Bisher gab es überhaupt keinen Weg, einem http-Server einen Schlüssel zu geben — und den
+  Broker gab es zwar samt Tests, aber ohne einen einzigen Aufrufer. Durchgesetzt wird mit zwei
+  Rechten aus der `policy.toml`: `net = ["<host>"]` sagt, wohin das Secret darf, `env = ["NAME"]`
+  sagt, welches der Server sehen darf. Fehlt eine Hälfte, bricht der Connect mit dem passenden
+  `sepp policy allow` ab, statt einen Header mit literalem `$NAME` loszuschicken — der landete
+  sonst im Zugriffslog des fremden Servers. Substituiert wird nur in `headers`, nie in der `url`:
+  Die steht in jeder Verbindungsfehlermeldung. Werte sind als `sensitive` markiert und tauchen
+  in keinem `Debug` auf; Fehlertexte und das stderr von stdio-Servern laufen durch `redact`.
+- **Unbekannte Schlüssel in der `policy.toml` werden gemeldet.** `[plugins.x]` statt `[plugin.x]`
+  oder `fs_reed = [...]` parste bisher klaglos und bewirkte nichts. In der Datei, die über Rechte
+  entscheidet, ist ein stumm verschluckter Tippfehler nicht kosmetisch: Man hält ein Recht für
+  erteilt oder das Netz für gesperrt. Abgelehnt wird weiterhin nichts — sonst scheiterte jede
+  neuere Policy auf einem älteren `sepp`.
+
+### Geändert
+- **Ein Schreibrecht deckt jetzt auch Leseanfragen.** Bisher hatten vier Stellen drei Meinungen:
+  `Policy::allows_path` und beide Sandbox-Adapter zählten `fs_write` als Leserecht, `covers`
+  (und damit `intersect`) trennte strikt, und das WASM-Linker-Gate prüfte nur auf `fs_read`.
+  Ausschlaggebend ist die Durchsetzung: Landlock trägt jeden Schreibpfad zusätzlich in die
+  Leseliste ein, Seatbelt schreibt `(allow file-read* file-write* …)`. „Schreiben ja, lesen nein"
+  ist für Kindprozesse gar nicht ausdrückbar — die strikte Lesart beschrieb einen Zustand, den es
+  im Betrieb nirgends gab. Die Gegenrichtung bleibt streng, und `[deny]` behält seine Asymmetrie.
+- **`sepp policy` widerspricht dem Loader nicht mehr.** Ein Abschnitt mit nur `exec = "system"`
+  wurde als „(kein Abschnitt) — keine Rechte" gemeldet, während der Loader ihn sehr wohl sah.
+  Beide benutzen jetzt dieselbe Prädikatsfunktion. Für http-Server mit Secret-Headern nennt die
+  Tabelle bei `net` und `env` den Broker als Vollstrecker — das ist der einzige Punkt, an dem
+  ein remoter Server aufhört, rechtlich ein Nullum zu sein.
+- **Ein kaputtes Plugin-Manifest ergibt eine Meldung statt zweier widersprüchlicher.** Die erste
+  versprach einen Namens-Fallback auf den Dateistamm, den es nie gab: Das Manifest wurde gleich
+  darauf ein zweites Mal geparst und riss das Plugin mit. Jetzt wird einmal geparst und das
+  Plugin ehrlich übersprungen — ohne lesbares Manifest wäre auch `abi` unbekannt und würde
+  stillschweigend als 1 gelesen.
+- **Der Hinweis bei fehlenden Plugin-Rechten erklärt beide Hälften.** Er hing an der fehlenden
+  Gewährung; wer der Empfehlung folgte und `sepp policy allow …` ausführte, bekam danach nur noch
+  ein nacktes `unknown import`. Dabei ist genau das der Fall, in dem zu erklären war, dass das
+  Manifest das Recht nicht anfordert.
+
+### Behoben
+- **`bash` puffert die Ausgabe eines Kindprozesses nicht mehr unbegrenzt.** `yes` oder
+  `cat /dev/urandom` füllten bis zum Timeout den Speicher; die Trunkierung lief erst auf dem
+  fertigen Puffer und konnte den Host konstruktionsbedingt nicht schützen. Jetzt greift eine
+  Aufnahmegrenze je Strom, und verworfene Bytes werden im Ergebnis benannt.
+- **Das Trunkierungsbudget gilt pro Tool-Ergebnis, nicht je Block.** Ein MCP-Server oder Plugin
+  mit 200 Blöcken à 50 KiB brachte 10 MB ins Kontextfenster, weil jeder Block seine eigene
+  Grenze bekam.
+- **Die Obergrenze für WASM-Fähigkeiten gilt für das abgelegte Ergebnis.** `host_fs_read` prüfte
+  die rohe Dateigröße und legte dann das JSON ab — Lossy-Ersetzungen und Escaping können das
+  Vielfache sein, und dieser Speicher liegt beim Host, den das Page-Limit nicht deckt.
+- **`read` mit `offset`/`limit` verfälscht keine Zeilenenden mehr.** Der Ausschnitt wurde über
+  `lines().join("\n")` neu zusammengesetzt, was CRLF zu LF normalisierte und eine abschließende
+  Newline verschluckte. Das Modell kopierte danach einen `old_string`, den es auf der Platte so
+  nicht gab, und `edit` meldete „nicht gefunden" ohne erkennbaren Grund.
+- **Die Auto-Compaction reagiert auf Ctrl+C.** Sie streamte mit einem frisch erzeugten
+  Cancel-Token; der Nutzer saß den vollen Zusammenfassungs-Roundtrip ab. Gleiches galt für
+  `/compact` in der TUI.
+- **Ein fehlgeschlagener Sub-Agent-Lauf behält seinen Audit-Eintrag.** Die Kind-Session lag auf
+  Platte, aber der Verweis in der Wurzel entstand erst nach der Fehlerbehandlung — verwaist war
+  ausgerechnet der Fall, den man hinterher nachlesen will. Ein gescheiterter Auftrag ist jetzt
+  ein Werkzeugfehler mit Spur; ein Abbruch reicht weiterhin durch.
+- **`host_log` klemmt negative Zeiger.** Ein Plugin konnte mit `ptr = -1` einen
+  Additions-Overflow auslösen — in Debug-Builds ein Panic aus dem Host-Call heraus, aus der
+  Start-Sektion sogar außerhalb von `spawn_blocking`.
+- **Das `lossy`-Flag von `host_fs_read` stimmt.** Es war ein Längenvergleich und meldete `false`,
+  wenn die ersetzte Sequenz zufällig so lang war wie das Ersatzzeichen — etwa bei einer
+  abgeschnittenen 4-Byte-Sequenz.
+- **Die Pfad-Lock-Registry wächst nicht mehr unbegrenzt.** Sie legte je berührtem Pfad einen
+  Eintrag an und entfernte nie einen — in einer langen TUI-Sitzung oder im RPC-Server monoton.
+
+### Tests
+- Aufnahmegrenze und Zählung verworfener Bytes in `bash`; gemeinsames Blockbudget; `line_slice`
+  gegen CRLF, Trailing-Newline und Bereichsgrenzen; Aufräumen der Lock-Registry im Erfolgs- und
+  im Fehlerfall.
+- Compaction bricht auf ein gecanceltes Token ab (hängender Fake-Provider); gescheiterter
+  Sub-Agent-Lauf trägt `details["audit"]` mit der Kind-Session.
+- WASM: negativer `host_log`-Zeiger, gedeckeltes Ergebnis, `lossy` bei gleicher Länge, Plugin mit
+  reiner `fs_write`-Gewährung lädt und liest, genau eine Meldung bei kaputtem Manifest.
+- Policy: `fs_write` deckt `fs_read` (und nicht umgekehrt), Tippfehler je Abschnitt landen in den
+  Warnungen, `[agent.ask]` bleibt dabei wirksam.
+- MCP: die sieben Fehlerfälle von `resolve_headers` ohne Umgebung und ohne Server, `url_host`
+  samt Userinfo/Port/IPv6, `Debug` eines Secret-Headers zeigt nur `Sensitive` — dazu ein
+  Verdrahtungstest gegen einen echten TCP-Listener, der belegt, dass der Header auf der Leitung
+  ankommt und dass ohne `net`-Gewährung gar keine Verbindung entsteht.
+
 ### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
 - `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
 - Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
 - Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, Rechte als
