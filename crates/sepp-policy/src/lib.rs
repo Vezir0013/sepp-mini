@@ -32,7 +32,7 @@ pub use sandbox::{
     default_sandbox, kernel_capabilities, probe_sandbox, resolve_program, NullSandbox, Sandbox,
     SandboxCapabilities,
 };
-pub use secrets::SecretBroker;
+pub use secrets::{placeholder_names, SecretBroker};
 
 /// Ein atomares Recht.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,11 +272,20 @@ impl Policy {
 }
 
 /// Deckt das gewährte Recht `g` das angefragte `r`?
+///
+/// Ein Schreibrecht deckt die Leseanfrage auf demselben Präfix — nicht aus Bequemlichkeit,
+/// sondern weil die Vollstrecker es ohnehin so machen und gar nicht anders können: Landlock
+/// trägt jeden Schreibpfad zusätzlich in die Leseliste ein (siehe `sandbox.rs`), Seatbelt
+/// schreibt `(allow file-read* file-write* …)`. Eine Policy „schreiben ja, lesen nein" wäre für
+/// Kindprozesse nicht durchsetzbar, und wer eine Datei überschreiben darf, erfährt ihren Inhalt
+/// ohnehin. [`Policy::allows_path`] liest es seit jeher so. Die Gegenrichtung bleibt streng:
+/// Ein Leserecht deckt keine Schreibanfrage.
 fn covers(g: &Capability, r: &Capability) -> bool {
     use Capability::*;
     match (g, r) {
         (FsRead { prefix: gp }, FsRead { prefix: rp }) => rp.starts_with(gp),
         (FsWrite { prefix: gp }, FsWrite { prefix: rp }) => rp.starts_with(gp),
+        (FsWrite { prefix: gp }, FsRead { prefix: rp }) => rp.starts_with(gp),
         (Net { host: gh }, Net { host: rh }) => host_matches(gh, rh),
         (Env { name: gn }, Env { name: rn }) => gn == rn,
         (Exec { program: gp }, Exec { program: rp }) => gp == rp,
@@ -597,9 +606,13 @@ mod tests {
         assert!(!pol.allows(&Capability::FsWrite {
             prefix: p("/proj/other")
         }));
-        // FsWrite-Grant ist kein FsRead-Grant.
-        assert!(!pol.allows(&Capability::FsRead {
+        // Ein FsWrite-Grant schließt das Lesen ein — wie in `allows_path` und wie es beide
+        // Sandbox-Adapter ohnehin eintragen. Umgekehrt gilt das nicht.
+        assert!(pol.allows(&Capability::FsRead {
             prefix: p("/proj/out/x")
+        }));
+        assert!(!pol.allows(&Capability::FsRead {
+            prefix: p("/proj/other")
         }));
     }
 
@@ -808,6 +821,40 @@ mod tests {
         assert!(!eff2.allows(&Capability::FsRead {
             prefix: p("/data/other")
         }));
+    }
+
+    #[test]
+    fn write_grant_covers_a_read_request() {
+        // Manifest fordert Lesen, gewährt ist Schreiben: Lesen bleibt übrig.
+        let grant = Policy::new(vec![Capability::FsWrite { prefix: p("/data") }]);
+        let request = Policy::new(vec![Capability::FsRead {
+            prefix: p("/data/sub"),
+        }]);
+        assert_eq!(
+            grant.intersect(&request).granted,
+            vec![Capability::FsRead {
+                prefix: p("/data/sub")
+            }]
+        );
+        // Manifest fordert Schreiben, gewährt ist nur Lesen: Es bleibt beim Lesen, das Plugin
+        // scheitert später beim Schreiben. Fail-closed in beide Richtungen.
+        let read_only = Policy::new(vec![Capability::FsRead { prefix: p("/data") }]);
+        let wants_write = Policy::new(vec![Capability::FsWrite {
+            prefix: p("/data/sub"),
+        }]);
+        let eff = read_only.intersect(&wants_write);
+        assert!(!eff.allows(&Capability::FsWrite {
+            prefix: p("/data/sub")
+        }));
+    }
+
+    #[test]
+    fn read_grant_never_covers_a_write_request() {
+        let read_only = Policy::new(vec![Capability::FsRead { prefix: p("/data") }]);
+        assert!(!read_only.allows(&Capability::FsWrite {
+            prefix: p("/data/sub")
+        }));
+        assert!(!read_only.allows_path(&p("/data/sub/x"), true));
     }
 
     #[test]

@@ -142,7 +142,7 @@ impl TryFrom<ExecGrantRaw> for ExecGrant {
 }
 
 /// Gewährungen eines Abschnitts (`[agent]`, `[mcp.<name>]`, `[plugin.<name>]`, `[deny]`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct Grants {
     /// Lesepräfixe; `"system"` expandiert zu den Systempfaden ([`system_read_paths`]).
@@ -151,9 +151,20 @@ pub struct Grants {
     pub exec: ExecGrant,
     pub net: NetGrant,
     pub env: Vec<String>,
+    /// Alles, was der Host hier nicht kennt. Wird gelesen, ignoriert und **gemeldet**: Ein
+    /// `fs_reed = [...]` sähe sonst aus wie eine Gewährung, wäre aber keine — in der Datei, die
+    /// über Rechte entscheidet, ist ein stumm verschluckter Tippfehler sicherheitsrelevant.
+    /// Abgelehnt wird nichts, sonst scheiterte jede neuere Policy auf einem älteren `sepp`.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
 impl Grants {
+    /// Namen der Felder, die der Host nicht kennt — sortiert, für eine stabile Meldung.
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
+    }
+
     /// Enthält der Abschnitt überhaupt eine Gewährung?
     pub fn is_empty(&self) -> bool {
         self.fs_read.is_empty()
@@ -220,7 +231,7 @@ pub struct AskRules {
 }
 
 /// `[agent]`: Gewährungen des Agenten plus `[agent.ask]`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct AgentSection {
     #[serde(flatten)]
     pub grants: Grants,
@@ -229,7 +240,7 @@ pub struct AgentSection {
 }
 
 /// Eine Policy-Datei (Wire-Format, nur additiv erweitern).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct PolicyFile {
     pub mode: Option<Mode>,
@@ -239,9 +250,18 @@ pub struct PolicyFile {
     /// Nur `fs_read` (sperrt Lesen und Schreiben) und `fs_write` (sperrt Schreiben) werden
     /// ausgewertet; andere Felder erzeugen eine Warnung.
     pub deny: Grants,
+    /// Unbekannte Schlüssel auf oberster Ebene — etwa `[plugins.x]` statt `[plugin.x]`.
+    /// Siehe [`Grants::unknown`].
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
 impl PolicyFile {
+    /// Namen der Schlüssel auf oberster Ebene, die der Host nicht kennt.
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
+    }
+
     /// Parst eine `policy.toml`.
     pub fn parse(text: &str) -> Result<PolicyFile> {
         toml::from_str(text).map_err(|e| SeppError::Config(format!("policy: {e}")))
@@ -280,6 +300,7 @@ pub fn builtin_agent_grants() -> Grants {
         .iter()
         .map(|s| s.to_string())
         .collect(),
+        unknown: BTreeMap::new(),
     }
 }
 
@@ -379,6 +400,23 @@ pub struct PolicySet {
 impl PolicySet {
     /// Führt geladene Dateien (in Ladereihenfolge) mit den Defaults zusammen. Pur — die
     /// Dateien liest [`load_policy_set`].
+    /// Meldet unbekannte Schlüssel eines Abschnitts über den vorhandenen Warnungs-Kanal.
+    /// `section` ist leer für die oberste Ebene.
+    fn warn_unknown(&mut self, source: &Source, section: &str, keys: &[&str]) {
+        if keys.is_empty() {
+            return;
+        }
+        let wo = if section.is_empty() {
+            String::new()
+        } else {
+            format!(" in {section}")
+        };
+        self.warnings.push(format!(
+            "{source}: unbekannte Schlüssel{wo}, ohne Wirkung: {}",
+            keys.join(", ")
+        ));
+    }
+
     pub fn merge(
         files: Vec<(Source, PolicyFile)>,
         defaults: &BuiltinDefaults,
@@ -417,22 +455,30 @@ impl PolicySet {
         }
 
         for (source, file) in &files {
+            // Tippfehler melden, bevor irgendetwas ausgewertet wird: `fs_reed = [...]` oder
+            // `[plugins.x]` sieht aus wie eine Gewährung, ist aber keine. Stumm verschluckt
+            // hieße das, jemand hält ein Recht für erteilt oder das Netz für gesperrt.
+            set.warn_unknown(source, "", &file.unknown_keys());
             if let Some(m) = file.mode {
                 set.mode = m;
                 set.mode_source = source.clone();
             }
             if let Some(agent) = &file.agent {
+                set.warn_unknown(source, "[agent]", &agent.grants.unknown_keys());
                 set.push_grants(&Actor::Agent, &agent.grants, source, ctx);
                 for p in &agent.ask.patterns {
                     set.ask_patterns.push((p.clone(), source.clone()));
                 }
             }
             for (name, g) in &file.mcp {
+                set.warn_unknown(source, &format!("[mcp.{name}]"), &g.unknown_keys());
                 set.push_grants(&Actor::Mcp(name.clone()), g, source, ctx);
             }
             for (name, g) in &file.plugin {
+                set.warn_unknown(source, &format!("[plugin.{name}]"), &g.unknown_keys());
                 set.push_grants(&Actor::Plugin(name.clone()), g, source, ctx);
             }
+            set.warn_unknown(source, "[deny]", &file.deny.unknown_keys());
             for p in &file.deny.fs_read {
                 set.deny
                     .push((DenyRule::read(resolve_path_with(p, ctx)), source.clone()));
@@ -1241,6 +1287,67 @@ fs_read  = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.sepp"]
                 == Capability::FsRead {
                     prefix: "/usr".into()
                 }));
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_but_not_rejected() {
+        let text = r#"
+gibtsnicht = 1
+[agent]
+fs_reed = ["~/data"]
+[agent.ask]
+patterns = ["rm -rf"]
+[plugins.wetter]
+fs_read = ["./"]
+[mcp.git]
+fs_reed = ["./"]
+[deny]
+net_all = true
+"#;
+        let file = PolicyFile::parse(text).expect("wird gelesen, nicht abgelehnt");
+        let set = PolicySet::merge(
+            vec![(Source::Builtin, file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ResolveCtx::from_env(),
+        );
+        let all = set.warnings.join(" | ");
+        for expected in [
+            "gibtsnicht", // oberste Ebene
+            "fs_reed",    // in [agent] und [mcp.git]
+            "plugins",    // [plugins.x] statt [plugin.x]
+            "net_all",    // in [deny]
+            "[agent]",    //
+            "[mcp.git]",  //
+            "[deny]",     //
+        ] {
+            assert!(all.contains(expected), "fehlt: {expected} in {all}");
+        }
+        // Und der Tippfehler darf die echten Nachbarn nicht mitreißen: `[agent.ask]` ist ein
+        // benanntes Feld neben dem abgeflachten `Grants` — die Sammel-Map darf es nicht fressen.
+        assert_eq!(set.ask_patterns.len(), 1);
+        assert_eq!(set.ask_patterns[0].0, "rm -rf");
+    }
+
+    #[test]
+    fn a_clean_policy_file_warns_about_nothing() {
+        let text = r#"
+mode = "auto"
+[agent]
+fs_read = ["./"]
+[agent.ask]
+patterns = ["rm"]
+[plugin.wetter]
+fs_read = ["./"]
+"#;
+        let file = PolicyFile::parse(text).unwrap();
+        let set = PolicySet::merge(
+            vec![(Source::Builtin, file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ResolveCtx::from_env(),
+        );
+        assert!(set.warnings.is_empty(), "{:?}", set.warnings);
     }
 
     #[test]

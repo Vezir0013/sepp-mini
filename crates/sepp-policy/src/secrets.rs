@@ -15,6 +15,43 @@ pub struct SecretBroker {
     secrets: HashMap<String, String>,
 }
 
+/// Findet die `$NAME`-Platzhalter in `text` und liefert je Fund `(start, ende, name)` —
+/// `start` zeigt auf das `$`, `ende` hinter das letzte Namenszeichen.
+///
+/// **Der** Scanner: Wer wissen will, welche Secrets ein Text braucht, und wer sie ersetzt,
+/// müssen sich exakt einig sein. Zwei Implementierungen driften, und eine Abweichung hieße
+/// hier, dass ein Platzhalter am Gate vorbeikäme.
+fn scan(text: &str) -> impl Iterator<Item = (usize, usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j > start {
+                    let found = (i, j, &text[start..j]);
+                    i = j;
+                    return Some(found);
+                }
+            }
+            i += 1;
+        }
+        None
+    })
+}
+
+/// Namen aller `$NAME`-Platzhalter in `text`, in Reihenfolge des Auftretens.
+///
+/// Für Aufrufer, die *vor* der Ersetzung wissen müssen, welche Secrets ein Text überhaupt
+/// verlangt — etwa um nur die gewährten Env-Vars zu laden, statt die ganze Umgebung.
+pub fn placeholder_names(text: &str) -> Vec<&str> {
+    scan(text).map(|(_, _, name)| name).collect()
+}
+
 impl SecretBroker {
     /// Leerer Broker.
     pub fn new() -> Self {
@@ -45,6 +82,12 @@ impl SecretBroker {
         self.secrets.is_empty()
     }
 
+    /// Kennt der Broker ein Secret dieses Namens? Für Aufrufer, die einen fehlenden Wert
+    /// **melden** wollen, statt stumm den Platzhalter stehen zu lassen.
+    pub fn knows(&self, name: &str) -> bool {
+        self.secrets.contains_key(name)
+    }
+
     /// Ersetzt `$NAME`-Platzhalter durch echte Werte — **nur**, wenn die Policy `Net{host}`
     /// erlaubt. Für nicht erlaubte Hosts bleibt der Platzhalter stehen (kein Leak).
     pub fn substitute_for_host(&self, text: &str, host: &str, policy: &Policy) -> String {
@@ -55,30 +98,16 @@ impl SecretBroker {
         }
         // Segment-basiert: literale Läufe werden als &str-Slices kopiert (UTF-8-sicher); nur
         // erkannte `$NAME` werden ersetzt. Geschnitten wird ausschließlich an `$`-Positionen
-        // (ASCII) und an `last`/`j` (Char-Grenzen), nie mitten in einem Mehrbyte-Zeichen.
-        let bytes = text.as_bytes();
+        // (ASCII) und an Namensgrenzen, nie mitten in einem Mehrbyte-Zeichen.
         let mut out = String::with_capacity(text.len());
         let mut last = 0; // Beginn des noch nicht geflushten Literal-Laufs
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'$' {
-                let start = i + 1;
-                let mut j = start;
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                if j > start {
-                    if let Some(v) = self.secrets.get(&text[start..j]) {
-                        out.push_str(&text[last..i]); // Literal vor dem '$'
-                        out.push_str(v);
-                        last = j;
-                    }
-                    // unbekannt → `$NAME` bleibt Teil des Literal-Laufs (verbatim)
-                    i = j;
-                    continue;
-                }
+        for (start, end, name) in scan(text) {
+            if let Some(v) = self.secrets.get(name) {
+                out.push_str(&text[last..start]); // Literal vor dem '$'
+                out.push_str(v);
+                last = end;
             }
-            i += 1;
+            // unbekannt → `$NAME` bleibt Teil des Literal-Laufs (verbatim)
         }
         out.push_str(&text[last..]);
         out
@@ -148,6 +177,22 @@ mod tests {
             b.substitute_for_host("café $UNKNOWN café", "h", &net("h")),
             "café $UNKNOWN café"
         );
+    }
+
+    #[test]
+    fn placeholder_names_agree_with_substitution() {
+        // `$` ohne Namen, führende Ziffer, Unterstrich, doppeltes `$` — der Scanner muss genau
+        // das finden, was die Ersetzung später anfasst, sonst käme ein Platzhalter am Gate vorbei.
+        let text = "$A$ $_1 $ $9x $LANG_2";
+        assert_eq!(placeholder_names(text), vec!["A", "_1", "9x", "LANG_2"]);
+
+        let b = SecretBroker::new()
+            .with_secret("A", "a")
+            .with_secret("_1", "u")
+            .with_secret("9x", "n")
+            .with_secret("LANG_2", "l");
+        assert_eq!(b.substitute_for_host(text, "h", &net("h")), "a$ u $ n l");
+        assert!(placeholder_names("gar nichts hier").is_empty());
     }
 
     #[test]
