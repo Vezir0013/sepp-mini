@@ -366,6 +366,10 @@ pub struct PolicySet {
     /// Akteure, für die eine Quelle `exec = "system"` gesetzt hat (Exec unbeschränkt).
     pub exec_open: Vec<Actor>,
     pub deny: Vec<(DenyRule, Source)>,
+    /// Gesetzt, wenn eine Quelle `[deny] net` schreibt: **jedes** Netzrecht ist zurückgenommen,
+    /// für jeden Akteur. Ein Schalter, kein Filter — Landlock und Seatbelt können TCP nur ganz
+    /// oder gar nicht sperren (der Hostfilter käme mit dem Egress-Proxy).
+    pub deny_net: Option<Source>,
     pub ask_patterns: Vec<(String, Source)>,
     pub warnings: Vec<String>,
     /// Alle betrachteten Quellen und ob sie existierten (für `sepp policy`).
@@ -387,6 +391,7 @@ impl PolicySet {
             entries: Vec::new(),
             exec_open: Vec::new(),
             deny: Vec::new(),
+            deny_net: None,
             ask_patterns: Vec::new(),
             warnings: Vec::new(),
             sources: Vec::new(),
@@ -436,12 +441,25 @@ impl PolicySet {
                 set.deny
                     .push((DenyRule::write(resolve_path_with(p, ctx)), source.clone()));
             }
-            if file.deny.exec != ExecGrant::Unset
-                || file.deny.net != NetGrant::Off
-                || !file.deny.env.is_empty()
-            {
+            match &file.deny.net {
+                NetGrant::Off => {}
+                NetGrant::All => set.deny_net = Some(source.clone()),
+                NetGrant::Hosts(hosts) => {
+                    set.deny_net = Some(source.clone());
+                    // Ein Verbot einzelner Hosts ist heute nicht durchsetzbar. Es still zu
+                    // ignorieren wäre die gefährlichere Wahl: Man hielte etwas für gesperrt,
+                    // das offen ist. Also fail-closed sperren und den Grund nennen.
+                    if hosts.iter().any(|h| h != "*") {
+                        set.warnings.push(format!(
+                            "{source}: [deny] net {hosts:?} — Host-Verbote brauchen den \
+                             Egress-Proxy; die Liste sperrt derzeit jedes Netz"
+                        ));
+                    }
+                }
+            }
+            if file.deny.exec != ExecGrant::Unset || !file.deny.env.is_empty() {
                 set.warnings.push(format!(
-                    "{source}: [deny] wertet nur fs_read und fs_write aus; exec/net/env werden ignoriert"
+                    "{source}: [deny] wertet fs_read, fs_write und net aus; exec/env werden ignoriert"
                 ));
             }
         }
@@ -555,9 +573,21 @@ impl PolicySet {
     /// Effektive Policy eines Akteurs: Gewährungen minus Verbote (Grants unter einem Deny fallen
     /// weg; die Verbote stehen in `denied`, damit [`Policy::allows_path`] sie prüft).
     pub fn policy_for(&self, actor: &Actor) -> Policy {
-        self.raw_policy_for(actor)
+        let pol = self
+            .raw_policy_for(actor)
             .without_denied(&self.deny_rules())
-            .0
+            .0;
+        self.strip_denied_net(pol)
+    }
+
+    /// Entfernt alle Netzrechte, wenn `[deny] net` gesetzt ist. Die eine Stelle, an der das
+    /// Netzverbot greift — [`PolicySet::policy_for`] und [`Guard::agent_spawn_policy`] gehen
+    /// beide hier durch, damit Agent, MCP und Plugins gleich behandelt werden.
+    pub fn strip_denied_net(&self, mut pol: Policy) -> Policy {
+        if self.deny_net.is_some() {
+            pol.granted.retain(|c| !matches!(c, Capability::Net { .. }));
+        }
+        pol
     }
 
     /// Deny-Präfixe unterhalb einer Gewährung des Akteurs — für Kindprozesse nicht durchsetzbar.
@@ -1007,7 +1037,8 @@ impl Guard {
                 pol.granted.push(c.clone());
             }
         }
-        pol.without_denied(&self.set.deny_rules()).0
+        let pol = pol.without_denied(&self.set.deny_rules()).0;
+        self.set.strip_denied_net(pol)
     }
 
     /// Sperrt einen Kindprozess gemäß `policy` ein (Env-Scrubbing + Landlock/Seatbelt).
@@ -1464,8 +1495,10 @@ command = ["uvx", "mcp-server-git"]
     }
 
     #[test]
-    fn deny_with_non_fs_fields_emits_warning() {
-        let f = PolicyFile::parse("[deny]\nfs_read = [\"/x\"]\nnet = true").unwrap();
+    fn deny_with_ignored_fields_emits_warning() {
+        // exec und env kann ein Verbot nicht: Landlock kennt für Exec nur Erlaubnislisten,
+        // und die Env-Allowlist ist ohnehin schon eine.
+        let f = PolicyFile::parse("[deny]\nfs_read = [\"/x\"]\nenv = [\"FOO\"]").unwrap();
         let set = PolicySet::merge(
             vec![file("/p", f)],
             &BuiltinDefaults::default(),
@@ -1473,8 +1506,94 @@ command = ["uvx", "mcp-server-git"]
             &ctx(),
         );
         assert_eq!(set.warnings.len(), 1);
-        assert!(set.warnings[0].contains("[deny]"));
+        assert!(set.warnings[0].contains("exec/env"), "{:?}", set.warnings);
         assert!(set.deny_rules().contains(&DenyRule::read("/x")));
+    }
+
+    #[test]
+    fn deny_net_removes_grants_from_every_actor() {
+        let f = PolicyFile::parse(
+            "[agent]\nnet = true\n             [mcp.git]\nnet = [\"api.github.com\"]\n             [plugin.wetter]\nnet = [\"api.weather.example\"]\n             [deny]\nnet = true\n",
+        )
+        .unwrap();
+        let set = PolicySet::merge(
+            vec![file("/p", f)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx(),
+        );
+        assert!(set.deny_net.is_some(), "Verbot ist vermerkt");
+        assert!(
+            set.warnings.is_empty(),
+            "net = true warnt nicht: {:?}",
+            set.warnings
+        );
+        for actor in [
+            Actor::Agent,
+            Actor::Mcp("git".into()),
+            Actor::Plugin("wetter".into()),
+        ] {
+            let pol = set.policy_for(&actor);
+            assert!(!pol.net_allowed(), "{actor} darf nicht ins Netz");
+        }
+        // Die Gewährungen stehen weiter in der Übersicht — nur wirksam sind sie nicht.
+        assert!(set
+            .entries
+            .iter()
+            .any(|e| matches!(&e.cap, Capability::Net { .. })));
+    }
+
+    #[test]
+    fn deny_net_with_host_list_blocks_everything_and_warns() {
+        let f = PolicyFile::parse("[agent]\nnet = true\n[deny]\nnet = [\"tracker.example\"]\n")
+            .unwrap();
+        let set = PolicySet::merge(
+            vec![file("/p", f)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx(),
+        );
+        assert!(set.deny_net.is_some());
+        assert!(!set.policy_for(&Actor::Agent).net_allowed());
+        assert_eq!(set.warnings.len(), 1);
+        assert!(
+            set.warnings[0].contains("Egress-Proxy"),
+            "{:?}",
+            set.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_net_also_strips_the_bash_spawn_policy() {
+        // Der Weg, auf dem das Verbot wirklich wirkt: was `bash` in die Sandbox mitbekommt.
+        let env = Env::new();
+        let f = PolicyFile::parse("[agent]\nnet = true\n[deny]\nnet = true\n").unwrap();
+        let set = PolicySet::merge(
+            vec![(Source::File(PathBuf::from("/p")), f)],
+            &BuiltinDefaults::default(),
+            Some(Mode::Auto),
+            &env.ctx(),
+        );
+        let g = Guard::new(set, Box::new(NullSandbox));
+        assert!(!g.agent_spawn_policy(&[]).net_allowed());
+    }
+
+    #[test]
+    fn deny_net_star_is_the_plain_full_stop() {
+        let f = PolicyFile::parse("[agent]\nnet = true\n[deny]\nnet = [\"*\"]\n").unwrap();
+        let set = PolicySet::merge(
+            vec![file("/p", f)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx(),
+        );
+        assert!(set.deny_net.is_some());
+        assert!(
+            set.warnings.is_empty(),
+            "\"*\" ist eindeutig: {:?}",
+            set.warnings
+        );
+        assert!(!set.policy_for(&Actor::Agent).net_allowed());
     }
 
     #[test]

@@ -333,6 +333,18 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Ist nichts angefordert? Genutzt, um eine veraltete `[mcp.servers.capabilities]`-Angabe
+    /// zu erkennen und zu melden.
+    pub fn is_empty(&self) -> bool {
+        self.fs_read.is_empty()
+            && self.fs_write.is_empty()
+            && self.net.is_empty()
+            && self.env.is_empty()
+            && self.exec.is_empty()
+    }
+}
+
+impl Capabilities {
     /// Baut eine [`Policy`]; Pfade werden (`~`/relativ aufgelöst und) kanonisiert.
     pub fn to_policy(&self) -> Policy {
         self.to_policy_with(&ResolveCtx::from_env())
