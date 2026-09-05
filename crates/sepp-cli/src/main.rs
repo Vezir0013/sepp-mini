@@ -7,6 +7,7 @@
 //! Daten-/Text-Kanal. Im TUI-Modus wird Tracing nicht initialisiert (sonst würde stderr die
 //! Oberfläche zerstören).
 
+mod audit_cmd;
 mod policy_cmd;
 mod session;
 mod tui;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use sepp_agent::resources::ResourceSet;
-use sepp_agent::{AgentEvent, AgentSession, SubAgentTool};
+use sepp_agent::{AgentEvent, AgentSession, AuditRecord, SubAgentTool};
 use sepp_core::{Model, SeppError, ThinkingLevel};
 use sepp_hooks::{HookHost, RhaiHookHost};
 use sepp_policy::{
@@ -57,6 +58,8 @@ enum Cmd {
     },
     /// `sepp policy [show | allow …]` — effektives Regelwerk von Sepp Guard anzeigen.
     Policy(policy_cmd::PolicyCmd),
+    /// Die Spur einer Sitzung lesbar ausgeben (Prompts, Tools, Guard, Sub-Agenten).
+    Audit(audit_cmd::AuditArgs),
     Run(RunOpts),
 }
 
@@ -97,6 +100,8 @@ fn main() -> ExitCode {
         Ok(Cmd::Init { scope }) => run_init(scope),
         Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
         Ok(Cmd::Policy(cmd)) => policy_cmd::run_policy(cmd),
+        // Lesen einer Session ist reines fs+serde — kein Tokio-Runtime, kein Provider, kein Guard.
+        Ok(Cmd::Audit(a)) => audit_cmd::run_audit(a),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
             eprintln!("Fehler: {e}\n");
@@ -135,6 +140,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         }
         Some("policy") => {
             return policy_cmd::parse_policy_args(&args[1..]).map(Cmd::Policy);
+        }
+        Some("audit") => {
+            return audit_cmd::parse_audit_args(&args[1..]).map(Cmd::Audit);
         }
         _ => {}
     }
@@ -311,6 +319,8 @@ fn print_help() {
          \x20 sepp policy               Sepp Guard: effektive Rechte je Akteur samt Vollstrecker\n\
          \x20 sepp policy allow …       Recht eintragen, z. B. `allow agent fs_write ~/.cache`\n\
          \x20                           (mit --global in die globale policy.toml)\n\
+         \x20 sepp audit [id]           Spur einer Sitzung: Prompts, Tools, Guard-Entscheidungen,\n\
+         \x20                           Sub-Agenten (ohne id: jüngste; --json, --no-children)\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -1054,12 +1064,35 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         eprintln!("WASM: {n_wasm} Plugins geladen");
     }
 
+    // Wurzel-Session für die Kind-Sessions der Sub-Agenten. Geteilte Zelle, weil `/new` und
+    // `/resume` die Wurzel im laufenden Betrieb austauschen — ein einmal kopierter String würde
+    // Kind-Sessions danach an die alte Wurzel hängen.
+    let root_session = Arc::new(std::sync::Mutex::new(store.id().to_string()));
+
     // Phase 4: nativer Sub-Agent als Tool (`task`) — isolierter Kontext, eigenes (read/write/
     // edit/bash) Toolset unter demselben Guard, kein eigener `task` (keine Rekursion).
+    // Phase 3 des Guards: jeder Lauf schreibt eine eigene Kind-Session, sonst wäre alles, was
+    // der Sub-Agent tut, im Audit unsichtbar.
+    let factory_root = Arc::clone(&root_session);
+    let use_sqlite = opts.sqlite;
     let sub = SubAgentTool::new(Arc::clone(&provider), model.clone())
         .tools(builtin_tools_with(guard.clone()))
         .max_tokens(max_tokens)
-        .thinking(thinking);
+        .thinking(thinking)
+        .session_factory(Arc::new(move || {
+            let parent = factory_root
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match session::child_store(&parent, use_sqlite) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    // Ohne Kind-Session läuft der Sub-Agent weiter, nur ohne Spur.
+                    eprintln!("Hinweis: Kind-Session für den Sub-Agenten fehlgeschlagen: {e}");
+                    None
+                }
+            }
+        }));
     let sub_name = sepp_mcp::resolve_name(&taken, "agent", &sub.spec().name);
     taken.insert(sub_name.clone());
     tools.push(Arc::new(sub.name(sub_name)));
@@ -1075,6 +1108,11 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .auto_compact_threshold(threshold);
     if let Some(h) = hooks {
         builder = builder.hooks(h);
+    }
+    // Guard-Entscheidungen als eigene Einträge in die Session — auch die Verweigerungen, die
+    // als Fehler aus dem Tool kommen und deshalb kein Ergebnis mit `details` haben.
+    if let Some(g) = guard.clone() {
+        builder = builder.audit_source(guard_audit_source(g));
     }
     let mut agent = builder.build()?;
 
@@ -1143,6 +1181,7 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 startup_notices,
                 provider_kind,
                 guard,
+                root_session,
             )
             .await
         }
@@ -1261,6 +1300,23 @@ async fn abort_with_audit(
     });
     let _ = store.flush().await;
     anyhow::anyhow!("{msg}")
+}
+
+/// Audit-Quelle für den Agent-Loop: leert nach jedem Tool-Batch das Guard-Protokoll und macht
+/// aus jeder Entscheidung einen Session-Eintrag der Art `guard`.
+///
+/// Der Guard sammelt **jede** Entscheidung, auch die erlaubten — genau das macht die Spur
+/// auswertbar. Nebeneffekt: der Protokollpuffer im Guard wächst nicht mehr über die Sitzung.
+fn guard_audit_source(g: Arc<Guard>) -> sepp_agent::AuditSource {
+    Arc::new(move || {
+        g.drain_audit()
+            .iter()
+            .map(|ev| AuditRecord {
+                kind: "guard".into(),
+                data: Guard::audit_json(ev),
+            })
+            .collect()
+    })
 }
 
 /// Wählt das Session-Backend (JSONL-Default oder SQLite via `--sqlite`).
@@ -1652,6 +1708,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_audit_subcommand_only_first_arg() {
+        assert!(matches!(
+            parse(&args(&["audit"])).unwrap(),
+            Cmd::Audit(audit_cmd::AuditArgs {
+                select: None,
+                json: false,
+                no_children: false
+            })
+        ));
+        assert!(matches!(
+            parse(&args(&["audit", "3f2a", "--json"])).unwrap(),
+            Cmd::Audit(audit_cmd::AuditArgs { select: Some(s), json: true, .. }) if s == "3f2a"
+        ));
+        assert!(parse(&args(&["audit", "--bogus"])).is_err());
+        // Nicht erstes Token → Prompt, damit `sepp -p "audit die Logs"` weiter funktioniert.
+        let cmd = parse(&args(&["-p", "audit"])).unwrap();
+        assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "audit"));
+    }
+
+    #[test]
     fn init_state_creates_sessions_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("state");
@@ -1763,5 +1839,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn guard_audit_source_yields_one_record_per_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ResolveCtx {
+            home: Some(root.clone()),
+            cwd: root.clone(),
+            tmpdir: root.join("tmp"),
+        };
+        let set = load_policy_set(
+            &[],
+            &BuiltinDefaults {
+                extra_deny: Vec::new(),
+                default_mode: Mode::Auto,
+            },
+            None,
+            &ctx,
+        )
+        .unwrap();
+        let g = Arc::new(Guard::new(set, Box::new(sepp_policy::NullSandbox)));
+        let src = guard_audit_source(Arc::clone(&g));
+
+        assert!(
+            src().is_empty(),
+            "ohne Entscheidung nichts zu protokollieren"
+        );
+
+        let _ = g
+            .authorize(&Actor::Agent, sepp_policy::Action::FsRead(root.join("a")))
+            .await;
+        // `~/.ssh` steht im eingebauten Verbot — unabhängig von der Umgebung ein „deny".
+        let _ = g
+            .authorize(
+                &Actor::Agent,
+                sepp_policy::Action::FsRead(root.join(".ssh/id_rsa")),
+            )
+            .await;
+
+        let records = src();
+        assert_eq!(
+            records.len(),
+            2,
+            "erlaubt UND verweigert stehen in der Spur"
+        );
+        assert!(records.iter().all(|r| r.kind == "guard"));
+        assert_eq!(records[0].data["decision"], "allow");
+        assert_eq!(records[1].data["decision"], "deny");
+        assert!(records[1].data["detail"].is_string(), "Grund ist dabei");
+
+        // Die Quelle leert das Protokoll — sonst wüchse es über die Sitzung.
+        assert!(src().is_empty());
     }
 }

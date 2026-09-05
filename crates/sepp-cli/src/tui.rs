@@ -137,6 +137,7 @@ impl Drop for DoneOnDrop {
     }
 }
 
+#[derive(Debug)]
 struct TreeLine {
     id: String,
     display: String,
@@ -249,6 +250,10 @@ struct App {
     permissions: VecDeque<PendingPermission>,
     /// Guard der Session — liefert die Meldungen nach „dauerhaft erlauben".
     guard: Option<Arc<Guard>>,
+    /// ID der aktuellen Wurzel-Session. Die Kind-Sessions der Sub-Agenten hängen sich daran;
+    /// `/new` und `/resume` müssen sie deshalb nachziehen, sonst zeigen spätere Kind-Sessions
+    /// auf die vorige Wurzel.
+    root_session: Option<Arc<std::sync::Mutex<String>>>,
 }
 
 /// Startet die TUI und blockiert, bis der Nutzer beendet. `startup_notices` sind Hinweise aus
@@ -265,6 +270,7 @@ pub async fn run(
     startup_notices: Vec<String>,
     provider_kind: String,
     guard: Option<Arc<Guard>>,
+    root_session: Arc<std::sync::Mutex<String>>,
 ) -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -287,6 +293,7 @@ pub async fn run(
         provider_kind,
     );
     app.guard = guard;
+    app.root_session = Some(root_session);
     app.rebuild_transcript().await;
     // Start-Hinweise als Notices (nicht ins Transcript): rebuild_transcript baut den Verlauf
     // bei jedem Turn-Ende aus den Session-Messages neu — dort eingefügte Zeilen verschwänden
@@ -408,7 +415,16 @@ impl App {
             tx,
             permissions: VecDeque::new(),
             guard: None,
+            root_session: None,
         }
+    }
+
+    /// Zieht die Wurzel-ID nach einem Session-Wechsel nach (`/new`, `/resume`).
+    fn track_root(&self, agent: &AgentSession) {
+        let (Some(cell), Some(store)) = (&self.root_session, agent.session()) else {
+            return;
+        };
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) = store.id().to_string();
     }
 
     async fn rebuild_transcript(&mut self) {
@@ -708,6 +724,7 @@ impl App {
                     // Alte Session durabel abschließen (fsync), bevor wir umschalten.
                     let _ = g.finalize().await;
                     g.set_session(store);
+                    self.track_root(&g);
                     self.metrics = metric_snapshot(&g);
                     drop(g);
                     self.transcript.clear();
@@ -1043,6 +1060,7 @@ impl App {
                             // Alte Session abschließen, bevor wir auf die gewählte umschalten.
                             let _ = g.finalize().await;
                             g.set_session(Box::new(store));
+                            self.track_root(&g);
                             let t = transcript_from_messages(g.messages(), self.show_thinking);
                             self.metrics = metric_snapshot(&g);
                             drop(g);
@@ -1750,6 +1768,10 @@ fn entry_snippet(payload: &sepp_session::EntryPayload) -> String {
             format!("{role}: {snippet}")
         }
         sepp_session::EntryPayload::Compaction { .. } => "[Zusammenfassung]".into(),
+        sepp_session::EntryPayload::Custom { kind, data } if kind == "subagent" => {
+            let id = data.get("session").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("→ Sub-Agent {}", short_id(id))
+        }
         sepp_session::EntryPayload::Custom { kind, .. } => format!("[custom: {kind}]"),
     }
 }
@@ -1773,32 +1795,42 @@ fn build_tree(store: &dyn SessionStore) -> (Vec<TreeLine>, usize) {
     }
     while let Some((idx, depth)) = stack.pop() {
         let e = &entries[idx];
-        let indent = "  ".repeat(depth);
-        let label = e
-            .label
-            .as_ref()
-            .map(|l| format!(" [{l}]"))
-            .unwrap_or_default();
-        let marker = if leaf.as_ref() == Some(&e.id) {
-            "  ←"
+        // Guard-Entscheidungen sind Audit-Beiwerk: sie stehen zwar auf dem Pfad, würden den
+        // Baum aber zumüllen und wären als Branch-Ziel sinnlos. Ihre Kinder rücken auf.
+        let skip = matches!(&e.payload, sepp_session::EntryPayload::Custom { kind, .. } if kind == "guard");
+        let child_depth = if skip {
+            depth
         } else {
-            ""
+            let indent = "  ".repeat(depth);
+            let label = e
+                .label
+                .as_ref()
+                .map(|l| format!(" [{l}]"))
+                .unwrap_or_default();
+            let marker = if leaf.as_ref() == Some(&e.id) {
+                "  ←"
+            } else {
+                ""
+            };
+            lines.push(TreeLine {
+                id: e.id.clone(),
+                display: format!("{indent}{}{label}{marker}", entry_snippet(&e.payload)),
+            });
+            depth + 1
         };
-        lines.push(TreeLine {
-            id: e.id.clone(),
-            display: format!("{indent}{}{label}{marker}", entry_snippet(&e.payload)),
-        });
         if let Some(ch) = children.get(&Some(e.id.clone())) {
             for &c in ch.iter().rev() {
-                stack.push((c, depth + 1));
+                stack.push((c, child_depth));
             }
         }
     }
 
+    // Ist der Leaf selbst ein ausgeblendeter Guard-Eintrag (Turn brach dazwischen ab), zeigt
+    // der Cursor auf die letzte sichtbare Zeile statt auf den Anfang.
     let sel = lines
         .iter()
         .position(|l| Some(&l.id) == leaf.as_ref())
-        .unwrap_or(0);
+        .unwrap_or_else(|| lines.len().saturating_sub(1));
     (lines, sel)
 }
 
@@ -2475,6 +2507,79 @@ mod tests {
         assert!(app.handle_command("policy").await);
         let msg = app.message.as_ref().expect("Meldung");
         assert!(msg.text.contains("yolo"), "{}", msg.text);
+    }
+
+    #[tokio::test]
+    async fn root_session_follows_session_switch() {
+        // Nach /new oder /resume müssen neue Sub-Agent-Läufe an der NEUEN Wurzel hängen,
+        // sonst zeigen ihre Kind-Sessions auf eine Sitzung, in der nichts passiert ist.
+        let dir = tempfile::tempdir().unwrap();
+        let first = sepp_session::JsonlSessionStore::create(dir.path()).unwrap();
+        let first_id = first.id().to_string();
+        let session = sepp_agent::AgentSession::builder()
+            .provider(Arc::new(FakeProvider))
+            .model(crate::custom_model("test".into(), "fake"))
+            .session(Box::new(first))
+            .build()
+            .expect("test session");
+
+        let mut app = test_app();
+        app.session = Arc::new(Mutex::new(session));
+        let cell = Arc::new(std::sync::Mutex::new(first_id.clone()));
+        app.root_session = Some(Arc::clone(&cell));
+
+        let second = sepp_session::JsonlSessionStore::create(dir.path()).unwrap();
+        let second_id = second.id().to_string();
+        assert_ne!(first_id, second_id);
+        {
+            let mut g = app.session.lock().await;
+            g.set_session(Box::new(second));
+            app.track_root(&g);
+        }
+        assert_eq!(*cell.lock().unwrap(), second_id);
+    }
+
+    #[test]
+    fn tree_hides_guard_entries_and_names_subagents() {
+        let mut store = sepp_session::InMemorySessionStore::new();
+        store
+            .append(sepp_session::EntryPayload::Message {
+                message: sepp_core::Message::user_text("frage"),
+            })
+            .unwrap();
+        store
+            .append(sepp_session::EntryPayload::Custom {
+                kind: "guard".into(),
+                data: serde_json::json!({ "decision": "allow", "action": "fs_read /x" }),
+            })
+            .unwrap();
+        store
+            .append(sepp_session::EntryPayload::Custom {
+                kind: "subagent".into(),
+                data: serde_json::json!({ "session": "abcdef01-2345-6789-abcd-ef0123456789" }),
+            })
+            .unwrap();
+        let last = store
+            .append(sepp_session::EntryPayload::Message {
+                message: sepp_core::Message::user_text("antwort"),
+            })
+            .unwrap();
+
+        let (lines, sel) = build_tree(&store);
+        assert_eq!(lines.len(), 3, "der Guard-Eintrag ist ausgeblendet");
+        assert!(
+            !lines.iter().any(|l| l.display.contains("custom: guard")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].display.contains("Sub-Agent abcdef01"),
+            "{}",
+            lines[1].display
+        );
+        // Der ausgeblendete Knoten darf die Kette nicht abschneiden: die Kinder rücken auf,
+        // bleiben aber sichtbar, und der Cursor steht weiter auf dem Leaf.
+        assert_eq!(lines[2].id, last);
+        assert_eq!(sel, 2);
     }
 
     #[test]

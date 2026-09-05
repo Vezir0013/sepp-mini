@@ -264,21 +264,61 @@ pub fn new_store() -> Result<Box<dyn SessionStore>> {
     ))
 }
 
+/// Löst ein ID-Präfix gegen die Sessions dieses Projekts auf.
+///
+/// Die Liste ist nach Änderungszeit sortiert, ein mehrdeutiges Präfix träfe also stumm die
+/// zuletzt geänderte Session. Deshalb ist Mehrdeutigkeit hier ein Fehler mit Vorschlägen.
+pub fn resolve_session(prefix: &str) -> Result<SessionInfo> {
+    let dir = project_session_dir()?;
+    let mut hits: Vec<SessionInfo> = JsonlSessionStore::list(&dir)?
+        .into_iter()
+        .filter(|s| s.id.starts_with(prefix))
+        .collect();
+    match hits.len() {
+        0 => Err(anyhow!("keine Session mit Präfix '{prefix}' gefunden")),
+        1 => Ok(hits.remove(0)),
+        n => {
+            let list: Vec<&str> = hits.iter().take(5).map(|s| s.id.as_str()).collect();
+            Err(anyhow!(
+                "Präfix '{prefix}' passt auf {n} Sessions: {} — bitte mehr Zeichen angeben",
+                list.join(", ")
+            ))
+        }
+    }
+}
+
 pub fn open_store(select: &SessionSelect) -> Result<Box<dyn SessionStore>> {
     let dir = project_session_dir()?;
     let store: Box<dyn SessionStore> = match select {
         SessionSelect::New => Box::new(JsonlSessionStore::create(&dir)?),
         SessionSelect::Continue => Box::new(JsonlSessionStore::continue_recent(&dir)?),
         SessionSelect::Resume(Some(id)) => {
-            let info = JsonlSessionStore::list(&dir)?
-                .into_iter()
-                .find(|s| s.id.starts_with(id.as_str()))
-                .ok_or_else(|| anyhow!("keine Session mit Präfix '{id}' gefunden"))?;
-            Box::new(JsonlSessionStore::open(&info.path)?)
+            Box::new(JsonlSessionStore::open(&resolve_session(id)?.path)?)
         }
         SessionSelect::Resume(None) => Box::new(JsonlSessionStore::continue_recent(&dir)?),
     };
     Ok(store)
+}
+
+/// Store für eine Kind-Session (Sub-Agent-Lauf), verlinkt auf `parent_id`.
+///
+/// Kind-Sessions liegen im selben Projektverzeichnis wie die Wurzel und tauchen damit in
+/// `-r`/`/resume` auf; der Header sagt, zu welchem Lauf sie gehören.
+pub fn child_store(parent_id: &str, sqlite: bool) -> Result<Box<dyn SessionStore>> {
+    let dir = project_session_dir()?;
+    if sqlite {
+        #[cfg(feature = "sqlite")]
+        {
+            return Ok(Box::new(sepp_session::SqliteSessionStore::create_child(
+                &dir, parent_id,
+            )?));
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            return Err(anyhow!("--sqlite: Binary ohne Feature 'sqlite' gebaut"));
+        }
+    }
+    Ok(Box::new(JsonlSessionStore::create_child(&dir, parent_id)?))
 }
 
 /// Wie [`open_store`], aber mit dem SQLite-Backend (`.sqlite`-Dateien).
@@ -290,11 +330,19 @@ pub fn sqlite_store(select: &SessionSelect) -> Result<Box<dyn SessionStore>> {
         SessionSelect::New => Box::new(SqliteSessionStore::create(&dir)?),
         SessionSelect::Continue => Box::new(SqliteSessionStore::continue_recent(&dir)?),
         SessionSelect::Resume(Some(id)) => {
-            let info = SqliteSessionStore::list(&dir)?
+            let mut hits: Vec<_> = SqliteSessionStore::list(&dir)?
                 .into_iter()
-                .find(|s| s.id.starts_with(id.as_str()))
-                .ok_or_else(|| anyhow!("keine SQLite-Session mit Präfix '{id}' gefunden"))?;
-            Box::new(SqliteSessionStore::open(&info.path)?)
+                .filter(|s| s.id.starts_with(id.as_str()))
+                .collect();
+            match hits.len() {
+                0 => return Err(anyhow!("keine SQLite-Session mit Präfix '{id}' gefunden")),
+                1 => Box::new(SqliteSessionStore::open(&hits.remove(0).path)?),
+                n => {
+                    return Err(anyhow!(
+                        "Präfix '{id}' passt auf {n} SQLite-Sessions — bitte mehr Zeichen angeben"
+                    ))
+                }
+            }
         }
         SessionSelect::Resume(None) => Box::new(SqliteSessionStore::continue_recent(&dir)?),
     };
