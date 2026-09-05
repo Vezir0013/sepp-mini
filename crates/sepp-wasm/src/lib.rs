@@ -85,10 +85,32 @@ fn host_state(limits: &Limits, policy: Policy) -> HostState {
 /// Fähigkeiten geben **immer** ein JSON-Objekt zurück, auch im Fehlerfall — ein Plugin soll
 /// eine Erklärung bekommen, keinen Absturz.
 fn stage(caller: &mut Caller<'_, HostState>, json: serde_json::Value) -> i32 {
-    let bytes = json.to_string().into_bytes();
+    let bytes = staged_bytes(json);
     let n = bytes.len();
     caller.data_mut().result = bytes;
     n as i32
+}
+
+/// Serialisiert und deckelt auf [`MAX_PLUGIN_BYTES`].
+///
+/// Die Grenze muss **hier** greifen, nicht an der Rohgröße der Quelle: `from_utf8_lossy` macht
+/// aus jedem ungültigen Byte 3 Bytes U+FFFD und `serde_json` escaped Steuerbytes zu 6 — eine
+/// Datei knapp unter der Grenze kann so ein Vielfaches an Host-Speicher belegen, den das
+/// Page-Limit des Stores ausdrücklich nicht abdeckt. Nebenbei bliebe `n as i32` sonst nicht
+/// zwingend positiv.
+fn staged_bytes(json: serde_json::Value) -> Vec<u8> {
+    let bytes = json.to_string().into_bytes();
+    if bytes.len() > MAX_PLUGIN_BYTES as usize {
+        return serde_json::json!({
+            "error": format!(
+                "Ergebnis zu groß ({} > {MAX_PLUGIN_BYTES} Bytes)",
+                bytes.len()
+            )
+        })
+        .to_string()
+        .into_bytes();
+    }
+    bytes
 }
 
 /// Fehler-Ergebnis einer Fähigkeit.
@@ -306,11 +328,11 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
             "host_log",
             |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
                 if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
-                    let (a, b) = (ptr as usize, ptr as usize + len as usize);
-                    let msg = mem
-                        .data(&caller)
-                        .get(a..b)
-                        .map(|s| String::from_utf8_lossy(s).into_owned());
+                    // Über `read_input`, damit es im Linker genau einen Weg gibt, Modulspeicher
+                    // zu lesen: Die Inline-Rechnung hier klemmte negative Werte nicht und lief
+                    // bei `ptr = -1` in einen Additions-Overflow.
+                    let msg = read_input(&caller, &mem, ptr, len)
+                        .map(|s| String::from_utf8_lossy(&s).into_owned());
                     if let Some(msg) = msg {
                         tracing::info!(target: "wasm", "{msg}");
                         caller.data_mut().logs.push(msg);
@@ -350,12 +372,15 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
         )
         .map_err(|e| SeppError::Tool(format!("wasm linker host_result_read: {e}")))?;
 
-    // host_fs_read: nur mit FsRead-Capability. Führt aus, legt das Ergebnis bereit und liefert
-    // dessen Größe; abgeholt wird mit `host_result_read`.
+    // host_fs_read: nur mit FsRead-Capability — oder FsWrite, das laut `Policy::allows_path` und
+    // beiden Sandbox-Adaptern das Lesen einschließt. Ohne diesen Zweig bekäme ein Plugin mit
+    // reiner Schreibgewährung die Lesefunktion gar nicht erst hingelegt und lüde nicht einmal.
+    // Führt aus, legt das Ergebnis bereit und liefert dessen Größe; abgeholt wird mit
+    // `host_result_read`.
     if policy
         .granted
         .iter()
-        .any(|c| matches!(c, Capability::FsRead { .. }))
+        .any(|c| matches!(c, Capability::FsRead { .. } | Capability::FsWrite { .. }))
     {
         linker
             .func_wrap(
@@ -444,7 +469,10 @@ fn host_fs_read(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
         Err(e) => return stage_err(caller, format!("host_fs_read: {}: {e}", path.display())),
     };
     let text = String::from_utf8_lossy(&bytes);
-    let lossy = text.len() != bytes.len();
+    // Genau die Frage, die `from_utf8_lossy` beantwortet. Ein Längenvergleich läge daneben,
+    // sobald die ersetzte Sequenz zufällig so viele Bytes belegt wie das U+FFFD (etwa bei einer
+    // abgeschnittenen 4-Byte-Sequenz) — das Plugin bekäme dann `false` auf verfälschten Daten.
+    let lossy = matches!(text, std::borrow::Cow::Owned(_));
     stage(
         caller,
         serde_json::json!({ "bytes": bytes.len(), "text": text, "lossy": lossy }),
@@ -536,12 +564,27 @@ impl WasmHost {
         manifest_path: Option<&Path>,
         grant: Option<&Policy>,
     ) -> Result<WasmPlugin> {
+        let manifest = match manifest_path {
+            Some(p) => Some(Manifest::from_file(p)?),
+            None => None,
+        };
+        self.load_with_manifest(wasm_path, manifest, grant)
+    }
+
+    /// Wie [`Self::load_file_with_grant`], aber mit bereits geparstem Manifest — damit
+    /// `discover_with` die Datei nicht ein zweites Mal liest (und ein Parse-Fehler nicht zweimal
+    /// gemeldet wird).
+    fn load_with_manifest(
+        &self,
+        wasm_path: &Path,
+        manifest: Option<Manifest>,
+        grant: Option<&Policy>,
+    ) -> Result<WasmPlugin> {
         let wasm = std::fs::read(wasm_path)
             .map_err(|e| SeppError::Tool(format!("wasm read {}: {e}", wasm_path.display())))?;
         let mut notes = Vec::new();
-        let (requested, limits) = match manifest_path {
-            Some(p) => {
-                let manifest = Manifest::from_file(p)?;
+        let (requested, limits) = match manifest {
+            Some(manifest) => {
                 // Die unterstützte Protokollversion gehört dem Host, nicht der Policy — deshalb
                 // steht die Prüfung hier und nicht in `Manifest::parse`.
                 if manifest.abi > PLUGIN_ABI {
@@ -606,22 +649,31 @@ impl WasmHost {
                 .and_then(|s| s.to_str())
                 .unwrap_or("plugin")
                 .to_string();
-            // Ein unlesbares Manifest fiele auf den Dateistamm zurück und ergäbe damit den
-            // falschen Akteur — also nicht die Rechte, die gemeint waren. Das muss auffallen.
-            let parsed = manifest.as_deref().map(Manifest::from_file);
-            if let Some(Err(e)) = &parsed {
-                notes.push(format!(
-                    "WASM-Plugin {}: Manifest nicht lesbar ({e}) — der Name fällt auf \"{stem}\" \
-                     zurück, Rechte werden unter diesem Namen gesucht",
-                    path.display()
-                ));
-            }
-            let name = parsed
-                .and_then(|r| r.ok())
-                .map(|m| m.name)
+            // Ein unlesbares Manifest wird NICHT auf den Dateistamm zurückgefallen: Dann wäre
+            // auch `abi` unbekannt und würde stillschweigend als 1 gelesen — genau das, was
+            // „kaputt muss beim Laden sichtbar sein" abgeschafft hat. Einmal parsen, und bei
+            // einem Fehler eine einzige klare Meldung.
+            let manifest = match manifest.as_deref().map(Manifest::from_file) {
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => {
+                    notes.push(format!(
+                        "WASM-Plugin {} übersprungen: Manifest nicht lesbar ({e})",
+                        path.display()
+                    ));
+                    continue;
+                }
+                None => None,
+            };
+            let requested = manifest
+                .as_ref()
+                .map(|m| m.policy())
+                .unwrap_or_else(Policy::default);
+            let name = manifest
+                .as_ref()
+                .map(|m| m.name.clone())
                 .unwrap_or_else(|| stem.clone());
             let grant = grant_for(&name);
-            match self.load_file_with_grant(&path, manifest.as_deref(), grant.as_ref()) {
+            match self.load_with_manifest(&path, manifest, grant.as_ref()) {
                 Ok(mut p) => {
                     for n in p.take_notes() {
                         notes.push(format!("WASM-Plugin {}: {n}", path.display()));
@@ -630,25 +682,43 @@ impl WasmHost {
                 }
                 Err(e) => {
                     tracing::warn!("wasm-plugin {} übersprungen: {e}", path.display());
-                    // Der Hinweis auf die fehlende Gewährung passt nur, wenn das Modul an einem
-                    // Import gescheitert ist. Bei einem ABI-Konflikt oder einem fehlenden Export
-                    // führte er in die Irre.
-                    let hint = if grant.is_none() && e.to_string().contains("instantiate") {
-                        format!(
-                            " — es gibt keinen Abschnitt [plugin.{name}] in der policy.toml, \
-                             das Plugin bekommt deshalb keine Rechte"
-                        )
-                    } else {
-                        String::new()
-                    };
                     notes.push(format!(
-                        "WASM-Plugin {} übersprungen: {e}{hint}",
-                        path.display()
+                        "WASM-Plugin {} übersprungen: {e}{}",
+                        path.display(),
+                        import_hint(&e, &name, grant.as_ref(), &requested)
                     ));
                 }
             }
         }
         (out, notes)
+    }
+}
+
+/// Erklärt, warum ein Modul an einem Import gescheitert ist.
+///
+/// Rechte brauchen **beide** Hälften: die Gewährung in der `policy.toml` und die Anfrage im
+/// Manifest. Bisher hing der Hinweis allein an der fehlenden Gewährung — wer der Empfehlung des
+/// Tools folgte und `sepp policy allow …` ausführte, bekam danach nur noch ein nacktes
+/// `unknown import`, obwohl genau dann die zweite Hälfte zu erklären war.
+fn import_hint(e: &SeppError, name: &str, grant: Option<&Policy>, requested: &Policy) -> String {
+    // Bei einem ABI-Konflikt oder einem fehlenden Export führte jeder Rechte-Hinweis in die Irre.
+    if !e.to_string().contains("instantiate") {
+        return String::new();
+    }
+    match grant {
+        None => format!(
+            " — es gibt keinen Abschnitt [plugin.{name}] in der policy.toml, \
+             das Plugin bekommt deshalb keine Rechte"
+        ),
+        Some(_) if requested.granted.is_empty() => format!(
+            " — [plugin.{name}] gewährt Rechte, aber das Manifest fordert keine an \
+             (fehlender oder leerer [capabilities]-Block); eine Gewährung allein reicht nicht"
+        ),
+        Some(g) if g.intersect(requested).granted.is_empty() => format!(
+            " — [plugin.{name}] und das Manifest überschneiden sich nicht; \
+             wirksam ist nur der Schnitt aus beidem"
+        ),
+        Some(_) => String::new(),
     }
 }
 
@@ -970,19 +1040,28 @@ mod tests {
             "ohne Abschnitt in der policy.toml zählt das Manifest allein nicht"
         );
 
-        // discover_with: leere Gewährung und gar keine Gewährung führen beide zum Überspringen,
-        // aber nur die fehlende Gewährung nennt den fehlenden Abschnitt.
+        // discover_with: leere Gewährung und gar keine Gewährung führen beide zum Überspringen —
+        // aber aus verschiedenen Gründen, und die Meldung muss den richtigen nennen.
         let (plugins, notes) =
             host.discover_with(tmp.path(), &|name| (name == "netter").then(Policy::default));
         assert!(plugins.is_empty());
         assert_eq!(notes.len(), 1);
-        assert!(!notes[0].contains("[plugin.netter]"), "{}", notes[0]);
+        assert!(
+            notes[0].contains("überschneiden sich nicht"),
+            "der Abschnitt existiert, deckt aber nichts ab: {}",
+            notes[0]
+        );
+        assert!(
+            !notes[0].contains("es gibt keinen Abschnitt"),
+            "{}",
+            notes[0]
+        );
 
         let (plugins, notes) = host.discover_with(tmp.path(), &|_| None);
         assert!(plugins.is_empty(), "ohne Gewährung lädt nichts");
         assert_eq!(notes.len(), 1);
         assert!(
-            notes[0].contains("[plugin.netter]"),
+            notes[0].contains("es gibt keinen Abschnitt [plugin.netter]"),
             "die Meldung nennt den fehlenden Abschnitt: {}",
             notes[0]
         );
@@ -1001,18 +1080,19 @@ mod tests {
 
     #[test]
     fn unreadable_manifest_is_reported_not_swallowed() {
-        // Ein kaputtes Manifest fällt beim Namen auf den Dateistamm zurück. Unter der Regel
-        // „ohne Abschnitt keine Rechte" hieße das: Rechte werden unter dem falschen Namen
-        // gesucht. Das darf nicht still passieren.
+        // Ohne lesbares Manifest ist auch `abi` unbekannt und würde stillschweigend als 1
+        // gelesen. Das Plugin wird deshalb übersprungen — und zwar mit GENAU EINER Meldung,
+        // die das sagt. Früher standen hier zwei, von denen die erste einen Namens-Fallback
+        // versprach, den es nie gab.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("kaputt.wasm"), compute_wat()).unwrap();
         std::fs::write(tmp.path().join("kaputt.toml"), "das ist kein toml [[[").unwrap();
         let host = WasmHost::new();
-        let (_plugins, notes) = host.discover_with(tmp.path(), &|_| None);
-        assert!(
-            notes.iter().any(|n| n.contains("Manifest nicht lesbar")),
-            "{notes:?}"
-        );
+        let (plugins, notes) = host.discover_with(tmp.path(), &|_| None);
+        assert!(plugins.is_empty());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("übersprungen"), "{}", notes[0]);
+        assert!(notes[0].contains("Manifest nicht lesbar"), "{}", notes[0]);
     }
 
     #[tokio::test]
@@ -1354,6 +1434,86 @@ mod tests {
         assert_eq!(res.details["text"], "Hallo Welt");
         assert_eq!(res.details["bytes"], 10);
         assert_eq!(res.details["lossy"], false);
+    }
+
+    #[tokio::test]
+    async fn write_grant_alone_lets_a_plugin_read() {
+        // `allows_path` und beide Sandbox-Adapter zählen Schreiben als Lesen. Täte das
+        // Linker-Gate das nicht, bekäme dieses Plugin `host_fs_read` gar nicht erst hingelegt
+        // und lüde nicht einmal — bei einem Recht, das das Lesen ausdrücklich einschließt.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("daten.txt");
+        std::fs::write(&file, "Hallo Welt").unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, file.display());
+
+        let grant = Policy::new(vec![Capability::FsWrite {
+            prefix: dir.path().canonicalize().unwrap(),
+        }]);
+        let plugin = WasmHost::new()
+            .load(&fs_reader_wat(&req), grant, Limits::default())
+            .expect("lädt auch mit reiner FsWrite-Gewährung");
+
+        let res = plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(res.details["text"], "Hallo Welt");
+    }
+
+    #[tokio::test]
+    async fn lossy_is_reported_even_when_the_length_is_unchanged() {
+        // Eine abgeschnittene 4-Byte-Sequenz wird zu EINEM U+FFFD (3 Bytes) — gleiche Länge,
+        // aber verfälschter Inhalt. Der alte Längenvergleich meldete hier `false`.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("kaputt.bin");
+        std::fs::write(&file, [0xF0, 0x9F, 0x98]).unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, file.display());
+
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: dir.path().canonicalize().unwrap(),
+        }]);
+        let res = WasmHost::new()
+            .load(&fs_reader_wat(&req), grant, Limits::default())
+            .unwrap()
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(res.details["bytes"], 3);
+        assert_eq!(res.details["lossy"], true);
+    }
+
+    #[test]
+    fn staged_result_is_capped() {
+        let big = serde_json::json!({ "text": "x".repeat(MAX_PLUGIN_BYTES as usize + 1) });
+        let out = staged_bytes(big);
+        assert!(out.len() < MAX_PLUGIN_BYTES as usize);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("zu groß"),
+            "{:?}",
+            v["error"]
+        );
+        // Kleine Ergebnisse gehen unverändert durch.
+        let small = serde_json::json!({ "a": 1 });
+        assert_eq!(staged_bytes(small.clone()), small.to_string().into_bytes());
+    }
+
+    #[test]
+    fn host_log_survives_a_negative_pointer() {
+        // `ptr as usize + len as usize` lief bei -1 in einen Additions-Overflow und riss den
+        // Host-Call mit — aus der Start-Sektion heraus sogar außerhalb von `spawn_blocking`.
+        let wat = r#"(module
+  (import "env" "host_log" (func $log (param i32 i32)))
+  (memory (export "memory") 1)
+  (func $start (call $log (i32.const -1) (i32.const 5)))
+  (start $start)
+  (func (export "sepp_alloc") (param i32) (result i32) (i32.const 0))
+  (func (export "sepp_spec") (result i64) (i64.const 0))
+  (func (export "sepp_call") (param i32) (param i32) (result i64) (i64.const 0))
+)"#;
+        let module = wat::parse_str(wat).expect("wat");
+        // Kein Panic: Der Fehler darf höchstens ein normales Err sein.
+        let _ = WasmHost::new().load(&module, Policy::default(), Limits::default());
     }
 
     #[tokio::test]
