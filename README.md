@@ -290,6 +290,8 @@ name  = "string-tools"
 kind  = "wasm"
 entry = "string_tools.wasm"
 
+abi   = 1                   # Version des Plugin-Protokolls; fehlend = 1
+
 [capabilities]
 fs_read = ["/data"]
 
@@ -302,10 +304,17 @@ fuel_slice       = 1000000  # Instruktionen pro Zeitscheibe (Yield-Intervall)
 ### Ein Plugin schreiben
 
 Ein lauffähiges Beispiel samt Anleitung liegt unter
-[`examples/textstat-plugin/`](./examples/textstat-plugin/). Das Protokoll ist klein: Dein Modul
-exportiert `memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`. Der Rückgabewert `i64` trägt im
-oberen Wort die Adresse und im unteren die Länge. `sepp_spec` liefert die Werkzeugbeschreibung als
-JSON, `sepp_call` bekommt die Argumente als JSON und gibt das Ergebnis als JSON zurück.
+[`examples/textstat-plugin/`](./examples/textstat-plugin/). Das Protokoll ist klein und seit
+**ABI Version 1** festgezurrt; das Manifest deklariert sie über `abi`. Dein Modul exportiert
+`memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`, alle vier werden beim Laden geprüft. Der
+Rückgabewert `i64` trägt im oberen Wort die Adresse und im unteren die Länge. `sepp_spec` liefert
+die Werkzeugbeschreibung als JSON, `sepp_call` bekommt die Argumente als JSON und gibt das
+Ergebnis als JSON zurück.
+
+Aus dem Modul `env` bekommt ein Plugin vier Funktionen: `host_log` und `host_result_read` immer,
+`host_fs_read` mit dem Recht `fs_read`, `host_http` mit `net`. Eine Fähigkeit führt aus, legt ihr
+Ergebnis beim Host ab und meldet dessen Größe; abgeholt wird es mit `host_result_read` in einen
+Puffer, den das Plugin stellt.
 
 ```bash
 just plugin-example                     # baut das Beispiel
@@ -314,8 +323,9 @@ cp examples/textstat-plugin/textstat.toml ~/.sepp/plugins/
 ```
 
 Es gibt bewusst kein Freigeben im Protokoll: Der Host verwirft nach jedem Aufruf die ganze
-Instanz, ein Plugin hält also keinen Zustand zwischen zwei Aufrufen. Die weiteren Fallstricke
-stehen in der Anleitung.
+Instanz, ein Plugin hält also keinen Zustand zwischen zwei Aufrufen. Und die Standardbibliothek
+trägt für `wasm32-unknown-unknown` nur zur Hälfte, denn ein Modul hat weder Uhr noch Zufall noch
+Dateizugriff außer über die Importe. Die weiteren Fallstricke stehen in der Anleitung.
 
 ## Sicherheitsmodell
 
@@ -497,7 +507,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] Google-Provider-Adapter
 - [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
 - [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
-- [ ] `host_http`/`host_fs_read` für WASM-Plugins (heute Stubs; das Capability-Gate ist echt)
+- [x] Plugin-ABI Version 1 festgezurrt, `host_fs_read` gebaut
+- [ ] `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
 - [ ] Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
 
 ## Mitwirken

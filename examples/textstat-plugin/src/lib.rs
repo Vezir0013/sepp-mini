@@ -14,10 +14,12 @@ use serde_json::json;
 
 // ── Das Protokoll ─────────────────────────────────────────────────────────────────────────
 //
-// Der Host erwartet vier Exports: `memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`.
-// `memory` und `sepp_spec` prüft er beim Laden, die beiden anderen erst beim ersten
-// Werkzeug-Aufruf. Ein Plugin ohne `sepp_alloc` lädt also scheinbar sauber und fällt erst
-// später um — beim Suchen nach dem Fehler ist das die erste Stelle zum Nachsehen.
+// Der Host erwartet vier Exports: `memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`. Alle
+// werden beim Laden geprüft, Name und Signatur. Fehlt einer oder hat er den falschen Typ, lädt
+// das Modul gar nicht erst und die Meldung nennt den erwarteten Typ.
+//
+// Das Manifest daneben deklariert über `abi`, gegen welche Version dieses Protokolls gebaut
+// wurde. Ohne Angabe gilt 1.
 
 /// Packt Zeiger und Länge in den Rückgabewert: oberes Wort Zeiger, unteres Wort Länge.
 ///
@@ -80,8 +82,11 @@ pub extern "C" fn sepp_spec() -> i64 {
 
 // `host_log` schreibt eine Zeile ins Log des Hosts. Immer verfügbar, ohne jede Gewährung.
 //
-// Die beiden anderen Host-Funktionen, `host_fs_read` und `host_http`, dürfen hier NICHT
-// deklariert werden: Der Host registriert sie nur bei passender Gewährung, und ein Import ohne
+// Ebenfalls immer verfügbar wäre `host_result_read(ptr, cap) -> i32`, mit dem man das Ergebnis
+// einer Fähigkeit abholt. Dieses Beispiel braucht es nicht, weil es keine Fähigkeit benutzt.
+//
+// Die beiden Fähigkeiten `host_fs_read` und `host_http` dürfen hier NICHT deklariert werden:
+// Der Host registriert sie nur bei passender Gewährung in der policy.toml, und ein Import ohne
 // sie verhindert die Instanziierung. Das Plugin würde dann gar nicht laden.
 extern "C" {
     fn host_log(ptr: i32, len: i32);

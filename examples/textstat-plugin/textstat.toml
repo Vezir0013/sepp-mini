@@ -5,6 +5,9 @@
 # Pflichtfeld — und der Schlüssel, unter dem Sepp Guard die Rechte sucht: [plugin.textstat].
 name = "textstat"
 
+# Version des Plugin-Protokolls. Der Host lehnt ab, was er nicht kennt; ohne Angabe gilt 1.
+abi = 1
+
 version     = "0.1.0"
 kind        = "wasm"
 entry       = "textstat.wasm"

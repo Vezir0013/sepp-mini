@@ -7,14 +7,61 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
+- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
+- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, Rechte als
+  Zustimmung bei der Installation
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.1.22] - 2026-09-05
+
+Das Plugin-ABI ist **festgezurrt (Version 1)**. WASM soll die Plugin-Welt von sepp mini tragen,
+bis hin zu einem Paketmanager mit Marktplatz. Das trägt nur, weil ein Modul von sich aus nichts
+kann und die Installation eines fremden Pakets damit zu einer Zustimmung wird statt zu einer
+Vertrauensfrage. Bevor das erste fremde Paket existiert, muss das Protokoll stehen: Danach ist
+jede Änderung ein Bruch für alle.
+
+### Geändert
+- **BRUCH: `host_fs_read` und `host_http` haben neue Signaturen** (`(i32,i32) -> i32`). Eine
+  Fähigkeit führt aus, legt ihr Ergebnis beim Host ab und meldet nur dessen Größe; abgeholt wird
+  es mit dem neuen **`host_result_read(ptr, cap) -> i32`** in einen Puffer, den das Plugin selbst
+  stellt. Die alte Form hätte verlangt, dass der Host aus der Host-Funktion heraus `sepp_alloc`
+  aufruft — dieser Rücksprung läuft nicht resumierbar und kollidiert mit dem Fuel-Slicing, das
+  den äußeren Aufruf in Zeitscheiben anhält. So wird nie doppelt gesendet, und niemand muss eine
+  Puffergröße raten.
+- **Alle vier Exports werden beim Laden geprüft**, Name und Signatur, direkt am kompilierten
+  Modul ohne Store. Bisher fielen `sepp_alloc` und `sepp_call` erst beim ersten Werkzeug-Aufruf
+  auf: Ein Plugin lud scheinbar sauber und starb später. Für ein Paket, das jemand installiert,
+  muss „kaputt" beim Laden sichtbar sein.
+- Eine Fähigkeit liefert **immer** ein JSON-Objekt, auch im Fehlerfall (`{"error":"…"}`), und
+  trappt nie. `host_http` ist weiterhin eine Attrappe, aber eine ehrliche: Sie erklärt, statt
+  eine Null zu liefern.
+- Die Obergrenze von 16 MiB gilt jetzt in **beide** Richtungen; bisher nur Plugin zu Host.
+
 ### Hinzugefügt
+- **`abi` im Plugin-Manifest** deklariert die Protokollversion; fehlend gilt als 1. Ein höherer
+  Wert als der des Hosts wird abgelehnt, mit einer Meldung, die beide Versionen nennt. Ohne
+  dieses Feld bräche jede spätere Protokolländerung stumm jedes vorhandene Plugin.
+- **Unbekannte Manifest-Felder werden gemeldet**, statt still verschluckt zu werden. Ein
+  Tippfehler wie `capabilites` kostete bisher eine lange Suche. Abgelehnt wird deshalb nicht:
+  Das ließe jedes neuere Paket auf einem älteren sepp scheitern.
+- **`host_fs_read` liest echte Dateien.** Der Pfad wird kanonisch aufgelöst und gegen dieselbe
+  Policy geprüft, die auch `read`, `write` und `edit` benutzen; ein Plugin kommt also nicht
+  weiter als der Agent selbst. Ergebnis ist `{"bytes":N,"text":"…","lossy":…}`.
+- Die Anleitung nennt jetzt auch, dass die Standardbibliothek für `wasm32-unknown-unknown` nur
+  zur Hälfte trägt: keine Uhr, kein Zufall, kein Dateizugriff außer über die Importe.
+
 - **Ein Beispiel-Plugin mit Anleitung** unter `examples/textstat-plugin/`. Bis jetzt gab es im
   ganzen Repository kein Beispiel, kein SDK und keine Vorlage; das Aufrufprotokoll stand nur in
   Modul-Kommentaren, und die einzige Implementierung waren WAT-Schnipsel in den Tests. Damit war
   Tier 2 ein Sicherheitsversprechen, das niemand einlösen konnte. Das Beispiel zählt Zeichen,
   Wörter und Zeilen, zeigt den Protokollteil offen zum Kopieren und benennt die vier Fallstricke:
-  das Vorzeichen beim Packen von Adresse und Länge, das fehlende Freigeben, die erst spät
-  geprüften Exports und die Host-Funktionen, die man ohne Gewährung nicht importieren darf.
+  das Vorzeichen beim Packen von Adresse und Länge, das fehlende Freigeben, die Host-Funktionen,
+  die man ohne Gewährung nicht importieren darf, und die nur halb tragende Standardbibliothek.
 - **`just plugin-example`** baut das Beispiel und installiert das WASM-Target bei Bedarf.
 - Ein `#[ignore]`-Test baut das Beispiel, lädt es in den Host und ruft es auf
   (`cargo test -p sepp-wasm -- --ignored`). Er läuft nicht in der CI, weil dort kein WASM-Target
@@ -24,14 +71,6 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 ### Behoben
 - `.gitignore` erfasste weder das `target/` eines Unterprojekts (der Eintrag ist an der Wurzel
   verankert) noch gebaute `*.wasm`-Dateien.
-
-### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
-- `host_http`/`host_fs_read` für WASM-Plugins (heute Stubs; das Capability-Gate ist echt)
-- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.1.21] - 2026-09-05
 
@@ -719,7 +758,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...HEAD
+[0.1.22]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...v0.1.19

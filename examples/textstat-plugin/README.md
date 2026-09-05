@@ -20,14 +20,14 @@ sepp neu starten.
 
 ## Was der Host erwartet
 
-Vier Exports, sonst nichts:
+Vier Exports, sonst nichts. Alle werden beim Laden geprüft, Name **und** Signatur:
 
-| Export | Signatur | Wann geprüft |
-|---|---|---|
-| `memory` | die exportierte Memory, Name exakt `memory` | beim Laden |
-| `sepp_spec` | `() -> i64` | beim Laden |
-| `sepp_alloc` | `(i32) -> i32` | **erst beim ersten Aufruf** |
-| `sepp_call` | `(i32, i32) -> i64` | **erst beim ersten Aufruf** |
+| Export | Signatur |
+|---|---|
+| `memory` | die exportierte Memory, Name exakt `memory` |
+| `sepp_spec` | `() -> i64` |
+| `sepp_alloc` | `(i32) -> i32` |
+| `sepp_call` | `(i32, i32) -> i64` |
 
 Der Rückgabewert `i64` trägt zwei Zahlen: im oberen Wort die Adresse, im unteren die Länge.
 
@@ -50,6 +50,42 @@ ist nur `content`; `details` und `is_error` darfst du weglassen:
 Was in `content` steht, sieht das Modell. Was in `details` steht, nicht: Das ist der Platz für
 Zahlen, die die Oberfläche verarbeiten soll, ohne das Kontextfenster zu füllen.
 
+## Was der Host anbietet
+
+Vier Importe aus dem Modul `env`. Zwei gibt es immer, zwei nur mit dem passenden Recht:
+
+| Import | Signatur | Gate |
+|---|---|---|
+| `host_log` | `(i32 ptr, i32 len)` | immer |
+| `host_result_read` | `(i32 ptr, i32 cap) -> i32` | immer |
+| `host_fs_read` | `(i32 ptr, i32 len) -> i32` | `fs_read` |
+| `host_http` | `(i32 ptr, i32 len) -> i32` | `net` |
+
+**Der Abholweg ist bei allen Fähigkeiten gleich.** Eine Fähigkeit führt aus, legt ihr Ergebnis
+beim Host ab und meldet nur dessen Größe. Du stellst dann einen passenden Puffer und holst es
+mit `host_result_read` ab:
+
+```rust
+let req = br#"{"path":"./daten.csv"}"#;
+let n = unsafe { host_fs_read(req.as_ptr() as i32, req.len() as i32) };
+let mut buf = vec![0u8; n as usize];
+let got = unsafe { host_result_read(buf.as_mut_ptr() as i32, n) };
+buf.truncate(got as usize);   // buf enthält jetzt das JSON-Ergebnis
+```
+
+Damit wird nie doppelt gesendet und du musst keine Größe raten. Das Ergebnis bleibt abrufbar,
+bis du die nächste Fähigkeit aufrufst, ein zu klein geratener Puffer kostet dich also nur einen
+zweiten Abholversuch.
+
+Eine Fähigkeit liefert **immer** ein JSON-Objekt, auch wenn etwas schiefgeht:
+
+```json
+{"bytes":42,"text":"…","lossy":false}      // host_fs_read, Erfolg
+{"error":"… liegt außerhalb der Rechte"}   // jede Fähigkeit, Fehler
+```
+
+`host_http` ist noch eine Attrappe und liefert konstant einen Fehler mit dieser Erklärung.
+
 ## Vier Dinge, die man einmal falsch macht
 
 **Das Vorzeichen beim Packen.** Ein `i32` mit gesetztem höchsten Bit schmiert beim Verbreitern
@@ -65,16 +101,16 @@ Speicher gehört ab dem Aufruf dem Host, und der Puffer muss die Rückkehr aus `
 `std::mem::forget`. Das leckt nicht dauerhaft: Der Host wirft nach jedem Aufruf die ganze Instanz
 weg. Aus demselben Grund kann ein Plugin **keinen Zustand über zwei Aufrufe hinweg** halten.
 
-**Fehlende Exports fallen spät auf.** `sepp_alloc` und `sepp_call` sucht der Host erst beim ersten
-Werkzeug-Aufruf. Ein Plugin ohne sie lädt scheinbar sauber und stirbt später mit
-`wasm: sepp_alloc fehlt`. Wenn ein Plugin geladen wird, aber beim Benutzen umfällt: hier
-nachsehen.
+**Nur importieren, was du gewährt bekommst.** `host_fs_read` und `host_http` registriert der Host
+nur, wenn die Policy das passende Recht hergibt. Importierst du eine davon ohne Gewährung,
+scheitert schon die Instanziierung und das Plugin lädt gar nicht. Wer nichts anfordert, kommt
+ohne einen `[plugin.<name>]`-Abschnitt aus, so wie dieses Beispiel.
 
-**Nur `host_log` importieren.** Die beiden anderen Host-Funktionen, `host_fs_read` und
-`host_http`, registriert der Host nur, wenn die Policy das passende Recht gewährt. Importierst du
-eine davon ohne Gewährung, scheitert schon die Instanziierung und das Plugin lädt gar nicht.
-Beide sind derzeit ohnehin leere Hüllen und liefern konstant null; ein Plugin kann heute rechnen
-und protokollieren.
+**Die Standardbibliothek trägt nur zur Hälfte.** Rust lässt sich für `wasm32-unknown-unknown` mit
+`std` bauen, aber alles darin, was das Betriebssystem braucht, ist eine Attrappe. Eine
+Zeitmessung schlägt fehl, `std::fs` gibt Fehler zurück, und ein Zufallsgenerator hat keine
+Quelle. Ein Modul hat weder Uhr noch Zufall noch Umgebungsvariablen: Es kann nur, was der Host
+über die Importe hineinreicht. Wer eine Datei lesen will, nimmt `host_fs_read`, nicht `std::fs`.
 
 ## Wenn dein Plugin Rechte braucht
 
@@ -105,6 +141,11 @@ importieren, bewirkt nichts. Prüfen lässt sich die Lage jederzeit mit `sepp po
 Pflicht ist einzig `name`, und zwar als Schlüssel: Unter diesem Namen sucht Sepp Guard den
 `[plugin.<name>]`-Abschnitt. `kind` und `entry` sind heute reine Dokumentation und werden nicht
 ausgewertet; der Loader geht über die vorgefundenen `*.wasm`-Dateien.
+
+Wichtig ist `abi`: die Version des Protokolls, gegen die du gebaut hast. Fehlt die Angabe, gilt 1.
+Ein höherer Wert als der, den dein sepp spricht, führt zur Ablehnung mit einer Meldung, die beide
+Versionen nennt. Felder, die der Host nicht kennt, werden gelesen, ignoriert und beim Start
+gemeldet — ein Tippfehler wie `capabilites` verschwindet also nicht stumm.
 
 Gefunden wird das Manifest als `<stamm>.toml` neben `<stamm>.wasm`, ersatzweise als
 `manifest.toml` im selben Verzeichnis, die dann für alle Module dort gilt. Deshalb setzt die
