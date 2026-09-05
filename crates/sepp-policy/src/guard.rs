@@ -713,10 +713,14 @@ pub struct AuditEvent {
 }
 
 /// Ergebnis einer erfolgreichen Autorisierung: zusätzliche, nur für diesen Aufruf geltende
-/// Rechte (Antwort „einmal").
+/// Rechte (Antwort „einmal") und die protokollierte Entscheidung **dieses** Aufrufs.
+///
+/// `audit` gehört bewusst hierher und nicht in den Guard-Zustand: Tool-Calls laufen parallel,
+/// [`Guard::last_audit`] würde einem Aufruf die Entscheidung eines anderen unterschieben.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Authorization {
     pub extra: Vec<Capability>,
+    pub audit: Option<AuditEvent>,
 }
 
 /// Der Entscheider. Hält das Regelwerk, den Modus, den Sandbox-Adapter, die Sitzungs-Gewährungen
@@ -867,13 +871,23 @@ impl Guard {
         }
     }
 
-    fn record(&self, actor: &Actor, action: &Action, decision: &str, detail: Option<String>) {
-        lock(&self.audit).push(AuditEvent {
+    /// Protokolliert eine Entscheidung und gibt sie zurück, damit der Aufrufer genau sein
+    /// eigenes Ereignis weiterreichen kann (statt es aus dem geteilten Audit zu fischen).
+    fn record(
+        &self,
+        actor: &Actor,
+        action: &Action,
+        decision: &str,
+        detail: Option<String>,
+    ) -> AuditEvent {
+        let ev = AuditEvent {
             actor: actor.clone(),
             action: action.to_string(),
             decision: decision.to_string(),
             detail,
-        });
+        };
+        lock(&self.audit).push(ev.clone());
+        ev
     }
 
     fn hint_text(&self, actor: &Actor, action: &Action) -> String {
@@ -909,8 +923,11 @@ impl Guard {
     pub async fn authorize(&self, actor: &Actor, action: Action) -> Result<Authorization> {
         match self.decide(actor, &action) {
             Decision::Allow => {
-                self.record(actor, &action, "allow", None);
-                Ok(Authorization::default())
+                let ev = self.record(actor, &action, "allow", None);
+                Ok(Authorization {
+                    extra: Vec::new(),
+                    audit: Some(ev),
+                })
             }
             Decision::Deny { reason } => {
                 self.record(actor, &action, "deny", Some(reason.clone()));
@@ -944,24 +961,31 @@ impl Guard {
                 let cap = cap_for(&action);
                 match answer {
                     PermissionAnswer::Once => {
-                        self.record(actor, &action, "allow (einmal)", Some(reason));
+                        let ev = self.record(actor, &action, "allow (einmal)", Some(reason));
                         Ok(Authorization {
                             extra: cap.into_iter().collect(),
+                            audit: Some(ev),
                         })
                     }
                     PermissionAnswer::Session => {
                         self.grant_for_session(&action, cap);
-                        self.record(actor, &action, "allow (Sitzung)", Some(reason));
-                        Ok(Authorization::default())
+                        let ev = self.record(actor, &action, "allow (Sitzung)", Some(reason));
+                        Ok(Authorization {
+                            extra: Vec::new(),
+                            audit: Some(ev),
+                        })
                     }
                     PermissionAnswer::Always => {
                         self.grant_for_session(&action, cap);
                         let detail = self.persist(actor, &action);
-                        self.record(actor, &action, "allow (dauerhaft)", Some(reason));
+                        let ev = self.record(actor, &action, "allow (dauerhaft)", Some(reason));
                         if let Some(msg) = detail {
                             lock(&self.notices).push(msg);
                         }
-                        Ok(Authorization::default())
+                        Ok(Authorization {
+                            extra: Vec::new(),
+                            audit: Some(ev),
+                        })
                     }
                     PermissionAnswer::No => {
                         self.record(actor, &action, "deny (Nutzer)", Some(reason.clone()));
@@ -1768,6 +1792,31 @@ command = ["uvx", "mcp-server-git"]
         assert_eq!(events[0].decision, "allow");
         assert_eq!(Guard::audit_json(&events[1])["decision"], "deny");
         assert!(g.drain_audit().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_authorize_each_gets_its_own_event() {
+        // Tool-Calls laufen parallel. Jeder Aufruf muss seine eigene Entscheidung
+        // zurückbekommen — `last_audit()` würde hier den Eintrag des jeweils anderen liefern.
+        let env = Env::new();
+        let g = Arc::new(env.guard(Mode::Auto, &[]));
+        let inside = env.root.join("proj/a");
+        let outside = env.root.join("home/b");
+
+        let (g1, g2) = (Arc::clone(&g), Arc::clone(&g));
+        let (p1, p2) = (inside.clone(), outside.clone());
+        let a = tokio::spawn(async move { g1.authorize(&Actor::Agent, Action::FsRead(p1)).await });
+        let b = tokio::spawn(async move { g2.authorize(&Actor::Agent, Action::FsRead(p2)).await });
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+        let ok = a.expect("Pfad im Projekt ist erlaubt");
+        let ev = ok.audit.expect("Erfolg trägt seine Entscheidung");
+        assert_eq!(ev.decision, "allow");
+        assert!(ev.action.contains(&inside.display().to_string()), "{ev:?}");
+        assert!(b.is_err(), "Pfad außerhalb muss verweigert werden");
+
+        // Beide Entscheidungen stehen trotzdem im gemeinsamen Audit.
+        assert_eq!(g.drain_audit().len(), 2);
     }
 
     #[tokio::test]

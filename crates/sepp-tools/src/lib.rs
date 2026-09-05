@@ -94,9 +94,12 @@ pub(crate) async fn authorize(guard: Option<&Arc<Guard>>, action: Action) -> Res
             audit: None,
         }),
         Some(g) => {
-            let res = g.authorize(&Actor::Agent, action).await;
-            let audit = g.last_audit().map(|ev| Guard::audit_json(&ev));
-            Ok(Authorized { auth: res?, audit })
+            // Das Ereignis kommt aus der `Authorization` dieses Aufrufs, nicht aus dem geteilten
+            // Guard-Audit — Tool-Calls laufen parallel und würden sich sonst gegenseitig den
+            // Eintrag wegnehmen.
+            let auth = g.authorize(&Actor::Agent, action).await?;
+            let audit = auth.audit.as_ref().map(Guard::audit_json);
+            Ok(Authorized { auth, audit })
         }
     }
 }
