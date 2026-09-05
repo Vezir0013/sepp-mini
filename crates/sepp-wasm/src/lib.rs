@@ -313,21 +313,48 @@ impl WasmHost {
 
     /// Lädt ein Plugin aus einer Datei; Capabilities und Limits aus dem (optionalen) Manifest.
     pub fn load_file(&self, wasm_path: &Path, manifest_path: Option<&Path>) -> Result<WasmPlugin> {
+        self.load_file_with_grant(wasm_path, manifest_path, None)
+    }
+
+    /// Wie [`WasmHost::load_file`], zusätzlich mit einer Gewährung aus der Policy-Datei
+    /// (`[plugin.<name>]`, Sepp Guard): effektiv gilt der **Schnitt** aus Manifest-Anfrage und
+    /// Gewährung. Ohne Gewährung (`None`) gilt die Manifest-Policy (bisheriges Verhalten).
+    pub fn load_file_with_grant(
+        &self,
+        wasm_path: &Path,
+        manifest_path: Option<&Path>,
+        grant: Option<&Policy>,
+    ) -> Result<WasmPlugin> {
         let wasm = std::fs::read(wasm_path)
             .map_err(|e| SeppError::Tool(format!("wasm read {}: {e}", wasm_path.display())))?;
-        let (policy, limits) = match manifest_path {
+        let (requested, limits) = match manifest_path {
             Some(p) => {
                 let manifest = Manifest::from_file(p)?;
                 (manifest.policy(), manifest.limits.clone())
             }
             None => (Policy::default(), Limits::default()),
         };
+        let policy = match grant {
+            Some(g) => g.intersect(&requested),
+            None => requested,
+        };
         self.load(&wasm, policy, limits)
     }
 
     /// Findet `*.wasm` in `dir` (Manifest: `<stem>.toml` oder `manifest.toml` daneben) und lädt
-    /// sie. Fehlerhafte Plugins werden übersprungen (geloggt).
+    /// sie mit der Manifest-Policy. Fehlerhafte Plugins werden übersprungen (geloggt).
     pub fn discover(&self, dir: &Path) -> Vec<WasmPlugin> {
+        self.discover_with(dir, &|_| None)
+    }
+
+    /// Wie [`WasmHost::discover`], mit Gewährung je Plugin-Name (Manifest-`name`, sonst
+    /// Dateistamm): `grant_for(name)` liefert `Some(policy)` aus `[plugin.<name>]` oder `None`
+    /// (dann gilt das Manifest).
+    pub fn discover_with(
+        &self,
+        dir: &Path,
+        grant_for: &dyn Fn(&str) -> Option<Policy>,
+    ) -> Vec<WasmPlugin> {
         let mut out = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else {
             return out;
@@ -346,7 +373,18 @@ impl WasmHost {
             } else {
                 None
             };
-            match self.load_file(&path, manifest.as_deref()) {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("plugin")
+                .to_string();
+            let name = manifest
+                .as_deref()
+                .and_then(|m| Manifest::from_file(m).ok())
+                .map(|m| m.name)
+                .unwrap_or(stem);
+            let grant = grant_for(&name);
+            match self.load_file_with_grant(&path, manifest.as_deref(), grant.as_ref()) {
                 Ok(p) => out.push(p),
                 Err(e) => tracing::warn!("wasm-plugin {} übersprungen: {e}", path.display()),
             }
@@ -365,6 +403,11 @@ pub struct WasmPlugin {
 }
 
 impl WasmPlugin {
+    /// Effektive Policy des Plugins (Manifest-Anfrage, ggf. mit Gewährung geschnitten).
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
     /// Überschreibt den exponierten Tool-Namen (für Kollisions-Präfixe im gemeinsamen Toolset).
     pub fn rename(&mut self, name: String) {
         self.spec.label = name.clone();
@@ -620,6 +663,49 @@ mod tests {
             sepp_core::ContentBlock::Text { text } => text,
             other => panic!("Text erwartet, war: {other:?}"),
         }
+    }
+
+    #[test]
+    fn grant_intersection_removes_net_import() {
+        // Manifest VERLANGT net; die Gewährung entscheidet. Ohne Gewährung gilt das Manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("netter.wasm");
+        std::fs::write(&wasm, net_wat()).unwrap();
+        let manifest = tmp.path().join("netter.toml");
+        std::fs::write(
+            &manifest,
+            "name = \"netter\"\nkind = \"wasm\"\n[capabilities]\nnet = [\"example.com\"]\n",
+        )
+        .unwrap();
+        let host = WasmHost::new();
+
+        // Gewährung ohne net → Schnitt ohne net → host_http fehlt → lädt nicht.
+        let denied = host.load_file_with_grant(&wasm, Some(&manifest), Some(&Policy::default()));
+        assert!(
+            denied.is_err(),
+            "ohne Gewährung darf das Plugin nicht laden"
+        );
+
+        // Gewährung mit net → lädt; effektive Policy enthält genau den gewährten Host.
+        let grant = Policy::new(vec![Capability::Net {
+            host: "example.com".into(),
+        }]);
+        let ok = host
+            .load_file_with_grant(&wasm, Some(&manifest), Some(&grant))
+            .unwrap();
+        assert!(ok.policy().net_allowed());
+
+        // Keine Gewährung → Manifest-Policy (kompatibel).
+        let legacy = host
+            .load_file_with_grant(&wasm, Some(&manifest), None)
+            .unwrap();
+        assert!(legacy.policy().net_allowed());
+
+        // discover_with: Gewährung per Name; `netter` ohne net wird übersprungen.
+        let none = host.discover_with(tmp.path(), &|name| (name == "netter").then(Policy::default));
+        assert!(none.is_empty());
+        let some = host.discover_with(tmp.path(), &|_| None);
+        assert_eq!(some.len(), 1);
     }
 
     #[tokio::test]
