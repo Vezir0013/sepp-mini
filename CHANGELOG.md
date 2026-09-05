@@ -9,9 +9,49 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- `host_http`/`host_fs_read` für WASM-Plugins (heute Stubs; das Capability-Gate ist echt)
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter
+
+## [0.1.21] - 2026-09-05
+
+Sepp Guard: **ein Regelwerk, eine Datei.** Der Leitsatz stimmte beim Regelwerk nicht. Rechte für
+MCP-Server standen in zwei Dateien mit unterschiedlicher Verknüpfung, ein Verbot konnte kein Netz
+zurücknehmen, und ein WASM-Plugin bekam ohne Gegenzeichnung, was sein eigenes Manifest verlangte.
+Jetzt sagt die `settings.toml`, **was läuft**, und die `policy.toml`, **was es darf**.
+
+### Geändert
+- **BRUCH: `[mcp.servers.capabilities]` in der settings.toml wird nicht mehr ausgewertet.**
+  Rechte eines MCP-Servers kommen ausschließlich aus `policy.toml [mcp.<name>]`; die frühere
+  Vereinigung beider Quellen entfällt. Steht der alte Block noch da, meldet sepp das beim Start
+  und `sepp policy` zeigt ihn als wirkungslos an. Es gibt bewusst keinen Migrationsbefehl.
+- **BRUCH: Ein WASM-Plugin ohne `[plugin.<name>]` bekommt keine Rechte.** Bisher galt in diesem
+  Fall das Manifest allein. Ein Manifest liegt aber neben der wasm-Datei und stammt vom Autor des
+  Plugins; ohne Gegenzeichnung ist es eine Absichtserklärung, keine Grenze. Ein Plugin, das etwas
+  fordert, das niemand gewährt hat, lädt nicht mehr.
+- `WasmHost::discover_with` liefert zusätzlich die Meldungen zu übersprungenen Plugins;
+  `WasmHost::discover` und `load_file` sind entfallen. `sepp_mcp::connect` verbindet ohne Rechte
+  und ist nur noch für `examples/probe.rs` gedacht.
+
+### Hinzugefügt
+- **`[deny] net`** nimmt Netzrechte zurück, gegen jede Quelle und jeden Akteur. `net = true` oder
+  `net = ["*"]` ist der Hauptschalter. Eine konkrete Hostliste sperrt ebenfalls alles und sagt
+  warum: Hostfilter brauchen den Egress-Proxy. Ein Verbot, das nicht wirkt, wäre gefährlicher als
+  eines, das zu breit wirkt. Für `exec` und `env` bleibt es bei einer Warnung, weil Landlock dort
+  nur Erlaubnislisten kennt.
+- Unter einem Netzverbot wird ein MCP-Server mit `transport = "http"` **gar nicht erst
+  verbunden**. Er wäre sonst der einzige Weg, doch nach draußen zu kommen.
+
+### Behoben
+- **Übersprungene Plugins und MCP-Server waren in der TUI unsichtbar.** Sie wurden nur geloggt
+  bzw. auf stderr geschrieben, und die TUI zeigt beides nicht. Jetzt erscheinen sie als
+  Startmeldung, bei fehlender Gewährung samt Namen des fehlenden Abschnitts.
+- Ein unlesbares Plugin-Manifest fiel beim Namen still auf den Dateistamm zurück. Damit wurden
+  die Rechte unter dem falschen Namen gesucht. Das wird jetzt gemeldet.
+- Warnungen zum Regelwerk erschienen im Modus `yolo` nie, weil sie im falschen Zweig hingen.
+- `/policy` in der TUI zeigte weder MCP-Server noch Plugins, weil die Zeilen dort nicht
+  eingesammelt wurden. Terminal und TUI zeigen jetzt dasselbe.
 
 ## [0.1.20] - 2026-09-05
 
@@ -660,7 +700,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...v0.1.18

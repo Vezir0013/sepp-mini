@@ -278,11 +278,10 @@ Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
 name = "git"
 transport = "stdio"
 command = ["uvx", "mcp-server-git"]
-[mcp.servers.capabilities]
-fs_read  = ["./"]
-fs_write = ["./"]
-exec     = ["git"]
 ```
+
+Was ein Server **darf**, steht nicht hier, sondern in der `policy.toml` unter `[mcp.git]`. Die
+settings.toml sagt, was läuft; das Regelwerk sagt, was es darf.
 
 Beispiel `manifest.toml` (WASM-Plugin mit Capabilities und Ressourcen-Limits):
 
@@ -330,9 +329,9 @@ Erweiterungen zu sandboxen reicht nicht, wenn das Modell über `bash` alles darf
 | `bash` | Rückfrage-Muster, Audit | OS-Sandbox mit der Agent-Policy: Environment geleert bis auf eine Allowlist, Dateisystem via Landlock (Linux) / Seatbelt (macOS), TCP verboten ohne `net`, Exec-Allowlist bei `exec`-Liste |
 | `read` / `write` / `edit` | Pfadprüfung (kanonisch, auch für neue Dateien und Symlinks) | in-process |
 | `task` (Sub-Agent) | erbt die Guard-Tools | wie oben |
-| MCP stdio | `[mcp.<name>]` ∪ `capabilities`, minus Verbote | wie bisher, plus Netz/Exec; stderr des Servers landet im Log |
-| MCP http | keine | keine (remote) |
-| WASM | `[plugin.<name>]` ∩ Manifest | wasmi-Linker-Gate |
+| MCP stdio | `[mcp.<name>]`, minus Verbote | wie bisher, plus Netz/Exec; stderr des Servers landet im Log |
+| MCP http | keine | keine (remote); unter `[deny] net` wird gar nicht erst verbunden |
+| WASM | `[plugin.<name>]` ∩ Manifest, ohne Abschnitt nichts | wasmi-Linker-Gate |
 
 **Defaults ohne Konfiguration:** Projekt und Systempfade lesbar, Projekt und `$TMPDIR` schreibbar,
 Ausführen unbeschränkt, **kein Netz**, minimale Umgebung (`PATH HOME LANG LC_* TERM TMPDIR`),
@@ -375,16 +374,22 @@ env      = ["CARGO_HOME"]
 [agent.ask]
 patterns = ["rm -rf", "git push --force"]
 
-[mcp.git]                        # ergänzt [mcp.servers.capabilities]
+[mcp.git]                        # die einzige Rechtequelle für diesen Server
 fs_write = ["./"]
 exec     = ["git"]
 
 [plugin.string-tools]            # Gewährung; effektiv: Schnitt mit dem Manifest
 net      = ["api.example.com"]
 
-[deny]                           # gewinnt immer
+[deny]                           # gewinnt gegen jede Quelle und jeden Akteur
 fs_read  = ["~/.config/secrets"]
+net      = true                  # Hauptschalter: niemand kommt ins Netz
 ```
+
+**Wer nichts einträgt, gewährt nichts.** Ein Manifest ist die Selbstauskunft des Plugin-Autors,
+keine Grenze: Ohne `[plugin.<name>]` bekommt ein Plugin keine Rechte, und eines, das im Manifest
+etwas fordert, lädt gar nicht erst. Die Meldung dazu erscheint beim Start und nennt den fehlenden
+Abschnitt.
 
 `sepp init` legt die Datei an und aktiviert das Preset für erkannte Projekttypen (Rust, Node,
 Python). `sepp policy` zeigt die effektiven Rechte je Akteur mit Quelle und Vollstrecker und
@@ -422,7 +427,9 @@ Kind-Sessions zu; `--json` gibt ein Objekt je Eintrag aus, etwa für
 **Grenzen, ehrlich benannt:** Landlock kennt keine Verbote unterhalb einer Gewährung (ein Deny
 unter `fs_read = ["~"]` gilt für `bash` nicht, für `read`/`write`/`edit` schon; `sepp policy`
 meldet solche Überlappungen). Netz ist für Kindprozesse „ganz oder gar nicht"; der Host-Filter
-kommt mit dem Egress-Proxy. Das TCP-Verbot braucht Landlock ABI 4 (Kernel ≥ 6.7). Exec-Listen sind
+kommt mit dem Egress-Proxy, und deshalb sperrt auch ein `[deny] net` mit Hostliste alles, mit
+Hinweis. Verbieten lassen sich nur Pfade und Netz; `exec` und `env` kann `[deny]` nicht, weil
+Landlock für beides nur Erlaubnislisten kennt. Das TCP-Verbot braucht Landlock ABI 4 (Kernel ≥ 6.7). Exec-Listen sind
 auf macOS wegen Apples Shims fragil. Unter Guard verliert die Shell alle nicht freigegebenen
 Umgebungsvariablen (`[agent].env` ist der Schalter). Im Audit stehen Entscheidungen aus einem
 Sub-Agent-Lauf in der Wurzel-Spur, nicht in der Kind-Session: alle Tools teilen sich einen Guard,
