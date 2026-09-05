@@ -20,11 +20,23 @@
 //! Ausführung im erhaltenen Zustand fort (`call_resumable`, kein Neustart).
 //! `max_wall_time_ms = 0` heißt beliebig lange laufen dürfen — niemals unkontrollierbar sein.
 //!
-//! Plugin-ABI (Exports): `sepp_alloc(i32)->i32`, `sepp_spec()->i64`, `sepp_call(i32,i32)->i64`.
-//! Der Rückgabewert `i64` packt `(ptr<<32 | len)`. `sepp_spec` liefert ToolSpec-JSON, `sepp_call`
-//! erhält die Argument-JSON und liefert ToolResult-JSON (beides im linearen Speicher).
-//! Gegatete Host-Importe (`env`-Modul): `host_log(i32,i32)` (immer), `host_fs_read`/`host_http`
-//! (nur bei passender Capability).
+//! **Plugin-ABI Version 1** ([`PLUGIN_ABI`]); ein Manifest deklariert sie über `abi`, ein
+//! höherer Wert wird abgelehnt.
+//!
+//! Exports, **alle vier beim Laden geprüft**: `sepp_alloc(i32)->i32`, `sepp_spec()->i64`,
+//! `sepp_call(i32,i32)->i64` und die Memory unter dem Namen `memory`. Der Rückgabewert `i64`
+//! packt `(ptr<<32 | len)`. `sepp_spec` liefert ToolSpec-JSON, `sepp_call` erhält die
+//! Argument-JSON und liefert ToolResult-JSON (beides im linearen Speicher).
+//!
+//! Importe aus dem Modul `env`: `host_log(i32,i32)` und `host_result_read(i32,i32)->i32` immer,
+//! `host_fs_read(i32,i32)->i32` mit `FsRead`, `host_http(i32,i32)->i32` mit `Net`.
+//!
+//! **Der Abholweg:** Eine Fähigkeit führt aus, legt ihr Ergebnis im Host ab und meldet dessen
+//! Größe; `host_result_read` kopiert es in einen Puffer, den das Plugin passend dimensioniert
+//! hat. Damit wird nie doppelt gesendet und niemand muss eine Größe raten. Die Alternative
+//! wäre, dass der Host aus der Host-Funktion heraus `sepp_alloc` aufruft — dieser Rücksprung
+//! läuft nicht resumierbar und kollidiert mit dem Fuel-Slicing. Eine Fähigkeit liefert immer
+//! ein JSON-Objekt, auch im Fehlerfall (`{"error":"…"}`), und trappt nie.
 
 use std::path::Path;
 use std::time::Instant;
@@ -47,20 +59,61 @@ struct HostState {
     /// Speicher-Deckel dieses Stores: `memory.grow` über dem Limit liefert dem Plugin `-1`
     /// (regulär, kein Trap) — Host-RAM bleibt flach, egal was das Plugin versucht.
     limits: StoreLimits,
+    /// Ergebnis der zuletzt aufgerufenen Fähigkeit, abholbar über `host_result_read`.
+    ///
+    /// Der Umweg über den Host ist Absicht: Die naheliegende Alternative wäre, dass der Host das
+    /// Ergebnis selbst in den Modulspeicher schreibt und dafür `sepp_alloc` aufruft. Dieser
+    /// Rücksprung läuft nicht resumierbar und kollidiert mit dem Fuel-Slicing. So stellt das
+    /// Plugin den Puffer, und ein zu klein geratener zwingt nicht zum erneuten Senden.
+    result: Vec<u8>,
+    /// Effektive Rechte dieses Plugins — die Host-Funktionen prüfen damit Pfade und Hosts.
+    policy: Policy,
 }
 
-fn host_state(limits: &Limits) -> HostState {
+fn host_state(limits: &Limits, policy: Policy) -> HostState {
     HostState {
         logs: Vec::new(),
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes())
             .build(),
+        result: Vec::new(),
+        policy,
     }
 }
 
-/// Obergrenze für Plugin-Rückgaben (ToolSpec-/ToolResult-JSON), damit ein bösartiges Plugin
-/// den Host nicht durch eine riesige `len` zu einer GB-Allokation zwingt.
+/// Legt ein Ergebnis für `host_result_read` bereit und liefert dessen Größe zurück.
+/// Fähigkeiten geben **immer** ein JSON-Objekt zurück, auch im Fehlerfall — ein Plugin soll
+/// eine Erklärung bekommen, keinen Absturz.
+fn stage(caller: &mut Caller<'_, HostState>, json: serde_json::Value) -> i32 {
+    let bytes = json.to_string().into_bytes();
+    let n = bytes.len();
+    caller.data_mut().result = bytes;
+    n as i32
+}
+
+/// Fehler-Ergebnis einer Fähigkeit.
+fn stage_err(caller: &mut Caller<'_, HostState>, msg: impl std::fmt::Display) -> i32 {
+    stage(caller, serde_json::json!({ "error": msg.to_string() }))
+}
+
+/// Liest die Eingabe einer Fähigkeit aus dem Modulspeicher.
+fn read_input(caller: &Caller<'_, HostState>, mem: &Memory, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    let (a, b) = (
+        ptr.max(0) as usize,
+        ptr.max(0) as usize + len.max(0) as usize,
+    );
+    mem.data(caller).get(a..b).map(<[u8]>::to_vec)
+}
+
+/// Obergrenze für Nutzdaten in **beide** Richtungen: für Plugin-Rückgaben (ToolSpec-/
+/// ToolResult-JSON), damit ein bösartiges Plugin den Host nicht durch eine riesige `len` zu einer
+/// GB-Allokation zwingt, und für Ergebnisse der Host-Fähigkeiten, damit eine große Datei oder
+/// Antwort nicht den Speicher des Moduls sprengt.
 const MAX_PLUGIN_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Version des Plugin-Protokolls, die dieser Host spricht. Ein Manifest mit höherer Angabe wird
+/// abgelehnt — lieber gar nicht laden als mit falschen Erwartungen laufen.
+pub const PLUGIN_ABI: u32 = 1;
 
 /// Fuel-Tank für `instantiate_and_start`: die Start-Sektion ist nicht resumierbar und bekommt
 /// deshalb ein festes, großzügiges Einmal-Budget statt Slicing — fail-closed bei Überschreitung.
@@ -70,6 +123,57 @@ const START_FUEL: u64 = 10_000_000;
 /// gibt es keinen Abbruchkanal, also gilt hier IMMER ein hartes Budget — auch wenn das Manifest
 /// für Tool-Calls `max_wall_time_ms = 0` (unbegrenzt) erlaubt.
 const LOAD_WALL_MS: u64 = 5_000;
+
+/// Prüft die vier Pflicht-Exports samt Signatur — ohne Store, ohne Instanziierung, direkt am
+/// kompilierten Modul. Kostet kein Fuel und meldet den erwarteten Typ, damit ein Autor weiß,
+/// was er falsch gemacht hat.
+fn check_exports(module: &Module) -> Result<()> {
+    use wasmi::{ExternType, ValType};
+
+    let want: &[(&str, &[ValType], &[ValType])] = &[
+        ("sepp_alloc", &[ValType::I32], &[ValType::I32]),
+        ("sepp_spec", &[], &[ValType::I64]),
+        ("sepp_call", &[ValType::I32, ValType::I32], &[ValType::I64]),
+    ];
+    for (name, params, results) in want {
+        match module.get_export(name) {
+            Some(ExternType::Func(ty)) if ty.params() == *params && ty.results() == *results => {}
+            Some(ExternType::Func(ty)) => {
+                return Err(SeppError::Tool(format!(
+                    "wasm: Export `{name}` hat die falsche Signatur (({}) -> ({})), erwartet \
+                     wird (({}) -> ({}))",
+                    join_types(ty.params()),
+                    join_types(ty.results()),
+                    join_types(params),
+                    join_types(results)
+                )))
+            }
+            Some(_) => {
+                return Err(SeppError::Tool(format!(
+                    "wasm: `{name}` ist exportiert, aber keine Funktion"
+                )))
+            }
+            None => {
+                return Err(SeppError::Tool(format!(
+                    "wasm: Export `{name}` fehlt (erwartet: ({}) -> ({}))",
+                    join_types(params),
+                    join_types(results)
+                )))
+            }
+        }
+    }
+    match module.get_export("memory") {
+        Some(ExternType::Memory(_)) => Ok(()),
+        _ => Err(SeppError::Tool("wasm: kein 'memory'-Export".into())),
+    }
+}
+
+fn join_types(ts: &[wasmi::ValType]) -> String {
+    ts.iter()
+        .map(|t| format!("{t:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn unpack(v: i64) -> (u32, u32) {
     (((v >> 32) & 0xffff_ffff) as u32, (v & 0xffff_ffff) as u32)
@@ -216,7 +320,38 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
         )
         .map_err(|e| SeppError::Tool(format!("wasm linker host_log: {e}")))?;
 
-    // host_fs_read: nur mit FsRead-Capability (Stub — echte Implementierung folgt).
+    // host_result_read: immer verfügbar. Holt das Ergebnis der zuletzt aufgerufenen Fähigkeit
+    // in einen Puffer, den das Plugin selbst gestellt hat. Kopiert höchstens `cap` Bytes und
+    // liefert die kopierte Zahl; ohne anliegendes Ergebnis null. Das Ergebnis bleibt erhalten,
+    // bis die nächste Fähigkeit läuft — ein zu klein geratener Puffer zwingt also nicht dazu,
+    // die Anfrage zu wiederholen. Trappt nie, auch nicht bei einem Ziel außerhalb des Speichers.
+    linker
+        .func_wrap(
+            "env",
+            "host_result_read",
+            |mut caller: Caller<'_, HostState>, ptr: i32, cap: i32| -> i32 {
+                let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                    return -1;
+                };
+                let take = caller.data().result.len().min(cap.max(0) as usize);
+                if take == 0 {
+                    return 0;
+                }
+                // Speicher und Zustand in einem Zug — zwei getrennte Zugriffe kollidierten
+                // im Borrow-Checker.
+                let (bytes, state) = mem.data_and_store_mut(&mut caller);
+                let dst = ptr.max(0) as usize;
+                let Some(slot) = bytes.get_mut(dst..dst + take) else {
+                    return -1;
+                };
+                slot.copy_from_slice(&state.result[..take]);
+                take as i32
+            },
+        )
+        .map_err(|e| SeppError::Tool(format!("wasm linker host_result_read: {e}")))?;
+
+    // host_fs_read: nur mit FsRead-Capability. Führt aus, legt das Ergebnis bereit und liefert
+    // dessen Größe; abgeholt wird mit `host_result_read`.
     if policy
         .granted
         .iter()
@@ -226,11 +361,20 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
             .func_wrap(
                 "env",
                 "host_fs_read",
-                |_c: Caller<'_, HostState>, _p: i32, _l: i32| -> i64 { 0 },
+                |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                    let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                        return -1;
+                    };
+                    let Some(raw) = read_input(&caller, &mem, ptr, len) else {
+                        return stage_err(&mut caller, "Eingabe liegt außerhalb des Speichers");
+                    };
+                    host_fs_read(&mut caller, &raw)
+                },
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_fs_read: {e}")))?;
     }
-    // host_http: nur mit Net-Capability (Stub) — DAS ist das Capability-Gate.
+    // host_http: nur mit Net-Capability — DAS ist das Capability-Gate. Noch eine Attrappe, aber
+    // eine ehrliche: Sie erklärt, statt eine Null zu liefern.
     if policy
         .granted
         .iter()
@@ -240,12 +384,71 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
             .func_wrap(
                 "env",
                 "host_http",
-                |_c: Caller<'_, HostState>, _p: i32, _l: i32| -> i64 { 0 },
+                |mut caller: Caller<'_, HostState>, _ptr: i32, _len: i32| -> i32 {
+                    stage_err(
+                        &mut caller,
+                        "host_http ist in dieser Version noch nicht implementiert",
+                    )
+                },
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_http: {e}")))?;
     }
 
     Ok(linker)
+}
+
+/// Rumpf von `host_fs_read`: `{"path":"…"}` hinein, `{"bytes":N,"text":"…","lossy":false}`
+/// hinaus, im Fehlerfall `{"error":"…"}`.
+///
+/// Der Pfad wird kanonisch aufgelöst und gegen dieselbe Policy geprüft, die auch `read`,
+/// `write` und `edit` benutzen — ein Plugin kommt also nicht weiter als der Agent selbst.
+/// Ein Fehler wird nie zum Trap: Das Modell kann mit einer Erklärung etwas anfangen, mit
+/// einem abgestürzten Werkzeug nicht.
+fn host_fs_read(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
+    let args: Value = match serde_json::from_slice(input) {
+        Ok(v) => v,
+        Err(e) => return stage_err(caller, format!("host_fs_read: ungültige Eingabe: {e}")),
+    };
+    let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
+        return stage_err(caller, "host_fs_read: Feld 'path' fehlt");
+    };
+    let ctx = sepp_policy::ResolveCtx::from_env();
+    let path = sepp_policy::canonicalize_lenient(&sepp_policy::resolve_path_with(raw_path, &ctx));
+    if !caller.data().policy.allows_path(&path, false) {
+        return stage_err(
+            caller,
+            format!(
+                "host_fs_read: {} liegt außerhalb der Rechte dieses Plugins",
+                path.display()
+            ),
+        );
+    }
+    // Erst die Größe prüfen, dann lesen — sonst zöge eine riesige Datei den Host in eine
+    // Allokation, die das Modul ohnehin nicht abholen könnte.
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_PLUGIN_BYTES as u64 => {
+            return stage_err(
+                caller,
+                format!(
+                    "host_fs_read: {} ist zu groß ({} > {MAX_PLUGIN_BYTES} Bytes)",
+                    path.display(),
+                    m.len()
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return stage_err(caller, format!("host_fs_read: {}: {e}", path.display())),
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => return stage_err(caller, format!("host_fs_read: {}: {e}", path.display())),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lossy = text.len() != bytes.len();
+    stage(
+        caller,
+        serde_json::json!({ "bytes": bytes.len(), "text": text, "lossy": lossy }),
+    )
 }
 
 /// Der WASM-Host (hält die `wasmi`-Engine, Fuel-Metering aktiv).
@@ -276,8 +479,13 @@ impl WasmHost {
     pub fn load(&self, wasm: &[u8], policy: Policy, limits: Limits) -> Result<WasmPlugin> {
         let module = Module::new(&self.engine, wasm)
             .map_err(|e| SeppError::Tool(format!("wasm compile: {e}")))?;
+        // Alle vier Exports schon hier prüfen, ohne Store und ohne Instanziierung. Vorher fehlten
+        // `sepp_alloc` und `sepp_call` erst beim ersten Werkzeug-Aufruf auf — ein Plugin lud
+        // scheinbar sauber und fiel später um. Für ein Paket, das jemand installiert, ist das
+        // untragbar: kaputt muss beim Laden sichtbar sein.
+        check_exports(&module)?;
 
-        let mut store = Store::new(&self.engine, host_state(&limits));
+        let mut store = Store::new(&self.engine, host_state(&limits, policy.clone()));
         store.limiter(|state| &mut state.limits);
         let linker = build_linker(&self.engine, &policy)?;
         store
@@ -314,6 +522,7 @@ impl WasmHost {
             policy,
             limits,
             spec,
+            notes: Vec::new(),
         })
     }
 
@@ -329,9 +538,25 @@ impl WasmHost {
     ) -> Result<WasmPlugin> {
         let wasm = std::fs::read(wasm_path)
             .map_err(|e| SeppError::Tool(format!("wasm read {}: {e}", wasm_path.display())))?;
+        let mut notes = Vec::new();
         let (requested, limits) = match manifest_path {
             Some(p) => {
                 let manifest = Manifest::from_file(p)?;
+                // Die unterstützte Protokollversion gehört dem Host, nicht der Policy — deshalb
+                // steht die Prüfung hier und nicht in `Manifest::parse`.
+                if manifest.abi > PLUGIN_ABI {
+                    return Err(SeppError::Tool(format!(
+                        "wasm: Plugin braucht Protokoll-Version {} (Feld `abi`), dieser sepp spricht {PLUGIN_ABI}",
+                        manifest.abi
+                    )));
+                }
+                let unknown = manifest.unknown_keys();
+                if !unknown.is_empty() {
+                    notes.push(format!(
+                        "unbekannte Felder im Manifest, ohne Wirkung: {}",
+                        unknown.join(", ")
+                    ));
+                }
                 (manifest.policy(), manifest.limits.clone())
             }
             None => (Policy::default(), Limits::default()),
@@ -340,7 +565,9 @@ impl WasmHost {
             Some(g) => g.intersect(&requested),
             None => Policy::default(),
         };
-        self.load(&wasm, policy, limits)
+        let mut plugin = self.load(&wasm, policy, limits)?;
+        plugin.notes = notes;
+        Ok(plugin)
     }
 
     /// Findet `*.wasm` in `dir` (Manifest: `<stem>.toml` oder `manifest.toml` daneben) und lädt
@@ -395,10 +622,18 @@ impl WasmHost {
                 .unwrap_or_else(|| stem.clone());
             let grant = grant_for(&name);
             match self.load_file_with_grant(&path, manifest.as_deref(), grant.as_ref()) {
-                Ok(p) => out.push(p),
+                Ok(mut p) => {
+                    for n in p.take_notes() {
+                        notes.push(format!("WASM-Plugin {}: {n}", path.display()));
+                    }
+                    out.push(p);
+                }
                 Err(e) => {
                     tracing::warn!("wasm-plugin {} übersprungen: {e}", path.display());
-                    let hint = if grant.is_none() {
+                    // Der Hinweis auf die fehlende Gewährung passt nur, wenn das Modul an einem
+                    // Import gescheitert ist. Bei einem ABI-Konflikt oder einem fehlenden Export
+                    // führte er in die Irre.
+                    let hint = if grant.is_none() && e.to_string().contains("instantiate") {
                         format!(
                             " — es gibt keinen Abschnitt [plugin.{name}] in der policy.toml, \
                              das Plugin bekommt deshalb keine Rechte"
@@ -424,9 +659,17 @@ pub struct WasmPlugin {
     policy: Policy,
     limits: Limits,
     spec: ToolSpec,
+    /// Hinweise aus dem Ladevorgang, die das Frontend zeigen soll (etwa unbekannte
+    /// Manifest-Felder). Kein Fehler, aber auch nichts, das still bleiben darf.
+    notes: Vec<String>,
 }
 
 impl WasmPlugin {
+    /// Hinweise aus dem Ladevorgang (siehe [`WasmPlugin::notes`]).
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
     /// Effektive Policy des Plugins (Manifest-Anfrage, ggf. mit Gewährung geschnitten).
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -450,7 +693,7 @@ impl WasmPlugin {
         input: &Value,
         cancel: &CancellationToken,
     ) -> Result<ToolResult> {
-        let mut store = Store::new(engine, host_state(limits));
+        let mut store = Store::new(engine, host_state(limits, policy.clone()));
         store.limiter(|state| &mut state.limits);
         let linker = build_linker(engine, policy)?;
         let mut budget = FuelBudget::new(limits, cancel);
@@ -581,7 +824,7 @@ mod tests {
             r#"{"name":"netter","label":"Net","description":"x","parameters":{"type":"object"}}"#;
         let wat = format!(
             r#"(module
-  (import "env" "host_http" (func $http (param i32 i32) (result i64)))
+  (import "env" "host_http" (func $http (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 8) "{spec}")
   (global $bump (mut i32) (i32.const 1024))
@@ -945,6 +1188,217 @@ mod tests {
             .expect("Abbruch muss wirken")
             .expect("join");
         assert!(matches!(res, Err(SeppError::Aborted)), "war: {res:?}");
+    }
+
+    // ── ABI Version 1 ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn missing_export_is_caught_at_load_time() {
+        // Früher fiel ein Plugin ohne `sepp_alloc` erst beim ersten Werkzeug-Aufruf um. Für ein
+        // Paket, das jemand installiert, muss „kaputt" beim Laden sichtbar sein.
+        let spec = r#"{"name":"x","label":"X","description":"x","parameters":{"type":"object"}}"#;
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 8) "{spec}")
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64) (i64.const 0))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+        );
+        let wasm = wat::parse_str(&wat).expect("wat");
+        let msg = match WasmHost::new().load(&wasm, Policy::default(), Limits::default()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Modul ohne sepp_alloc darf nicht laden"),
+        };
+        assert!(msg.contains("sepp_alloc"), "{msg}");
+        assert!(msg.contains("fehlt"), "{msg}");
+    }
+
+    #[test]
+    fn wrong_export_signature_names_both_types() {
+        let spec = r#"{"name":"x","label":"X","description":"x","parameters":{"type":"object"}}"#;
+        // sepp_alloc mit falscher Signatur: (i32) -> i64 statt (i32) -> i32.
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 8) "{spec}")
+  (func (export "sepp_alloc") (param i32) (result i64) (i64.const 0))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64) (i64.const 0))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+        );
+        let wasm = wat::parse_str(&wat).expect("wat");
+        let msg = match WasmHost::new().load(&wasm, Policy::default(), Limits::default()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("falsche Signatur darf nicht laden"),
+        };
+        assert!(msg.contains("falsche Signatur"), "{msg}");
+        assert!(msg.contains("I64") && msg.contains("I32"), "{msg}");
+    }
+
+    #[test]
+    fn newer_abi_is_rejected_with_the_supported_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("p.wasm");
+        std::fs::write(&wasm, compute_wat()).unwrap();
+        let manifest = tmp.path().join("p.toml");
+        std::fs::write(
+            &manifest,
+            format!("name = \"p\"\nabi = {}\n", PLUGIN_ABI + 1),
+        )
+        .unwrap();
+
+        let msg = match WasmHost::new().load_file_with_grant(&wasm, Some(&manifest), None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("neueres ABI darf nicht laden"),
+        };
+        assert!(msg.contains(&(PLUGIN_ABI + 1).to_string()), "{msg}");
+        assert!(msg.contains(&PLUGIN_ABI.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn unknown_manifest_field_loads_but_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("p.wasm"), compute_wat()).unwrap();
+        // `capabilites` ist ein Tippfehler — er darf nicht still verschwinden.
+        std::fs::write(
+            tmp.path().join("p.toml"),
+            "name = \"p\"\n[capabilites]\nnet = [\"x\"]\n",
+        )
+        .unwrap();
+
+        let (plugins, notes) = WasmHost::new().discover_with(tmp.path(), &|_| None);
+        assert_eq!(plugins.len(), 1, "das Plugin lädt trotzdem");
+        assert!(notes.iter().any(|n| n.contains("capabilites")), "{notes:?}");
+    }
+
+    /// Ein Modul, das eine Datei liest: Anfrage bauen, `host_fs_read` rufen, mit
+    /// `host_result_read` abholen und das Ergebnis als Werkzeug-Ergebnis zurückgeben.
+    /// Führt den kompletten Abholweg vor.
+    fn fs_reader_wat(request: &str) -> Vec<u8> {
+        let spec = r#"{"name":"reader","label":"Reader","description":"x","parameters":{"type":"object"}}"#;
+        // Das Ergebnis der Fähigkeit ist ein Objekt und wandert deshalb nach `details`;
+        // in `text` gehörte eine Zeichenkette.
+        let prefix = r#"{"content":[{"type":"text","text":"ok"}],"details":"#;
+        let suffix = r#"}"#;
+        let wat = format!(
+            r#"(module
+  (import "env" "host_fs_read" (func $fs (param i32 i32) (result i32)))
+  (import "env" "host_result_read" (func $read (param i32 i32) (result i32)))
+  (memory (export "memory") 4)
+  (data (i32.const 8) "{spec}")
+  (data (i32.const 2048) "{req}")
+  (data (i32.const 3072) "{prefix}")
+  (data (i32.const 3584) "{suffix}")
+  (global $bump (mut i32) (i32.const 4096))
+  (func (export "sepp_alloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64)
+    (local $n i32) (local $got i32) (local $out i32) (local $cur i32)
+    ;; Fähigkeit rufen: liefert die Größe des Ergebnisses.
+    (local.set $n (call $fs (i32.const 2048) (i32.const {reqlen})))
+    ;; Ergebnis in einen selbst gestellten Puffer holen.
+    (local.set $got (call $read (i32.const 65536) (local.get $n)))
+    ;; Als Text-Ergebnis verpacken: prefix + geholtes JSON + suffix.
+    (local.set $out (i32.const 131072))
+    (memory.copy (local.get $out) (i32.const 3072) (i32.const {plen}))
+    (local.set $cur (i32.add (local.get $out) (i32.const {plen})))
+    (memory.copy (local.get $cur) (i32.const 65536) (local.get $got))
+    (local.set $cur (i32.add (local.get $cur) (local.get $got)))
+    (memory.copy (local.get $cur) (i32.const 3584) (i32.const {slen}))
+    (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+            (i64.extend_i32_u (i32.add (i32.add (i32.const {plen}) (local.get $got))
+                                       (i32.const {slen})))))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+            req = esc(request),
+            reqlen = request.len(),
+            prefix = esc(prefix),
+            plen = prefix.len(),
+            suffix = esc(suffix),
+            slen = suffix.len(),
+        );
+        wat::parse_str(&wat).expect("fs reader wat")
+    }
+
+    #[tokio::test]
+    async fn host_fs_read_reads_allowed_file_through_the_full_pickup_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("daten.txt");
+        std::fs::write(&file, "Hallo Welt").unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, file.display());
+
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: dir.path().canonicalize().unwrap(),
+        }]);
+        let plugin = WasmHost::new()
+            .load(&fs_reader_wat(&req), grant, Limits::default())
+            .expect("lädt mit FsRead-Gewährung");
+
+        let res = plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(res.details["text"], "Hallo Welt");
+        assert_eq!(res.details["bytes"], 10);
+        assert_eq!(res.details["lossy"], false);
+    }
+
+    #[tokio::test]
+    async fn host_fs_read_refuses_path_outside_the_grant() {
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("geheim.txt");
+        std::fs::write(&secret, "streng geheim").unwrap();
+        let req = format!(r#"{{"path":"{}"}}"#, secret.display());
+
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: inside.path().canonicalize().unwrap(),
+        }]);
+        let plugin = WasmHost::new()
+            .load(&fs_reader_wat(&req), grant, Limits::default())
+            .expect("lädt, das Gate hängt am Import");
+
+        let res = plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let err = res.details["error"].as_str().unwrap_or_default();
+        assert!(err.contains("außerhalb der Rechte"), "{err}");
+        assert!(
+            !res.details.to_string().contains("streng geheim"),
+            "der Inhalt darf nicht durchsickern: {}",
+            res.details
+        );
+    }
+
+    #[tokio::test]
+    async fn host_fs_read_reports_missing_file_as_error_not_trap() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = format!(r#"{{"path":"{}/gibtsnicht.txt"}}"#, dir.path().display());
+        let grant = Policy::new(vec![Capability::FsRead {
+            prefix: dir.path().canonicalize().unwrap(),
+        }]);
+        let plugin = WasmHost::new()
+            .load(&fs_reader_wat(&req), grant, Limits::default())
+            .unwrap();
+        let res = plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .expect("ein fehlender Pfad darf das Plugin nicht abstürzen lassen");
+        assert!(res.details["error"].is_string(), "{}", res.details);
     }
 
     /// Baut das Beispiel-Plugin aus `examples/textstat-plugin` und führt es aus.
