@@ -11,4 +11,4 @@ pub mod tool;
 pub use error::{Result, SeppError};
 pub use message::{ContentBlock, ImageSource, Message, Role, Usage};
 pub use model::{Model, ThinkingLevel};
-pub use tool::{ToolResult, ToolSpec};
+pub use tool::{is_valid_tool_name, sanitize_tool_name, ToolResult, ToolSpec, MAX_TOOL_NAME_LEN};

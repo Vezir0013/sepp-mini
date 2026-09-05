@@ -32,6 +32,10 @@
 //! `host_fs_read(i32,i32)->i32` und `host_fs_read_bytes(i32,i32)->i32` mit `FsRead` (oder
 //! `FsWrite`, das Lesen einschließt), `host_http(i32,i32)->i32` mit `Net`.
 //!
+//! Der **Werkzeugname** aus `sepp_spec` wird beim Laden gegen `^[A-Za-z0-9_-]{1,64}$` geprüft.
+//! Anthropic und OpenAI lehnen alles andere mit `400` ab — und zwar den ganzen Request, nicht
+//! nur das eine Werkzeug.
+//!
 //! **Der Abholweg:** Eine Fähigkeit führt aus, legt ihr Ergebnis im Host ab und meldet dessen
 //! Größe; `host_result_read` kopiert es in einen Puffer, den das Plugin passend dimensioniert
 //! hat. Damit wird nie doppelt gesendet und niemand muss eine Größe raten. Die Alternative
@@ -618,6 +622,18 @@ impl WasmHost {
         let bytes = read_mem(&memory, &store, ptr, len)?;
         let spec: ToolSpec = serde_json::from_slice(&bytes)
             .map_err(|e| SeppError::Tool(format!("wasm spec-json: {e}")))?;
+        // Hier wird abgelehnt statt saniert: Der Name gehört dem Plugin-Autor, und ein
+        // stillschweigend umbenanntes Werkzeug wäre schlimmer als ein klarer Ladefehler — er
+        // beschreibt es ja unter diesem Namen. Anthropic und OpenAI lehnen alles außerhalb von
+        // `[A-Za-z0-9_-]` mit 400 ab, und zwar den ganzen Request.
+        if !sepp_core::is_valid_tool_name(&spec.name) {
+            return Err(SeppError::Tool(format!(
+                "wasm: Werkzeugname {:?} ist unzulässig — erlaubt sind 1 bis {} Zeichen aus \
+                 A-Z, a-z, 0-9, _ und -",
+                spec.name,
+                sepp_core::MAX_TOOL_NAME_LEN
+            )));
+        }
 
         Ok(WasmPlugin {
             engine: self.engine.clone(),
@@ -1628,6 +1644,32 @@ mod tests {
 
         let e = read_granted_file(&grant, br#"{"kein_pfad":1}"#, "t").unwrap_err();
         assert!(e.contains("'path' fehlt"), "{e}");
+    }
+
+    #[test]
+    fn a_plugin_with_an_invalid_tool_name_does_not_load() {
+        // Ein Doppelpunkt im Namen ginge ungefiltert an die Provider-API und ließe dort den
+        // GANZEN Request mit 400 scheitern — nicht nur dieses eine Werkzeug.
+        let spec = r#"{"name":"rp:pdf_extract","label":"X","description":"x","parameters":{"type":"object"}}"#;
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 8) "{spec}")
+  (func (export "sepp_alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {len})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64) (i64.const 0))
+)"#,
+            spec = esc(spec),
+            len = spec.len()
+        );
+        let module = wat::parse_str(&wat).expect("wat");
+        let msg = match WasmHost::new().load(&module, Policy::default(), Limits::default()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unzulässiger Name muss beim Laden auffallen"),
+        };
+        assert!(msg.contains("unzulässig"), "{msg}");
+        assert!(msg.contains("rp:pdf_extract"), "{msg}");
     }
 
     #[tokio::test]

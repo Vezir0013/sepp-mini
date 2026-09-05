@@ -156,20 +156,36 @@ impl McpConnection {
 /// falls auch das belegt ist, mit numerischem Suffix (`…_2`, `…_3`). Garantiert ein Ergebnis,
 /// das nicht in `taken` enthalten ist (sonst überschreiben sich Tools im Dispatch-Map).
 pub fn resolve_name(taken: &HashSet<String>, server: &str, raw: &str) -> String {
-    let mut candidate = if taken.contains(raw) {
+    // Der entfernte Name gehört dem fremden Server — wir dürfen ihn weder ablehnen (das Werkzeug
+    // verschwände kommentarlos) noch ungeprüft durchreichen: Anthropic und OpenAI lehnen alles
+    // außerhalb von `[A-Za-z0-9_-]` mit 400 ab, und zwar den ganzen Request. Angepasst wird nur
+    // der **exponierte** Name; aufgerufen wird der Server weiterhin unter `remote_name`.
+    let raw = sepp_core::sanitize_tool_name(raw);
+    let server = sepp_core::sanitize_tool_name(server);
+    // Nach dem Sanieren ist alles ASCII, `truncate` schneidet also nie mitten in ein Zeichen.
+    let clamp = |mut s: String| {
+        s.truncate(sepp_core::MAX_TOOL_NAME_LEN);
+        s
+    };
+    let candidate = clamp(if taken.contains(&raw) {
         format!("{server}__{raw}")
     } else {
-        raw.to_string()
-    };
+        raw.clone()
+    });
     if !taken.contains(&candidate) {
         return candidate;
     }
-    let base = candidate.clone();
+    // Präfix UND Suffix können die Grenze sprengen — deshalb wird die Basis so gekürzt, dass
+    // das Suffix noch hineinpasst, statt am Ende blind abzuschneiden.
+    let base = candidate;
     let mut i = 2;
     loop {
-        candidate = format!("{base}_{i}");
-        if !taken.contains(&candidate) {
-            return candidate;
+        let suffix = format!("_{i}");
+        let mut c = base.clone();
+        c.truncate(sepp_core::MAX_TOOL_NAME_LEN.saturating_sub(suffix.len()));
+        c.push_str(&suffix);
+        if !taken.contains(&c) {
+            return c;
         }
         i += 1;
     }
@@ -703,6 +719,40 @@ mod tests {
         taken.insert("read".into());
         assert_eq!(resolve_name(&taken, "git", "status"), "status");
         assert_eq!(resolve_name(&taken, "git", "read"), "git__read");
+    }
+
+    #[test]
+    fn resolve_name_always_yields_a_provider_valid_name() {
+        // Ein fremder Server darf keinen Namen liefern, den die API mit 400 ablehnt — sonst
+        // scheitert nicht ein Werkzeug, sondern jeder Turn.
+        let taken: HashSet<String> = HashSet::new();
+        for raw in [
+            "rp:pdf_extract",
+            "mit leerzeichen",
+            "grüße",
+            "",
+            &"x".repeat(200),
+        ] {
+            let r = resolve_name(&taken, "git", raw);
+            assert!(sepp_core::is_valid_tool_name(&r), "{raw} -> {r}");
+        }
+        assert_eq!(
+            resolve_name(&taken, "git", "rp:pdf_extract"),
+            "rp_pdf_extract"
+        );
+    }
+
+    #[test]
+    fn resolve_name_stays_within_the_length_limit() {
+        let long = "y".repeat(200);
+        let mut taken: HashSet<String> = HashSet::new();
+        // Erst den rohen, dann den Präfix-Namen belegen, damit der Suffix-Zweig greift.
+        for _ in 0..4 {
+            let r = resolve_name(&taken, &"s".repeat(80), &long);
+            assert!(sepp_core::is_valid_tool_name(&r), "{r}");
+            assert!(!taken.contains(&r));
+            taken.insert(r);
+        }
     }
 
     #[test]

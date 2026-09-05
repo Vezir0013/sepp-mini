@@ -61,7 +61,9 @@ fn emit(bytes: &[u8]) -> i64 {
 ///
 /// Alle vier Felder sind Pflicht. `parameters` ist ein JSON-Schema und wird unverändert an den
 /// Anbieter durchgereicht, deshalb schlank halten: kein `$schema`, kein `title`.
-
+///
+/// `name` muss `^[A-Za-z0-9_-]{1,64}$` erfüllen — alles andere lehnen die Anbieter mit 400 ab,
+/// und zwar den ganzen Request. Der Host prüft das beim Laden.
 const SPEC: &str = r#"{
   "name": "textstat",
   "label": "Textstatistik",

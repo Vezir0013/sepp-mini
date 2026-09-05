@@ -7,7 +7,8 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-Vorarbeiten für Plugin-Pakete, aber unabhängig davon nützlich.
+Vorarbeiten für Plugin-Pakete — beide aber unabhängig davon nützlich, und der zweite repariert
+einen Fehler, den es auch ohne Pakete gibt.
 
 ### Hinzugefügt
 - **`host_fs_read_bytes` für WASM-Plugins.** `host_fs_read` liefert `from_utf8_lossy`; für ein
@@ -20,11 +21,23 @@ Vorarbeiten für Plugin-Pakete, aber unabhängig davon nützlich.
   `fs_write`, das Lesen einschließt), und **additiv**: Ein Modul, das die Funktion nicht
   importiert, merkt nichts. Das ABI bleibt bei Version 1.
 
+### Behoben
+- **Tool-Namen werden gegen `^[A-Za-z0-9_-]{1,64}$` geprüft.** Anthropic und OpenAI lehnen alles
+  andere mit `400` ab — und zwar den **ganzen** Request, nicht nur das eine Werkzeug. Ein
+  einziger Doppelpunkt aus einer fremden Quelle legte damit jeden Turn lahm, bis man den Server
+  abklemmte. Je nach Quelle wird unterschiedlich reagiert: Bei **MCP** gehört der Name dem
+  fremden Server und wird für die Anzeige **saniert** (aufgerufen wird weiterhin der
+  Originalname), inklusive Längengrenze auch nach Präfix und Zähl-Suffix. Bei **WASM** gehört er
+  dem Plugin-Autor und wird beim Laden **abgelehnt** — ein stillschweigend umbenanntes Werkzeug
+  wäre schlimmer als ein klarer Ladefehler, denn das Plugin beschreibt sich ja unter diesem Namen.
+
 ### Tests
 - `host_fs_read_bytes` liefert rohe Bytes statt verlustbehaftetem Text (zwei ungültige
   UTF-8-Bytes: roh 2, lossy wären 6 — die Zahl unterscheidet beide Wege eindeutig); ein
   verweigerter Zugriff meldet sich negativ; die gemeinsame Prüfhälfte `read_granted_file` gegen
   Policy, Eingabefehler und byte-identische Rückgabe.
+- Ein Plugin mit unzulässigem Werkzeugnamen lädt nicht; `resolve_name` liefert für jede fremde
+  Eingabe einen anbieter-gültigen Namen und bleibt auch mit langem Präfix und Suffix unter 64.
 
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
