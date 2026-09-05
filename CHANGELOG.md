@@ -7,8 +7,25 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-Vorarbeiten für Plugin-Pakete — beide aber unabhängig davon nützlich, und der zweite repariert
-einen Fehler, den es auch ohne Pakete gibt.
+### Geplant
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
+- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
+- Plugin-SDK aus einer WIT-Schnittstellenbeschreibung: der Autor schreibt eine Funktion,
+  kein Protokoll
+- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
+  als Zustimmung bei der Installation
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.2.1] - 2026-09-05
+
+Zwei Vorarbeiten für Plugin-Pakete, die aber unabhängig davon nützlich sind — und eine davon
+repariert einen Fehler, der jeden Turn lahmlegen kann. Deshalb kommen sie sofort und warten
+nicht auf das Paketformat.
+
+Beides ist **rein additiv**: Das Plugin-ABI bleibt bei Version 1, und ein bestehendes Modul,
+das `host_fs_read_bytes` nicht importiert, merkt von der Änderung nichts.
 
 ### Hinzugefügt
 - **`host_fs_read_bytes` für WASM-Plugins.** `host_fs_read` liefert `from_utf8_lossy`; für ein
@@ -38,16 +55,6 @@ einen Fehler, den es auch ohne Pakete gibt.
   Policy, Eingabefehler und byte-identische Rückgabe.
 - Ein Plugin mit unzulässigem Werkzeugnamen lädt nicht; `resolve_name` liefert für jede fremde
   Eingabe einen anbieter-gültigen Namen und bleibt auch mit langem Präfix und Suffix unter 64.
-
-### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
-- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
-- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
-- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, Rechte als
-  Zustimmung bei der Installation
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.2.0] - 2026-09-05
 
@@ -893,7 +900,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...v0.2.0
 [0.1.22]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...v0.1.21
