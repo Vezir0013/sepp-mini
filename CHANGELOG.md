@@ -7,11 +7,32 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
+- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
+- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
+- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, Rechte als
+  Zustimmung bei der Installation
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.2.0] - 2026-09-05
+
 Eine Review über alle Crates hat fünfzehn Befunde ergeben, und sie fielen in Muster: Grenzen, die
 erst hinter der Schranke greifen; Zusagen der Doku, die der Code nicht hält; Meldungen, die im
 interessanten Fall schweigen. Kein einzelner davon war dramatisch — zusammen beschreiben sie
 Stellen, an denen `sepp` etwas versprach, das er nicht hielt. Das ist bei einem Werkzeug, dessen
 Alleinstellungsmerkmal die Rechteverwaltung ist, die teuerste Sorte Fehler.
+
+**Warum die Minor-Version steigt und nicht nur die Patch-Nummer:** Eine Rechtezeile bedeutet ab
+jetzt etwas anderes. Wer `[plugin.x] fs_write = ["./"]` schrieb und annahm, das Plugin könne
+damit nicht *lesen*, lag schon vorher falsch — Landlock trägt jeden Schreibpfad zusätzlich in die
+Leseliste ein, Seatbelt schreibt `(allow file-read* file-write* …)`, und `Policy::allows_path`
+las es seit jeher großzügig. Nur `covers` widersprach und beschrieb damit einen Zustand, den es
+im Betrieb nirgends gab. Diese Diskrepanz ist behoben — aber wer die strikte Lesart geglaubt hat,
+sollte seine `policy.toml` einmal ansehen, statt es einem Patch-Release zu entnehmen. Alles
+andere in diesem Release ist Reparatur oder Zuwachs.
 
 ### Hinzugefügt
 - **Secrets für entfernte MCP-Server.** `[mcp.servers.headers]` nimmt HTTP-Header, deren Werte
@@ -98,16 +119,6 @@ Alleinstellungsmerkmal die Rechteverwaltung ist, die teuerste Sorte Fehler.
   samt Userinfo/Port/IPv6, `Debug` eines Secret-Headers zeigt nur `Sensitive` — dazu ein
   Verdrahtungstest gegen einen echten TCP-Listener, der belegt, dass der Header auf der Leitung
   ankommt und dass ohne `net`-Gewährung gar keine Verbindung entsteht.
-
-### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
-- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
-- Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
-- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, Rechte als
-  Zustimmung bei der Installation
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.1.22] - 2026-09-05
 
@@ -850,7 +861,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...v0.2.0
 [0.1.22]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...v0.1.20
