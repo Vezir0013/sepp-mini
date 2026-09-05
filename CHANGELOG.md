@@ -7,11 +7,81 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Sepp Guard, Phase 1: **ein Regelwerk, ein Entscheider, ein Audit, mehrere Vollstrecker.** Bisher
+waren Erweiterungen eingesperrt, der Agent selbst nicht — `bash`, `read`, `write` und `edit` liefen
+mit vollen Nutzerrechten, ohne Pfadgrenze und ohne Bestätigung; das bash-Tool entfernte nur vier
+Provider-Keys. Jetzt läuft `bash` in derselben OS-Sandbox wie MCP-Server (Environment-Allowlist,
+Landlock/Seatbelt, TCP-Verbot ohne `net`), `read`/`write`/`edit` prüfen Pfade gegen dieselbe Policy,
+und `sepp policy` zeigt, wer was darf und wer es durchsetzt.
+
+### Hinzugefügt
+- **Sepp Guard** (`sepp-policy::guard`): Policy-Datei `.sepp/policy.toml` (projektlokal, nach
+  Trust), `~/.sepp/policy.toml` und `[policy]` in `settings.toml`; Abschnitte `[agent]`,
+  `[agent.ask]`, `[mcp.<name>]`, `[plugin.<name>]`, `[deny]`. Vereinigung aller Gewährungen mit
+  Herkunft, `[deny]` gewinnt immer (`fs_read` sperrt Lesen+Schreiben, `fs_write` nur Schreiben).
+  Eingebaute Defaults gelten immer: Projekt + Systempfade lesbar, Projekt + `$TMPDIR` schreibbar,
+  Ausführen unbeschränkt, kein Netz, minimale Umgebung, Verbote auf `~/.ssh ~/.aws ~/.gnupg ~/.sepp`
+  plus config-/state-Root. Entscheider `Guard::decide`/`authorize` mit Modus-Tabelle
+  `ask | auto | yolo`, Audit je Entscheidung, `PermissionPrompter`-Trait für den Dialog (Phase 2).
+- **`--mode ask|auto|yolo`** und `SEPP_MODE`; Default `ask` in der TUI, `auto` bei `-p`/`--rpc`.
+  `yolo` schaltet den Guard ab (bisheriges Verhalten, mit Hinweis). `ask` verhält sich in Phase 1
+  wie `auto` und sagt beim Start, dass der Dialog folgt.
+- **`sepp policy`**: effektive Rechte je Akteur (Agent, MCP-Server, Plugins) als Tabelle mit
+  Quelle und Vollstrecker, Verbote, Rückfrage-Muster und die Zeile „Nicht durchsetzbar auf diesem
+  System". `sepp policy allow <akteur> <recht> <wert>` nennt vorerst Datei und TOML-Schnipsel.
+- **Startprobe fail-closed**: kann die Sandbox nicht durchgesetzt werden (Kernel ohne Landlock,
+  `sandbox_init`-Fehler), startet der Agent nicht; Ausweg ist explizit `--mode yolo`. Fehlt nur
+  das TCP-Verbot (Kernel < 6.7), gibt es einen Start-Hinweis. Deny-Überlappungen (Verbot unter
+  Gewährung) werden gemeldet.
+- **Landlock ABI v7** statt v1 (BestEffort): Truncate, Refer, IoctlDev werden mitgehandhabt;
+  **TCP-Verbot** ohne `net`-Recht (Kernel ≥ 6.7); **Exec-Allowlist** bei `exec`-Liste (Execute nur
+  auf die Programme, das gestartete Programm und die dynamischen Loader). Seatbelt: `(allow
+  network*)` nur mit `net`, `process-exec (literal …)` bei Exec-Liste, Deny-Zeilen für `[deny]`.
+  `kernel_capabilities()` fragt ab, was der Kernel kann, ohne den eigenen Prozess zu beschränken.
+- `sepp init` schreibt eine kommentierte `policy.toml` und aktiviert das Preset für erkannte
+  Projekttypen (`Cargo.toml` → Rust, `package.json` → Node, `pyproject.toml`/`requirements.txt`
+  → Python). Ohne `sepp init` gelten die Minimal-Defaults.
+- `sepp-tools`: `builtin_tools_with(guard)`; die Tools tragen den Guard,
+  `ToolResult.details["guard"]` enthält den Audit-Eintrag; ein an der Sandbox gescheitertes
+  bash-Kommando bekommt einen `[guard: …]`-Hinweis für das Modell.
+- `sepp-mcp`: `connect_with_policy` (gemergte Policy vom Frontend) und `policy_from_config`; stderr
+  des Servers wird gepipet und über `tracing` geloggt statt in die TUI geerbt.
+- `sepp-wasm`: `load_file_with_grant` / `discover_with` — effektiv gilt der Schnitt aus
+  Manifest-Anfrage und `[plugin.<name>]`-Gewährung; ohne Gewährung wie bisher das Manifest.
+- `sepp-policy`: `Policy::union/intersect/without_denied/allows_path`, Wildcard-Host `*`,
+  `ResolveCtx`/`resolve_path_with` (testbar ohne Env), `canonicalize_lenient`
+  (Symlink-sicher auch für neue Dateien), `probe_sandbox`, `resolve_program`.
+
+### Geändert
+- Unter Guard ist das Environment des bash-Tools Default-deny (Allowlist + `[agent].env`), nicht
+  mehr nur eine Blacklist; die Shell sieht z. B. `CARGO_HOME` nur noch, wenn es freigegeben ist.
+- MCP-Kindprozesse erben stderr nicht mehr.
+- Neue Crate-Kanten: `sepp-tools → sepp-policy`, `sepp-cli → sepp-policy` (bleibt azyklisch).
+
+### Behoben
+- bash-Tool: `ZAI_API_KEY` und `MOONSHOT_API_KEY` fehlten in der Key-Blacklist — die Keys waren
+  per Prompt-Injection über die Shell auslesbar.
+- Rhai `print()`/`debug()` schrieben auf stdout und konnten den RPC-/One-shot-Datenkanal stören;
+  jetzt nach `tracing`.
+- Landlock v1 beschränkte `truncate(2)` außerhalb erlaubter Pfade nicht (Truncate-Recht kam mit v3).
+
+### Tests
+- Policy: Parser, Merge mit Herkunft, Deny-Präzedenz, Wildcard-Host, Schnitt, Pfadauflösung ohne
+  Env-Mutation, Modus-Tabelle, Fake-Prompter (Once/Session/Always/No), Audit.
+- Sandbox (`#[ignore]`, echter Linux-Host): TCP-Deny/Allow via `/dev/tcp`, Exec-Allowlist,
+  Schreibsperre; Seatbelt-Profil pur (Netz, Exec-Literale, Deny-Zeilen); `resolve_program`.
+- Tools: read/write/edit innerhalb/außerhalb, Symlink-Escape, Env-Scrubbing unter Guard; bash
+  unter Landlock (`#[ignore]`).
+- CLI: `--mode`, `policy`-Unterbefehl, Modus-Präzedenz, Tabellen-Renderer, Template, Preset-Erkennung,
+  `init` idempotent; `hooks`: `print()` im Hook; `mcp`: Legacy-Policy; `wasm`: Gewährungs-Schnitt.
+
 ### Geplant
+- Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst
+- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter
-- Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces)
 
 ## [0.1.17] - 2026-07-26
 

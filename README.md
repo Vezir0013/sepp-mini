@@ -39,6 +39,10 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
   Erweiterungen deklarieren Capabilities (`FsRead`/`FsWrite`/`Net`/`Env`/`Exec`); der Kern parst
   sie zu einer Policy und erzwingt sie an der Grenze — Linux via **Landlock**, macOS via
   **Seatbelt**, plus Environment-Scrubbing (Subprozesse sehen keine geerbten Secrets).
+- 🛡️ **Sepp Guard: auch der Agent selbst ist eingesperrt.** `bash` läuft in derselben OS-Sandbox
+  (Projekt und `$TMPDIR` schreibbar, Systempfade lesbar, kein Netz), `read`/`write`/`edit` prüfen
+  Pfade gegen dieselbe Policy. Ein Regelwerk (`policy.toml`), ein Entscheider, und `sepp policy`
+  zeigt, wer was darf und wer es durchsetzt (siehe [Sicherheitsmodell](#sicherheitsmodell)).
 - 🧩 **Vier Erweiterungs-Tiers** nach Macht/Isolation: **Resources** (Skills→System-Prompt,
   Prompt-Templates→Slash-Commands), **Hooks** (in-process Rhai), **WASM-Plugins** (memory-sandboxed,
   capability-gated, via `wasmi`), **MCP-Server** (out-of-process, OS-sandboxed).
@@ -214,7 +218,8 @@ sepp --provider moonshot -p "..."      # Default-Modell kimi-k3
 ```
 
 Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--model`,
-`--max-tokens`, `--provider anthropic|openai|local|zai|moonshot|mlx`, `--rpc`, `--sqlite`.
+`--max-tokens`, `--provider anthropic|openai|local|zai|moonshot|mlx`, `--mode ask|auto|yolo`,
+`--rpc`, `--sqlite`.
 `sepp --help` zeigt alles.
 
 > **Reasoning bei Moonshot:** Kimi denkt immer — die API kennt kein Abschalten, nur die Stufen
@@ -239,6 +244,7 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 | `MOONSHOT_BASE_URL` | Moonshot base_url überschreiben (Default `https://api.moonshot.ai/v1`) |
 | `SEPP_PROVIDER` | Default-Provider, wenn `--provider` fehlt |
 | `SEPP_THINK` | Default-Reasoning (on/off), wenn `--think`/`--no-think` fehlt |
+| `SEPP_MODE` | Sepp-Guard-Modus (`ask`/`auto`/`yolo`), wenn `--mode` fehlt |
 | `RUST_LOG` | Log-Level (One-shot/RPC; Logs nach stderr) |
 
 Standardmäßig liegt alles unter der einen Wurzel `~/.sepp/`. Für System-Installationen ist die Wurzel
@@ -312,6 +318,66 @@ bestätigt — und der Kern erzwingt sie an der jeweiligen Grenze:
   reicht sie nicht an Shell-Kommandos durch.
 - **Tool-Output** ist immer getrunkt, bevor er ins Kontextfenster geht.
 
+### Sepp Guard: der Agent selbst ist eingesperrt
+
+Erweiterungen zu sandboxen reicht nicht, wenn das Modell über `bash` alles darf. Sepp Guard legt
+**ein Regelwerk** über alle Akteure und lässt es von **mehreren Vollstreckern** durchsetzen:
+
+| Akteur | Prüfung | Durchsetzung |
+|---|---|---|
+| `bash` | Rückfrage-Muster, Audit | OS-Sandbox mit der Agent-Policy: Environment geleert bis auf eine Allowlist, Dateisystem via Landlock (Linux) / Seatbelt (macOS), TCP verboten ohne `net`, Exec-Allowlist bei `exec`-Liste |
+| `read` / `write` / `edit` | Pfadprüfung (kanonisch, auch für neue Dateien und Symlinks) | in-process |
+| `task` (Sub-Agent) | erbt die Guard-Tools | wie oben |
+| MCP stdio | `[mcp.<name>]` ∪ `capabilities`, minus Verbote | wie bisher, plus Netz/Exec; stderr des Servers landet im Log |
+| MCP http | keine | keine (remote) |
+| WASM | `[plugin.<name>]` ∩ Manifest | wasmi-Linker-Gate |
+
+**Defaults ohne Konfiguration:** Projekt und Systempfade lesbar, Projekt und `$TMPDIR` schreibbar,
+Ausführen unbeschränkt, **kein Netz**, minimale Umgebung (`PATH HOME LANG LC_* TERM TMPDIR`),
+Verbote auf `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.sepp` sowie config- und state-Root.
+
+**Modi:** `--mode ask` (TUI-Default; der Nachfrage-Dialog folgt, bis dahin wird außerhalb der
+Policy verweigert), `auto` (Default bei `-p`/`--rpc`: innerhalb erlaubt, außerhalb verweigert),
+`yolo` (keine Sandbox, bisheriges Verhalten). Ist die Sandbox nicht durchsetzbar, startet der Agent
+nicht (fail-closed); der Ausweg ist ausdrücklich `--mode yolo`.
+
+**Regelwerk** — `.sepp/policy.toml` im Projekt (lädt nach Trust), global `~/.sepp/policy.toml` oder
+`[policy]` in `settings.toml`. Einträge erweitern die Defaults, `[deny]` schränkt ein:
+
+```toml
+mode = "ask"
+
+[agent]                          # bash, read, write, edit und task
+fs_read  = ["~/.cargo", "~/.rustup"]
+fs_write = ["~/.cargo"]
+net      = true                  # TCP erlauben; Host-Listen wirken erst mit dem Egress-Proxy
+env      = ["CARGO_HOME"]
+
+[agent.ask]
+patterns = ["rm -rf", "git push --force"]
+
+[mcp.git]                        # ergänzt [mcp.servers.capabilities]
+fs_write = ["./"]
+exec     = ["git"]
+
+[plugin.string-tools]            # Gewährung; effektiv: Schnitt mit dem Manifest
+net      = ["api.example.com"]
+
+[deny]                           # gewinnt immer
+fs_read  = ["~/.config/secrets"]
+```
+
+`sepp init` legt die Datei an und aktiviert das Preset für erkannte Projekttypen (Rust, Node,
+Python). `sepp policy` zeigt die effektiven Rechte je Akteur mit Quelle und Vollstrecker und
+benennt, was auf dem System **nicht** durchsetzbar ist.
+
+**Grenzen, ehrlich benannt:** Landlock kennt keine Verbote unterhalb einer Gewährung (ein Deny
+unter `fs_read = ["~"]` gilt für `bash` nicht, für `read`/`write`/`edit` schon; `sepp policy`
+meldet solche Überlappungen). Netz ist für Kindprozesse „ganz oder gar nicht"; der Host-Filter
+kommt mit dem Egress-Proxy. Das TCP-Verbot braucht Landlock ABI 4 (Kernel ≥ 6.7). Exec-Listen sind
+auf macOS wegen Apples Shims fragil. Unter Guard verliert die Shell alle nicht freigegebenen
+Umgebungsvariablen (`[agent].env` ist der Schalter).
+
 Schwachstellen melden: [`SECURITY.md`](./SECURITY.md).
 
 ## Architektur
@@ -321,9 +387,9 @@ Cargo-Workspace aus kleinen Crates mit strikten Schichtgrenzen (untere Crates im
 ```
 sepp-core      Typen + reine Logik (kein I/O, kein tokio)
   ├── sepp-provider   Provider-Trait + Anthropic/OpenAI (HTTP/SSE)
-  ├── sepp-tools      built-in Tools read/write/edit/bash + Truncation
+  ├── sepp-tools      built-in Tools read/write/edit/bash (unter Sepp Guard) + Truncation
   ├── sepp-session    Baum-Sessions (JSONL, optional SQLite)
-  └── sepp-policy     Capabilities / Policy / Sandbox (Landlock) / Secret-Broker
+  └── sepp-policy     Capabilities / Policy / Sepp Guard / Sandbox (Landlock, Seatbelt) / Secret-Broker
         ├── sepp-hooks  Rhai-Hook-Bus
         ├── sepp-wasm   WASM-Plugin-Host (wasmi)
         └── sepp-mcp    MCP-Client als Tool-Quelle
@@ -353,7 +419,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] OpenTelemetry-Export (`tracing`), optional aktivierbar
 - [ ] OAuth-Login für Subscription-Provider
 - [ ] Google-Provider-Adapter
-- [ ] Netz-Sandbox für MCP-Subprozesse (seccomp/Namespaces; Landlock deckt aktuell nur das Dateisystem ab)
+- [ ] Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst, Guard-Einträge und Sub-Agenten im Session-Audit
+- [ ] Egress-Proxy für `net`-Hostfilter (TCP-Verbot ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
 
 ## Mitwirken
 
