@@ -27,9 +27,10 @@ eingebauten Tools (`read`/`write`/`edit`/`bash`) und vier Erweiterungs-Tiers aus
 interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in andere Programme.
 
 > **Status:** v0.1 — funktional vollständig und getestet. Kernschleife, TUI, persistente
-> Baum-Sessions, Erweiterbarkeit (Resources/Hooks/MCP/WASM), Sicherheits-Sandbox, native
-> Sub-Agenten, Multi-Provider und Distribution sind umgesetzt. Offen: OpenTelemetry-Export und
-> OAuth-Login (siehe [Roadmap](#roadmap)).
+> Baum-Sessions, Erweiterbarkeit (Resources/Hooks/MCP/WASM), **Sepp Guard** (Sandbox und
+> Regelwerk auch für den Agenten selbst, mit Rückfrage-Dialog), native Sub-Agenten,
+> Multi-Provider und Distribution sind umgesetzt. Offen: OpenTelemetry-Export, OAuth-Login und
+> der Host-Filter fürs Netz (siehe [Roadmap](#roadmap)).
 
 ---
 
@@ -436,8 +437,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] OpenTelemetry-Export (`tracing`), optional aktivierbar
 - [ ] OAuth-Login für Subscription-Provider
 - [ ] Google-Provider-Adapter
-- [ ] Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst, Guard-Einträge und Sub-Agenten im Session-Audit
-- [ ] Egress-Proxy für `net`-Hostfilter (TCP-Verbot ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
+- [ ] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
+- [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
 
 ## Mitwirken
 
