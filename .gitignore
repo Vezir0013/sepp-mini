@@ -1,7 +1,10 @@
 # Rust / Cargo
 /target
+examples/*/target/
 **/*.rs.bk
 *.pdb
+# Gebaute Plugin-Module gehören nicht ins Repo — `just plugin-example` erzeugt sie.
+*.wasm
 # Cargo.lock wird bewusst committet (reproduzierbare Builds für das Binary-Projekt).
 
 # Secrets / Auth — niemals committen

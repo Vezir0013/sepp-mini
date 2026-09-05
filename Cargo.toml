@@ -15,8 +15,9 @@ members = [
     "crates/sepp-agent",
     "crates/sepp-cli",
 ]
-# Die Doku-Quelle ist kein Cargo-Projekt.
-exclude = ["sepp-mini-docs"]
+# Die Doku-Quelle ist kein Cargo-Projekt; das Beispiel-Plugin wird für wasm32 gebaut und
+# gehört deshalb nicht in die Workspace-Tore (fmt, clippy, test, cargo-deny).
+exclude = ["sepp-mini-docs", "examples/textstat-plugin"]
 
 [workspace.package]
 edition = "2021"

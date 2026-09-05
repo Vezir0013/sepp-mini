@@ -1,0 +1,29 @@
+# Beispiel-Plugin für sepp mini (Tier 2, WASM).
+#
+# Bewusst NICHT Teil des Workspace (siehe `exclude` im Root-Cargo.toml): Es wird für
+# wasm32-unknown-unknown gebaut, nicht für den Host. Dadurch gelten hier auch die eigenen
+# [profile]-Einstellungen, die bei einem Workspace-Member ignoriert würden.
+[package]
+name = "textstat-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+
+[lib]
+# Der Loader sucht das Manifest als `<stamm>.toml` neben `<stamm>.wasm`. Ohne diese Zeile
+# hieße das Artefakt `textstat_plugin.wasm` und das Manifest müsste denselben Unterstrich tragen.
+name = "textstat"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Gleiche Versionen wie im Workspace.
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+
+[profile.release]
+opt-level = "z"      # auf Größe optimieren — das Modul wird bei jedem Tool-Aufruf instanziiert
+lto = true
+codegen-units = 1
+panic = "abort"      # kein Unwinding in WASM; spart Code und vermeidet halbe Zustände
+strip = true

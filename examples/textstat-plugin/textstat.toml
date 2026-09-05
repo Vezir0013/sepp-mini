@@ -1,0 +1,21 @@
+# Manifest des Plugins. Der Loader sucht es als `<stamm>.toml` neben `<stamm>.wasm`
+# (also `textstat.toml` zu `textstat.wasm`); alternativ eine `manifest.toml` im selben
+# Verzeichnis, die dann für alle Module dort gilt.
+
+# Pflichtfeld — und der Schlüssel, unter dem Sepp Guard die Rechte sucht: [plugin.textstat].
+name = "textstat"
+
+version     = "0.1.0"
+kind        = "wasm"
+entry       = "textstat.wasm"
+description = "Zählt Zeichen, Wörter und Zeilen und schätzt die Tokenzahl."
+
+# Kein [capabilities]-Abschnitt: Dieses Plugin will nichts. Deshalb braucht es auch keinen
+# Eintrag in der policy.toml und läuft sofort nach dem Kopieren.
+
+[limits]
+# Fehlt der Abschnitt, gelten 256 Seiten, 30 Sekunden und eine Million Instruktionen je
+# Zeitscheibe. Für ein Werkzeug, das nur zählt, darf es deutlich enger sein.
+max_memory_pages = 32       # 1 Seite = 64 KiB → 2 MiB
+max_wall_time_ms = 5000
+fuel_slice       = 500000

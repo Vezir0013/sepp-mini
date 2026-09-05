@@ -52,3 +52,13 @@ release-static:
 # Aufräumen
 clean:
     cargo clean
+
+# Beispiel-Plugin (Tier 2, WASM) bauen — siehe examples/textstat-plugin/README.md
+plugin-example:
+    rustup target add wasm32-unknown-unknown
+    cargo build --release --target wasm32-unknown-unknown \
+        --manifest-path examples/textstat-plugin/Cargo.toml
+    @echo ""
+    @echo "Fertig. Zum Installieren beide Dateien nach ~/.sepp/plugins/ kopieren:"
+    @echo "  cp examples/textstat-plugin/target/wasm32-unknown-unknown/release/textstat.wasm ~/.sepp/plugins/"
+    @echo "  cp examples/textstat-plugin/textstat.toml ~/.sepp/plugins/"
