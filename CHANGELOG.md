@@ -61,6 +61,10 @@ und `sepp policy` zeigt, wer was darf und wer es durchsetzt.
 ### Behoben
 - bash-Tool: `ZAI_API_KEY` und `MOONSHOT_API_KEY` fehlten in der Key-Blacklist — die Keys waren
   per Prompt-Injection über die Shell auslesbar.
+- `SeppError::Io`/`Serde` nannten die Ursache nicht („io error") — jetzt mit Quelle, z. B.
+  `io error: Permission denied (os error 13)`; aufgefallen an einem root-eigenen `~/.sepp/sessions`.
+- Der `[guard: …]`-Hinweis des bash-Tools erschien nur bei englischen Fehlermeldungen und nur bei
+  Exit-Code ≠ 0; jetzt auch bei deutschen (`Keine Berechtigung`) und unabhängig vom Exit-Code.
 - Rhai `print()`/`debug()` schrieben auf stdout und konnten den RPC-/One-shot-Datenkanal stören;
   jetzt nach `tracing`.
 - Landlock v1 beschränkte `truncate(2)` außerhalb erlaubter Pfade nicht (Truncate-Recht kam mit v3).

@@ -263,8 +263,9 @@ impl Tool for BashTool {
             content.push_str(&line);
         }
         // Unter Guard: eine Verweigerung durch die Sandbox als solche benennen, damit das Modell
-        // nicht rät und der Mensch weiß, wo er freigeben kann.
-        if self.guard.is_some() && is_error && looks_like_sandbox_denial(&combined) {
+        // nicht rät und der Mensch weiß, wo er freigeben kann. Unabhängig vom Exit-Code — ein
+        // `cmd; echo $?` endet mit 0, die Verweigerung steht trotzdem in der Ausgabe.
+        if self.guard.is_some() && looks_like_sandbox_denial(&combined) {
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
             }
@@ -285,9 +286,19 @@ impl Tool for BashTool {
     }
 }
 
-/// Typische Meldungen, wenn Landlock/Seatbelt einen Zugriff verweigern.
+/// Typische Meldungen, wenn Landlock/Seatbelt einen Zugriff verweigern — englisch (libc/dash)
+/// und deutsch (coreutils mit `LANG=de_*`), dazu die errno-Namen.
 fn looks_like_sandbox_denial(output: &str) -> bool {
-    output.contains("Permission denied") || output.contains("Operation not permitted")
+    const MARKERS: &[&str] = &[
+        "Permission denied",
+        "Operation not permitted",
+        "Keine Berechtigung",
+        "Vorgang nicht zulässig",
+        "Der Vorgang ist nicht erlaubt",
+        "EACCES",
+        "EPERM",
+    ];
+    MARKERS.iter().any(|m| output.contains(m))
 }
 
 #[cfg(unix)]
@@ -410,6 +421,17 @@ mod tests {
         assert!(!r.is_error, "exit: {:?}", r.details["exit_code"]);
         assert!(matches!(&r.content[0],
             sepp_core::ContentBlock::Text { text } if text.contains("200000")));
+    }
+
+    #[test]
+    fn sandbox_denial_markers_cover_english_and_german() {
+        assert!(looks_like_sandbox_denial("cat: /x: Permission denied"));
+        assert!(looks_like_sandbox_denial("cat: /x: Keine Berechtigung"));
+        assert!(looks_like_sandbox_denial(
+            "sh: 1: cannot create /x: Permission denied\nexit=2"
+        ));
+        assert!(looks_like_sandbox_denial("mount: Operation not permitted"));
+        assert!(!looks_like_sandbox_denial("hello.txt\nnotes.txt"));
     }
 
     #[test]
