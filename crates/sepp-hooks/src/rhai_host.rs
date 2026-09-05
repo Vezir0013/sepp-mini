@@ -175,6 +175,12 @@ fn build_engine() -> Engine {
     engine.register_fn("log", |msg: rhai::ImmutableString| {
         tracing::debug!(target: "hook", "{msg}");
     });
+    // Rhais eingebaute `print`/`debug` würden auf stdout schreiben — stdout ist der Datenkanal
+    // (One-shot, RPC). Deshalb nach tracing umleiten (im TUI ohne Subscriber = No-op).
+    engine.on_print(|s| tracing::info!(target: "hook", "{s}"));
+    engine.on_debug(|s, src, pos| {
+        tracing::debug!(target: "hook", "{}@{pos}: {s}", src.unwrap_or("?"));
+    });
 
     // Ressourcen begrenzen (Engine-Sandbox).
     engine.set_max_operations(500_000);
@@ -261,6 +267,24 @@ mod tests {
         let outcome = host.dispatch(HookEvent::Input { text: &mut text }).unwrap();
         assert!(matches!(outcome, HookOutcome::Continue));
         assert_eq!(text, "baue das feature (geprüft)");
+    }
+
+    #[test]
+    fn print_and_debug_in_hook_do_not_fail() {
+        // `print`/`debug` gehen nach tracing statt stdout — der Hook läuft normal durch.
+        let host = host_with(
+            r#"
+            fn on_input(text) {
+                print("hallo");
+                debug("x");
+                text
+            }
+            "#,
+        );
+        let mut text = String::from("a");
+        let outcome = host.dispatch(HookEvent::Input { text: &mut text }).unwrap();
+        assert!(matches!(outcome, HookOutcome::Continue));
+        assert_eq!(text, "a");
     }
 
     #[test]
