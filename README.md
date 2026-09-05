@@ -336,10 +336,27 @@ Erweiterungen zu sandboxen reicht nicht, wenn das Modell über `bash` alles darf
 Ausführen unbeschränkt, **kein Netz**, minimale Umgebung (`PATH HOME LANG LC_* TERM TMPDIR`),
 Verbote auf `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.sepp` sowie config- und state-Root.
 
-**Modi:** `--mode ask` (TUI-Default; der Nachfrage-Dialog folgt, bis dahin wird außerhalb der
-Policy verweigert), `auto` (Default bei `-p`/`--rpc`: innerhalb erlaubt, außerhalb verweigert),
-`yolo` (keine Sandbox, bisheriges Verhalten). Ist die Sandbox nicht durchsetzbar, startet der Agent
-nicht (fail-closed); der Ausweg ist ausdrücklich `--mode yolo`.
+**Modi:** `--mode ask` (TUI-Default: außerhalb der Policy erscheint ein Dialog — einmal erlauben,
+für die Sitzung, dauerhaft oder ablehnen), `auto` (Default bei `-p`/`--rpc`: innerhalb erlaubt,
+außerhalb verweigert), `yolo` (keine Sandbox, bisheriges Verhalten). Ist die Sandbox nicht
+durchsetzbar, startet der Agent nicht (fail-closed); der Ausweg ist ausdrücklich `--mode yolo`.
+
+```
+┌ Berechtigung — Sepp Guard ───────────────────────────────┐
+│ Akteur  agent                                            │
+│ Aktion  schreiben /home/du/.config/werkzeug.toml         │
+│ Grund   … liegt außerhalb der Policy für agent           │
+│                                                          │
+│   [e]  einmal erlauben                                   │
+│   [s]  für diese Sitzung erlauben                        │
+│   [d]  dauerhaft erlauben (schreibt in policy.toml)      │
+│   [n]  ablehnen                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+„Dauerhaft" trägt das Recht selbst in die `policy.toml` ein; Kommentare und Formatierung bleiben
+erhalten. Dasselbe von Hand: `sepp policy allow agent fs_write ~/.config` (mit `--global` in die
+globale Datei). In der TUI zeigt `/policy` das Regelwerk.
 
 **Regelwerk** — `.sepp/policy.toml` im Projekt (lädt nach Trust), global `~/.sepp/policy.toml` oder
 `[policy]` in `settings.toml`. Einträge erweitern die Defaults, `[deny]` schränkt ein:

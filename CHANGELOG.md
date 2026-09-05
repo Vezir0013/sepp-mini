@@ -7,8 +7,41 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Sepp Guard, Phase 2: **der Modus `ask` fragt jetzt wirklich.** Phase 1 hat den Agenten eingesperrt,
+aber außerhalb der Policy nur verweigert — jede Ausnahme kostete einen Neustart mit angepasster
+Datei. Jetzt erscheint in der TUI ein Dialog: einmal, für die Sitzung, dauerhaft oder nein. Die
+Antwort „dauerhaft" schreibt das Recht selbst in die `policy.toml`, ohne Kommentare zu zerstören.
+
+### Hinzugefügt
+- **Rückfrage-Dialog in der TUI** (Modus `ask`): zeigt Akteur, Aktion und Grund; Antworten per
+  Direkttaste `e`/`s`/`d`/`n` oder ↑/↓ und Enter, Esc lehnt ab. Der laufende Turn bleibt aktiv,
+  während das fragende Tool wartet; parallele Tool-Aufrufe reihen sich in eine Warteschlange
+  (Anzahl offener Fragen steht im Rahmen). Turn-Ende und Ctrl+C lehnen offene Fragen ab —
+  es wird nie stillschweigend erlaubt.
+- **`sepp policy allow [--global] <akteur> <recht> <wert>`** trägt das Recht selbst ein
+  (projektlokal `.sepp/policy.toml`, mit `--global` in `<config_root>/policy.toml`). Neu ist
+  `sepp_policy::policy_edit` auf Basis von `toml_edit`: Kommentare, Reihenfolge und Formatierung
+  bleiben erhalten, ein vorhandener Wert ist ein No-op, fehlende Abschnitte werden angelegt.
+- **`/policy` in der TUI** zeigt dasselbe Regelwerk wie `sepp policy` unter dem Verlauf.
+- `Guard::set_prompter` (der Rückfrage-Kanal entsteht erst mit der TUI, der Guard steckt da schon
+  in den Tools), `Guard::take_notices` für Frontend-Meldungen, Sitzungs-Zustimmung für
+  Shell-Kommandos (ein per Muster bestätigtes Kommando fragt nicht erneut).
+
+### Geändert
+- `ask` ohne Terminal (`-p`/`--rpc`) fällt mit Startup-Hinweis auf `auto` zurück, statt jede
+  Aktion außerhalb der Policy zu verweigern — dort gibt es niemanden zu fragen.
+- Die Verweigerungsmeldung nennt nicht mehr „Nachfrage-Dialog folgt (Phase 2)".
+
+### Tests
+- Dialog als Reducer getestet: Direkttasten, ↑/↓ mit Klemmung, Enter, Esc, unbekannte Taste,
+  Warteschlange mit zwei Anfragen, Ablehnung bei Turn-Ende und Ctrl+C, `/policy` ohne Guard.
+- `policy_edit`: Kommentare bleiben, No-op bei vorhandenem Wert, neue Datei mit Kopf, `[mcp.git]`
+  als eine Zeile, `net = true` als Bool, klare Fehler bei `exec = "system"` und unbekanntem Recht.
+- `parse_allow_args` (inkl. `--global` an beliebiger Stelle) und `section_label`.
+- End-to-End in der echten TUI über ein Pseudo-Terminal gegen Ollama: alle vier Antworten
+  (`n` verweigert, `e`/`s` schreiben ohne Datei-Eintrag, `d` schreibt und trägt ein).
+
 ### Geplant
-- Sepp Guard Phase 2: Nachfrage-Dialog in der TUI, `sepp policy allow` schreibt selbst
 - Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
 - OpenTelemetry-Export (optional aktivierbar)
