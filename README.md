@@ -283,6 +283,30 @@ command = ["uvx", "mcp-server-git"]
 Was ein Server **darf**, steht nicht hier, sondern in der `policy.toml` unter `[mcp.git]`. Die
 settings.toml sagt, was läuft; das Regelwerk sagt, was es darf.
 
+Ein entfernter Server braucht oft einen Schlüssel. Der steht als Platzhalter im Header — nie im
+Klartext und nie in der `url`, denn die taucht in jeder Verbindungsfehlermeldung auf:
+
+```toml
+[[mcp.servers]]
+name = "example"
+transport = "http"
+url = "https://mcp.example.com"
+
+[mcp.servers.headers]
+Authorization = "Bearer $EXAMPLE_TOKEN"
+```
+
+```toml
+# policy.toml — beide Zeilen nötig, sonst wird gar nicht erst verbunden
+[mcp.example]
+net = ["mcp.example.com"]   # wohin das Secret gehen darf
+env = ["EXAMPLE_TOKEN"]     # welches Secret dieser Server sehen darf
+```
+
+Der Wert kommt aus der Umgebung und wird **vor** dem Verbinden eingesetzt. Fehlt eine der beiden
+Zeilen, bricht sepp mit der passenden `sepp policy allow`-Empfehlung ab, statt einen Header mit
+literalem `$EXAMPLE_TOKEN` loszuschicken.
+
 Beispiel `manifest.toml` (WASM-Plugin mit Capabilities und Ressourcen-Limits):
 
 ```toml

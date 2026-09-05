@@ -10,14 +10,30 @@
 //! `exec`-Liste). Die Policy kommt entweder aus `[mcp.servers.capabilities]` ([`connect`]) oder
 //! — mit Sepp Guard — bereits gemergt aus der Policy-Datei ([`connect_with_policy`]). Das stderr
 //! des Servers wird gepipet und über `tracing` geloggt, statt in die TUI zu schreiben.
+//!
+//! **Secrets in HTTP-Headern.** `[mcp.servers.headers]` darf `$NAME`-Platzhalter enthalten; der
+//! [`SecretBroker`] ersetzt sie beim Verbinden — aber nur, wenn `[mcp.<name>]` in der
+//! `policy.toml` **beides** gewährt: `env = ["NAME"]` (welches Secret) und `net = ["<host>"]`
+//! (wohin es darf). Fehlt eine Hälfte, bricht der Connect ab, statt einen kaputten Header zu
+//! senden — ein stehengebliebener Platzhalter landete sonst im Zugriffslog des fremden Servers.
+//! Zwei Entscheidungen, die dazugehören:
+//!
+//! * **Nur `headers`, nie `url`.** `reqwest`s Fehlertexte enthalten die URL; ein
+//!   `?api_key=$TOKEN` stünde bei jedem Verbindungsfehler im Klartext in der Meldung.
+//! * **Redaction deckt Fehlertexte und stdio-stderr, nicht Tool-Ergebnisse.** Ein Server, der
+//!   den Auth-Header in seine *Antwort* spiegelt, schreibt das Secret damit ins Kontextfenster
+//!   und in die Session-Datei. Das ist eine bewusst getragene Grenze, keine Lücke, die niemand
+//!   bemerkt hat — sie fällt mit dem Egress-Proxy.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use http::{HeaderName, HeaderValue};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use serde::Deserialize;
@@ -25,7 +41,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::{ContentBlock, ImageSource, Result, SeppError, ToolResult, ToolSpec};
-use sepp_policy::Policy;
+use sepp_policy::{Policy, SecretBroker};
 use sepp_tools::Tool;
 
 type Service = RunningService<RoleClient, ()>;
@@ -59,6 +75,12 @@ pub struct McpServerConfig {
     /// `[mcp.servers.capabilities]` — werden für stdio-Subprozesse per Sandbox erzwungen.
     #[serde(default)]
     pub capabilities: sepp_policy::Capabilities,
+    /// `[mcp.servers.headers]` — HTTP-Header für `transport = "http"`. Werte dürfen
+    /// `$NAME`-Platzhalter enthalten; ersetzt wird nur, wenn `[mcp.<name>]` in der `policy.toml`
+    /// **beides** gewährt: `env = ["NAME"]` (welches Secret) und `net = ["<host der url>"]`
+    /// (wohin es gehen darf). Siehe [`resolve_headers`].
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Liest `[[mcp.servers]]` aus mehreren `settings.toml` (fehlende Dateien werden ignoriert).
@@ -90,6 +112,9 @@ pub struct McpConnection {
     server: String,
     service: Arc<Service>,
     tools: Vec<rmcp::model::Tool>,
+    /// Für die Redaction: Ein Server, der ein Secret in eine Fehlermeldung spiegelt, soll es
+    /// nicht in die TUI schreiben.
+    broker: Arc<SecretBroker>,
 }
 
 impl McpConnection {
@@ -112,6 +137,7 @@ impl McpConnection {
             let description = t.description.map(|d| d.to_string()).unwrap_or_default();
             out.push(Arc::new(McpTool {
                 service: self.service.clone(),
+                broker: self.broker.clone(),
                 remote_name: raw,
                 call_timeout: DEFAULT_CALL_TIMEOUT,
                 spec: ToolSpec {
@@ -158,6 +184,124 @@ pub fn policy_from_config(cfg: &McpServerConfig) -> Policy {
     cfg.capabilities.to_policy()
 }
 
+/// Host einer http(s)-URL — ohne Schema, Userinfo, Port und Pfad.
+///
+/// Reicht für das Net-Gate: `Capability::Net` kennt nur Hostnamen (exakt oder `*.suffix`).
+pub fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo abschneiden (`user:pass@host`).
+    let authority = authority.rsplit('@').next()?;
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        // IPv6-Literal: alles bis zur schließenden Klammer.
+        v6.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// Baut den Broker für einen Server: genau die Secrets, die seine Header **verlangen** und die
+/// ihm per `Env`-Recht **gewährt** sind.
+///
+/// Der einzige Ort, der Secret-Werte aus der Umgebung liest. Ohne das Env-Gate entschiede allein
+/// die `settings.toml`, welche Variable rausgeht — die nach Trust auch projektlokal sein kann,
+/// und `[deny]` kann `env` nicht einschränken.
+fn broker_for(cfg: &McpServerConfig, policy: &Policy) -> SecretBroker {
+    let wanted: Vec<&str> = cfg
+        .headers
+        .values()
+        .flat_map(|v| sepp_policy::placeholder_names(v))
+        .filter(|n| {
+            policy.allows(&sepp_policy::Capability::Env {
+                name: (*n).to_string(),
+            })
+        })
+        .collect();
+    SecretBroker::from_env(&wanted)
+}
+
+/// Löst `cfg.headers` zu fertigen HTTP-Headern auf: Platzhalter ersetzt, Gates geprüft, Werte
+/// als `sensitive` markiert.
+///
+/// Rein (kein Env, kein I/O) — der Broker wird übergeben, damit die Gate-Logik ohne Umgebung
+/// und ohne Server testbar bleibt.
+///
+/// **Fail-closed vor dem ersten Byte.** Bliebe ein Platzhalter stehen, ginge er über die Leitung
+/// und landete im Zugriffslog des fremden Servers, und die Meldung wäre ein nacktes `HTTP 401`,
+/// das nichts über die fehlende Policy-Zeile sagt. Deshalb bricht jeder ungeklärte Fall hier ab,
+/// mit dem passenden `sepp policy allow` in der Meldung — und **nie** mit dem Wert darin.
+pub fn resolve_headers(
+    cfg: &McpServerConfig,
+    host: &str,
+    policy: &Policy,
+    broker: &SecretBroker,
+) -> Result<HashMap<HeaderName, HeaderValue>> {
+    let mut out = HashMap::new();
+    for (name, raw) in &cfg.headers {
+        let lower = name.to_ascii_lowercase();
+        // rmcp setzt diese selbst und lehnt sie zur Request-Zeit ab — hier ist es erklärbar.
+        if matches!(
+            lower.as_str(),
+            "accept" | "mcp-session-id" | "last-event-id"
+        ) {
+            return Err(SeppError::Config(format!(
+                "mcp '{}': Header '{name}' wird vom Transport selbst gesetzt",
+                cfg.name
+            )));
+        }
+        for want in sepp_policy::placeholder_names(raw) {
+            if !policy.allows(&sepp_policy::Capability::Net {
+                host: host.to_string(),
+            }) {
+                return Err(SeppError::Config(format!(
+                    "mcp '{}': Header '{name}' nutzt ${want}, aber {host} ist nicht gewährt — \
+                     `sepp policy allow mcp.{} net {host}`",
+                    cfg.name, cfg.name
+                )));
+            }
+            if !policy.allows(&sepp_policy::Capability::Env {
+                name: want.to_string(),
+            }) {
+                return Err(SeppError::Config(format!(
+                    "mcp '{}': Header '{name}' nutzt ${want}, aber diese Variable ist nicht \
+                     gewährt — `sepp policy allow mcp.{} env {want}`",
+                    cfg.name, cfg.name
+                )));
+            }
+            // Der Broker hält genau die gewährten und verlangten Variablen; fehlt sie hier,
+            // ist sie in der Umgebung nicht gesetzt.
+            if !broker.knows(want) {
+                return Err(SeppError::Config(format!(
+                    "mcp '{}': Header '{name}' nutzt ${want} — gewährt, aber in der Umgebung \
+                     nicht gesetzt",
+                    cfg.name
+                )));
+            }
+        }
+        let value = broker.substitute_for_host(raw, host, policy);
+        let key = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            SeppError::Config(format!("mcp '{}': Header-Name '{name}': {e}", cfg.name))
+        })?;
+        // Der Wert darf NIE in eine Meldung — der klassische Fall ist ein Zeilenumbruch aus
+        // `$(cat token.txt)`, und die Fehlermeldung spiegelte dann das Secret.
+        let mut value = HeaderValue::from_str(&value).map_err(|_| {
+            SeppError::Config(format!(
+                "mcp '{}': Header '{name}' ergibt keinen gültigen Header-Wert \
+                 (Steuerzeichen im Secret?)",
+                cfg.name
+            ))
+        })?;
+        // `Debug` druckt danach nur noch "Sensitive" — der Transport-Worker leitet `Debug` ab
+        // und hält die Config.
+        value.set_sensitive(true);
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
 /// Verbindet zu einem MCP-Server und listet seine Tools, **ohne** Rechte. Nur für Werkzeuge
 /// ohne Policy-Kontext (`examples/probe.rs`); der Agent nutzt [`connect_with_policy`].
 pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
@@ -168,6 +312,10 @@ pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
 /// bereits angewendet). Für `http` ist die Policy ohne Wirkung — der Server läuft auf einem
 /// fremden Rechner.
 pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Result<McpConnection> {
+    // Die einzige Stelle, die Secret-Werte aus der Umgebung holt. `McpServerConfig` (derived
+    // `Debug`) hält nur Platzhalter; echte Werte leben ausschließlich hier und in als
+    // `sensitive` markierten `HeaderValue`s.
+    let broker = Arc::new(broker_for(cfg, policy));
     let service: Service = match cfg.transport.as_str() {
         "http" => {
             let url = cfg.url.as_deref().ok_or_else(|| {
@@ -176,10 +324,31 @@ pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Resu
                     cfg.name
                 ))
             })?;
-            let transport = StreamableHttpClientTransport::from_uri(url);
-            ().serve(transport)
-                .await
-                .map_err(|e| SeppError::Provider(format!("mcp '{}': connect: {e}", cfg.name)))?
+            // Header VOR dem Transportbau auflösen: Ein stehengebliebener Platzhalter ginge
+            // sonst über die Leitung und landete im Zugriffslog des fremden Servers.
+            let headers = if cfg.headers.is_empty() {
+                HashMap::new()
+            } else {
+                let host = url_host(url).ok_or_else(|| {
+                    SeppError::Config(format!(
+                        "mcp '{}': 'url' ist keine gültige http(s)-URL: {url}",
+                        cfg.name
+                    ))
+                })?;
+                resolve_headers(cfg, host, policy, &broker)?
+            };
+            let transport = StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers),
+            );
+            ().serve(transport).await.map_err(|e| {
+                // Ein Nicht-2xx wird von rmcp samt Antwortkörper in den Fehlertext gepackt;
+                // ein Server, der den Auth-Header spiegelt, leakte ihn sonst in die TUI.
+                SeppError::Provider(format!(
+                    "mcp '{}': connect: {}",
+                    cfg.name,
+                    broker.redact(&e.to_string())
+                ))
+            })?
         }
         "stdio" => {
             if cfg.command.is_empty() {
@@ -202,7 +371,7 @@ pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Resu
                 .spawn()
                 .map_err(|e| SeppError::Provider(format!("mcp '{}': spawn: {e}", cfg.name)))?;
             if let Some(stderr) = stderr {
-                spawn_stderr_logger(cfg.name.clone(), stderr);
+                spawn_stderr_logger(cfg.name.clone(), stderr, broker.clone());
             }
             ().serve(transport)
                 .await
@@ -217,24 +386,34 @@ pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Resu
     };
 
     let service = Arc::new(service);
-    let tools = service
-        .list_all_tools()
-        .await
-        .map_err(|e| SeppError::Provider(format!("mcp '{}': list_tools: {e}", cfg.name)))?;
+    let tools = service.list_all_tools().await.map_err(|e| {
+        SeppError::Provider(format!(
+            "mcp '{}': list_tools: {}",
+            cfg.name,
+            broker.redact(&e.to_string())
+        ))
+    })?;
     Ok(McpConnection {
         server: cfg.name.clone(),
         service,
         tools,
+        broker,
     })
 }
 
 /// Loggt das stderr eines stdio-Servers zeilenweise (`target = "mcp"`), bis EOF.
-fn spawn_stderr_logger(server: String, stderr: tokio::process::ChildStderr) {
+fn spawn_stderr_logger(
+    server: String,
+    stderr: tokio::process::ChildStderr,
+    broker: Arc<SecretBroker>,
+) {
     use tokio::io::AsyncBufReadExt;
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::warn!(target: "mcp", server = %server, "{line}");
+            // Der Subprozess hat das Secret per `scrub_env` legitim in der Umgebung und echot
+            // es bei einem Fehler gern auf stderr — von dort ginge es direkt ins Log.
+            tracing::warn!(target: "mcp", server = %server, "{}", broker.redact(&line));
         }
     });
 }
@@ -242,6 +421,9 @@ fn spawn_stderr_logger(server: String, stderr: tokio::process::ChildStderr) {
 /// Ein einzelnes Remote-Tool als `sepp_tools::Tool`.
 pub struct McpTool {
     service: Arc<Service>,
+    /// Redaction für Fehlertexte. Tool-**Ergebnisse** laufen bewusst NICHT hierdurch: siehe
+    /// die Grenze in der Modul-Doku.
+    broker: Arc<SecretBroker>,
     remote_name: String,
     call_timeout: Duration,
     spec: ToolSpec,
@@ -281,7 +463,11 @@ impl Tool for McpTool {
             r = tokio::time::timeout(self.call_timeout, self.service.call_tool(param)) => match r {
                 Ok(Ok(res)) => res,
                 Ok(Err(e)) => {
-                    return Err(SeppError::Tool(format!("mcp '{}': {e}", self.remote_name)))
+                    return Err(SeppError::Tool(format!(
+                        "mcp '{}': {}",
+                        self.remote_name,
+                        self.broker.redact(&e.to_string())
+                    )))
                 }
                 Err(_) => {
                     return Err(SeppError::Tool(format!(
@@ -332,6 +518,184 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use sepp_policy::Capability;
+
+    fn http_cfg(headers: &[(&str, &str)]) -> McpServerConfig {
+        McpServerConfig {
+            name: "gh".into(),
+            transport: "http".into(),
+            url: Some("https://api.example.com/mcp".into()),
+            command: vec![],
+            capabilities: Default::default(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn pol(caps: Vec<Capability>) -> Policy {
+        Policy::new(caps)
+    }
+
+    fn full_grant() -> Policy {
+        pol(vec![
+            Capability::Net {
+                host: "api.example.com".into(),
+            },
+            Capability::Env {
+                name: "TOKEN".into(),
+            },
+        ])
+    }
+
+    fn broker() -> SecretBroker {
+        SecretBroker::new().with_secret("TOKEN", "sk-geheim")
+    }
+
+    #[test]
+    fn url_host_strips_scheme_userinfo_port_and_path() {
+        assert_eq!(
+            url_host("https://api.example.com/mcp"),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            url_host("http://u:p@api.example.com:8443/x?y"),
+            Some("api.example.com")
+        );
+        assert_eq!(url_host("https://[::1]:8080/mcp"), Some("::1"));
+        assert_eq!(url_host("api.example.com/mcp"), None, "ohne Schema");
+        assert_eq!(url_host("https:///mcp"), None, "leerer Host");
+    }
+
+    #[test]
+    fn headers_resolve_when_both_gates_are_open() {
+        let cfg = http_cfg(&[("Authorization", "Bearer $TOKEN")]);
+        let out = resolve_headers(&cfg, "api.example.com", &full_grant(), &broker()).unwrap();
+        let v = out.get(&HeaderName::from_static("authorization")).unwrap();
+        assert_eq!(v.to_str().unwrap(), "Bearer sk-geheim");
+        // Die Nicht-Leak-Zusage: `Debug` darf den Wert nicht zeigen — der Transport-Worker
+        // leitet `Debug` ab und hält die Config.
+        assert_eq!(format!("{v:?}"), "Sensitive");
+    }
+
+    #[test]
+    fn wildcard_net_grant_is_enough() {
+        let cfg = http_cfg(&[("X-Key", "$TOKEN")]);
+        let grant = pol(vec![
+            Capability::Net { host: "*".into() },
+            Capability::Env {
+                name: "TOKEN".into(),
+            },
+        ]);
+        assert!(resolve_headers(&cfg, "api.example.com", &grant, &broker()).is_ok());
+    }
+
+    #[test]
+    fn headers_without_placeholders_need_no_grant() {
+        let cfg = http_cfg(&[("X-Client", "sepp")]);
+        let out = resolve_headers(&cfg, "api.example.com", &Policy::default(), &broker()).unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn missing_net_grant_names_the_host_and_the_command() {
+        let cfg = http_cfg(&[("Authorization", "Bearer $TOKEN")]);
+        let grant = pol(vec![Capability::Env {
+            name: "TOKEN".into(),
+        }]);
+        let e = resolve_headers(&cfg, "api.example.com", &grant, &broker()).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("api.example.com"), "{msg}");
+        assert!(msg.contains("sepp policy allow mcp.gh net"), "{msg}");
+        assert!(
+            !msg.contains("sk-geheim"),
+            "der Wert darf nie in die Meldung: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_env_grant_names_the_variable_and_the_command() {
+        let cfg = http_cfg(&[("Authorization", "Bearer $TOKEN")]);
+        let grant = pol(vec![Capability::Net {
+            host: "api.example.com".into(),
+        }]);
+        let msg = resolve_headers(&cfg, "api.example.com", &grant, &broker())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("sepp policy allow mcp.gh env TOKEN"), "{msg}");
+    }
+
+    #[test]
+    fn granted_but_unset_variable_is_reported_not_silently_left_standing() {
+        let cfg = http_cfg(&[("Authorization", "Bearer $TOKEN")]);
+        let empty = SecretBroker::new();
+        let msg = resolve_headers(&cfg, "api.example.com", &full_grant(), &empty)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("nicht gesetzt"), "{msg}");
+    }
+
+    #[test]
+    fn reserved_header_names_are_refused_at_config_time() {
+        let cfg = http_cfg(&[("Accept", "text/plain")]);
+        let msg = resolve_headers(&cfg, "api.example.com", &full_grant(), &broker())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("vom Transport selbst gesetzt"), "{msg}");
+    }
+
+    #[test]
+    fn a_secret_with_control_characters_is_refused_without_echoing_it() {
+        let cfg = http_cfg(&[("Authorization", "Bearer $TOKEN")]);
+        let b = SecretBroker::new().with_secret("TOKEN", "sk-mit\nZeilenumbruch");
+        let msg = resolve_headers(&cfg, "api.example.com", &full_grant(), &b)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Steuerzeichen"), "{msg}");
+        assert!(!msg.contains("sk-mit"), "{msg}");
+    }
+
+    #[test]
+    fn broker_loads_only_granted_and_actually_used_variables() {
+        std::env::set_var("SEPP_TEST_GRANTED", "wert-a");
+        std::env::set_var("SEPP_TEST_UNGRANTED", "wert-b");
+        let mut cfg = http_cfg(&[("A", "$SEPP_TEST_GRANTED"), ("B", "$SEPP_TEST_UNGRANTED")]);
+        cfg.name = "t".into();
+        let grant = pol(vec![Capability::Env {
+            name: "SEPP_TEST_GRANTED".into(),
+        }]);
+        let b = broker_for(&cfg, &grant);
+        assert!(b.knows("SEPP_TEST_GRANTED"));
+        assert!(!b.knows("SEPP_TEST_UNGRANTED"), "ohne env-Recht kein Wert");
+    }
+
+    #[test]
+    fn settings_without_headers_still_parse() {
+        let toml = r#"
+            [[mcp.servers]]
+            name = "alt"
+            transport = "http"
+            url = "https://api.example.com/mcp"
+        "#;
+        let s: Settings = toml::from_str(toml).unwrap();
+        assert!(s.mcp.servers[0].headers.is_empty());
+    }
+
+    #[test]
+    fn settings_with_headers_parse() {
+        let toml = r#"
+            [[mcp.servers]]
+            name = "gh"
+            transport = "http"
+            url = "https://api.example.com/mcp"
+            [mcp.servers.headers]
+            Authorization = "Bearer $TOKEN"
+        "#;
+        let s: Settings = toml::from_str(toml).unwrap();
+        assert_eq!(s.mcp.servers[0].headers["Authorization"], "Bearer $TOKEN");
+    }
 
     #[test]
     fn resolve_name_prefixes_only_on_collision() {

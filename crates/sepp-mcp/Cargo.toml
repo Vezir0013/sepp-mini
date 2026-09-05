@@ -20,6 +20,10 @@ rmcp = { version = "=1.8.0", features = [
     "transport-child-process",
 ] }
 
+# http = HeaderName/HeaderValue für `[mcp.servers.headers]`. rmcp re-exportiert sie nicht;
+# die Version ist die, die rmcp und reqwest ohnehin in den Baum ziehen.
+http = "=1.4.2"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "=0.8.23"

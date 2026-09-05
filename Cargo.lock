@@ -1886,6 +1886,7 @@ version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
+ "http",
  "rmcp",
  "sepp-core",
  "sepp-policy",

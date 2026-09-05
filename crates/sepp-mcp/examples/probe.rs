@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
         url: Some(url.clone()),
         command: vec![],
         capabilities: Default::default(),
+        headers: Default::default(),
     };
 
     println!("Verbinde mit {url} …");
