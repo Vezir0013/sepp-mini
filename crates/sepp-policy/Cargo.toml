@@ -13,6 +13,7 @@ sepp-core = { path = "../sepp-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "=0.8.23"
+toml_edit = "=0.22.27"
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

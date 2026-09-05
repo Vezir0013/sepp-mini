@@ -724,12 +724,18 @@ pub struct Authorization {
 pub struct Guard {
     set: PolicySet,
     mode: Mode,
-    prompter: Option<Arc<dyn PermissionPrompter>>,
+    /// Rückfrage-Kanal — wird erst gesetzt, wenn das Frontend steht (die TUI erzeugt ihren
+    /// Kanal nach dem Guard-Bau), deshalb innere Mutability statt Builder-Feld.
+    prompter: Mutex<Option<Arc<dyn PermissionPrompter>>>,
     session_grants: Mutex<Vec<Capability>>,
+    /// Shell-Kommandos, die der Mensch für diese Sitzung freigegeben hat (Rückfrage-Muster).
+    session_shell_ok: Mutex<Vec<String>>,
     sandbox: Box<dyn Sandbox>,
     audit: Mutex<Vec<AuditEvent>>,
-    persist_requests: Mutex<Vec<Capability>>,
-    hint_file: Option<PathBuf>,
+    /// Meldungen fürs Frontend (z. B. „dauerhaft in policy.toml eingetragen").
+    notices: Mutex<Vec<String>>,
+    /// Policy-Datei für Hinweise und für „dauerhaft erlauben".
+    policy_file: Option<PathBuf>,
 }
 
 impl fmt::Debug for Guard {
@@ -751,25 +757,43 @@ impl Guard {
         Guard {
             mode: set.mode,
             set,
-            prompter: None,
+            prompter: Mutex::new(None),
             session_grants: Mutex::new(Vec::new()),
+            session_shell_ok: Mutex::new(Vec::new()),
             sandbox,
             audit: Mutex::new(Vec::new()),
-            persist_requests: Mutex::new(Vec::new()),
-            hint_file: None,
+            notices: Mutex::new(Vec::new()),
+            policy_file: None,
         }
     }
 
-    /// Rückfrage-Kanal (Phase 2). Ohne Prompter wird `Ask` zu `Deny` mit Hinweis.
-    pub fn with_prompter(mut self, prompter: Arc<dyn PermissionPrompter>) -> Self {
-        self.prompter = Some(prompter);
+    /// Rückfrage-Kanal. Ohne Prompter wird `Ask` zu `Deny` mit Hinweis.
+    pub fn with_prompter(self, prompter: Arc<dyn PermissionPrompter>) -> Self {
+        self.set_prompter(prompter);
         self
     }
 
-    /// Datei, die Verweigerungsmeldungen als Ort zum Freigeben nennen.
-    pub fn with_hint_file(mut self, path: PathBuf) -> Self {
-        self.hint_file = Some(path);
+    /// Setzt den Rückfrage-Kanal nachträglich — die TUI erzeugt ihren Kanal erst beim Start,
+    /// der Guard steckt zu dem Zeitpunkt schon in den Tools.
+    pub fn set_prompter(&self, prompter: Arc<dyn PermissionPrompter>) {
+        *lock(&self.prompter) = Some(prompter);
+    }
+
+    /// Gibt es einen Rückfrage-Kanal? (Startup-Hinweis im Modus `ask`.)
+    pub fn has_prompter(&self) -> bool {
+        lock(&self.prompter).is_some()
+    }
+
+    /// Policy-Datei: wird in Verweigerungsmeldungen genannt und bei „dauerhaft erlauben"
+    /// beschrieben.
+    pub fn with_policy_file(mut self, path: PathBuf) -> Self {
+        self.policy_file = Some(path);
         self
+    }
+
+    /// Pfad der Policy-Datei, in die „dauerhaft" schreibt.
+    pub fn policy_file(&self) -> Option<&Path> {
+        self.policy_file.as_deref()
     }
 
     pub fn mode(&self) -> Mode {
@@ -807,6 +831,10 @@ impl Guard {
             Action::Shell { command } => {
                 if self.mode == Mode::Ask {
                     if let Some(p) = self.set.ask_match(command) {
+                        // Für diese Sitzung bereits freigegeben? Dann nicht erneut fragen.
+                        if lock(&self.session_shell_ok).iter().any(|c| c == command) {
+                            return Decision::Allow;
+                        }
                         return Decision::Ask {
                             reason: format!("Kommando enthält Rückfrage-Muster '{p}'"),
                         };
@@ -850,7 +878,7 @@ impl Guard {
 
     fn hint_text(&self, actor: &Actor, action: &Action) -> String {
         let file = self
-            .hint_file
+            .policy_file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".sepp/policy.toml".to_string());
@@ -891,7 +919,10 @@ impl Guard {
                 ))
             }
             Decision::Ask { reason } => {
-                let Some(prompter) = self.prompter.clone() else {
+                // Prompter klonen und den Lock SOFORT freigeben — nie über ein `.await` halten
+                // (sonst ist die Future nicht `Send` und der Tool-JoinSet nimmt sie nicht an).
+                let prompter = lock(&self.prompter).clone();
+                let Some(prompter) = prompter else {
                     self.record(
                         actor,
                         &action,
@@ -919,18 +950,17 @@ impl Guard {
                         })
                     }
                     PermissionAnswer::Session => {
-                        if let Some(c) = cap {
-                            lock(&self.session_grants).push(c);
-                        }
+                        self.grant_for_session(&action, cap);
                         self.record(actor, &action, "allow (Sitzung)", Some(reason));
                         Ok(Authorization::default())
                     }
                     PermissionAnswer::Always => {
-                        if let Some(c) = cap {
-                            lock(&self.session_grants).push(c.clone());
-                            lock(&self.persist_requests).push(c);
-                        }
+                        self.grant_for_session(&action, cap);
+                        let detail = self.persist(actor, &action);
                         self.record(actor, &action, "allow (dauerhaft)", Some(reason));
+                        if let Some(msg) = detail {
+                            lock(&self.notices).push(msg);
+                        }
                         Ok(Authorization::default())
                     }
                     PermissionAnswer::No => {
@@ -965,6 +995,60 @@ impl Guard {
         self.sandbox.prepare(cmd, policy)
     }
 
+    /// Merkt eine bejahte Rückfrage für den Rest der Sitzung vor (Pfad-Recht bzw. das exakte
+    /// Shell-Kommando — beim Muster-Treffer gibt es kein Recht, das man gewähren könnte).
+    fn grant_for_session(&self, action: &Action, cap: Option<Capability>) {
+        match (action, cap) {
+            (Action::Shell { command }, _) => {
+                let mut ok = lock(&self.session_shell_ok);
+                if !ok.iter().any(|c| c == command) {
+                    ok.push(command.clone());
+                }
+            }
+            (_, Some(c)) => {
+                let mut grants = lock(&self.session_grants);
+                if !grants.contains(&c) {
+                    grants.push(c);
+                }
+            }
+            (_, None) => {}
+        }
+    }
+
+    /// Schreibt eine bejahte Rückfrage dauerhaft in die Policy-Datei. Liefert die Meldung fürs
+    /// Frontend; ein Schreibfehler hebt die Zustimmung NICHT auf (die Sitzung gilt weiter).
+    fn persist(&self, actor: &Actor, action: &Action) -> Option<String> {
+        let file = self.policy_file.as_ref()?;
+        let (right, val) = match action {
+            Action::FsRead(p) => ("fs_read", canonicalize_lenient(p).display().to_string()),
+            Action::FsWrite(p) => ("fs_write", canonicalize_lenient(p).display().to_string()),
+            // Ein Rückfrage-Muster gewährt kein Recht — „dauerhaft" hieße hier, das Muster aus
+            // der Datei zu nehmen; das bleibt eine bewusste Handentscheidung.
+            Action::Shell { .. } => {
+                return Some(format!(
+                "Für die Sitzung erlaubt. Dauerhaft: das Muster in {} unter [agent.ask] entfernen.",
+                file.display()
+            ))
+            }
+        };
+        match crate::policy_edit::allow(file, actor, right, &val) {
+            Ok(true) => Some(format!(
+                "Dauerhaft erlaubt: {right} = \"{val}\" in {}",
+                file.display()
+            )),
+            Ok(false) => Some(format!("Stand bereits in {}", file.display())),
+            Err(e) => Some(format!(
+                "Für die Sitzung erlaubt, aber Schreiben in {} schlug fehl: {e}",
+                file.display()
+            )),
+        }
+    }
+
+    /// Holt Meldungen fürs Frontend ab (und leert sie).
+    pub fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *lock(&self.notices))
+    }
+
     /// Holt alle bisher protokollierten Entscheidungen ab (und leert das Audit).
     pub fn drain_audit(&self) -> Vec<AuditEvent> {
         std::mem::take(&mut *lock(&self.audit))
@@ -973,11 +1057,6 @@ impl Guard {
     /// Letzte protokollierte Entscheidung (für `ToolResult.details["guard"]`).
     pub fn last_audit(&self) -> Option<AuditEvent> {
         lock(&self.audit).last().cloned()
-    }
-
-    /// Gewährungen, die der Nutzer dauerhaft wünschte (Phase 2 schreibt sie in die Policy-Datei).
-    pub fn take_persist_requests(&self) -> Vec<Capability> {
-        std::mem::take(&mut *lock(&self.persist_requests))
     }
 
     /// Kompakte JSON-Form eines Audit-Eintrags.
@@ -1602,7 +1681,8 @@ command = ["uvx", "mcp-server-git"]
             Decision::Allow
         );
         assert!(g.agent_spawn_policy(&[]).allows_path(&target, true));
-        assert!(g.take_persist_requests().is_empty());
+        // „Sitzung" schreibt nichts in die Policy-Datei.
+        assert!(g.take_notices().is_empty());
     }
 
     #[tokio::test]
@@ -1633,22 +1713,32 @@ command = ["uvx", "mcp-server-git"]
     }
 
     #[tokio::test]
-    async fn always_grant_records_persist_request_and_no_denies() {
+    async fn always_writes_policy_file_and_no_denies() {
         let env = Env::new();
+        let policy_file = env.root.join("proj/.sepp/policy.toml");
         let g = Guard::new(
             env.set(Mode::Ask, Env::default_grants(), &[]),
             Box::new(NullSandbox),
         )
+        .with_policy_file(policy_file.clone())
         .with_prompter(Arc::new(Answering(PermissionAnswer::Always)));
         let target = env.root.join("home/always.txt");
         g.authorize(&Actor::Agent, Action::FsWrite(target.clone()))
             .await
             .unwrap();
+        // Datei geschrieben, Meldung fürs Frontend, Sitzung gilt sofort.
+        let written = std::fs::read_to_string(&policy_file).unwrap();
+        assert!(written.contains("[agent]"), "{written}");
+        assert!(
+            written.contains(&format!("{}", target.display())),
+            "{written}"
+        );
+        let notices = g.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("Dauerhaft erlaubt"), "{notices:?}");
         assert_eq!(
-            g.take_persist_requests(),
-            vec![Capability::FsWrite {
-                prefix: target.clone()
-            }]
+            g.decide(&Actor::Agent, &Action::FsWrite(target.clone())),
+            Decision::Allow
         );
         let g = Guard::new(
             env.set(Mode::Ask, Env::default_grants(), &[]),
