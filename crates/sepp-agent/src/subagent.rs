@@ -1,6 +1,11 @@
 //! Native Sub-Agenten (Phase 4): eine Teilaufgabe läuft in einer **isolierten** [`AgentSession`]
 //! (eigene Conversation, eingeschränktes Toolset, eigenes Budget). Nur das Endergebnis kehrt als
 //! [`ToolResult`] zur Wurzel zurück — der Wurzel-Kontext bleibt schlank.
+//!
+//! Für das Audit ist Isolation zu wenig: ohne Spur wäre alles, was der Sub-Agent tut, unsichtbar.
+//! Mit einer [`SessionFactory`] schreibt jeder Lauf deshalb eine **eigene Kind-Session**, die im
+//! Header auf die Wurzel verweist, und meldet sie der Wurzel über den reservierten Schlüssel
+//! `details["audit"]` (siehe [`crate::AUDIT_DETAIL_KEY`]).
 
 use std::sync::Arc;
 
@@ -12,9 +17,20 @@ use sepp_core::{
     ContentBlock, Message, Model, Result, Role, SeppError, ThinkingLevel, ToolResult, ToolSpec,
 };
 use sepp_provider::Provider;
+use sepp_session::SessionStore;
 use sepp_tools::Tool;
 
-use crate::{AgentEvent, AgentSession};
+use crate::{AgentEvent, AgentSession, AUDIT_DETAIL_KEY};
+
+/// Erzeugt den Session-Store für einen Sub-Agent-Lauf. Das Frontend entscheidet Backend,
+/// Verzeichnis und Wurzel-Verweis; liefert `None`, wenn nicht persistiert werden soll.
+///
+/// `Arc` + `Send + Sync`, weil [`Tool::execute`] nur `&self` bekommt und mehrere `task`-Aufrufe
+/// im selben Turn nebenläufig laufen können.
+pub type SessionFactory = Arc<dyn Fn() -> Option<Box<dyn SessionStore>> + Send + Sync>;
+
+/// Wie viele Zeichen der Aufgabenstellung in den Audit-Eintrag wandern.
+const TASK_PREVIEW_CHARS: usize = 160;
 
 /// Ein Tool, das eine Teilaufgabe an einen frisch aufgesetzten Sub-Agenten delegiert.
 pub struct SubAgentTool {
@@ -27,6 +43,7 @@ pub struct SubAgentTool {
     thinking: ThinkingLevel,
     name: String,
     description: String,
+    session_factory: Option<SessionFactory>,
 }
 
 impl SubAgentTool {
@@ -47,6 +64,7 @@ impl SubAgentTool {
                           Sub-Agenten (eigener Kontext, eingeschränktes Toolset, eigenes Budget). \
                           Gibt nur das Endergebnis zurück."
                 .into(),
+            session_factory: None,
         }
     }
 
@@ -81,6 +99,22 @@ impl SubAgentTool {
         self.name = n.into();
         self
     }
+    /// Store-Fabrik für die Kind-Session je Lauf (siehe [`SessionFactory`]). Ohne sie bleibt
+    /// der Sub-Agent wie bisher flüchtig.
+    pub fn session_factory(mut self, f: SessionFactory) -> Self {
+        self.session_factory = Some(f);
+        self
+    }
+}
+
+/// Einzeilige, gekürzte Vorschau der Aufgabenstellung für den Audit-Eintrag.
+fn task_preview(task: &str) -> String {
+    let one: String = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() <= TASK_PREVIEW_CHARS {
+        return one;
+    }
+    let head: String = one.chars().take(TASK_PREVIEW_CHARS).collect();
+    format!("{head}…")
 }
 
 fn last_assistant_text(messages: &[Message]) -> String {
@@ -136,25 +170,51 @@ impl Tool for SubAgentTool {
             .and_then(Value::as_str)
             .ok_or_else(|| SeppError::Tool("sub-agent: Feld 'description' fehlt".into()))?;
 
-        // Frische, isolierte Session (kein SessionStore → eigene leere Conversation, eigenes Budget).
-        let mut sub = AgentSession::builder()
+        // Frische, isolierte Conversation und eigenes Budget; der Store — falls es einen gibt —
+        // ist eine eigene Kind-Datei, nicht die der Wurzel.
+        let store = self.session_factory.as_ref().and_then(|f| f());
+        let child_id = store.as_ref().map(|s| s.id().to_string());
+        let mut builder = AgentSession::builder()
             .provider(Arc::clone(&self.provider))
             .model(self.model.clone())
             .system_prompt(self.system_prompt.clone())
             .tools(self.tools.clone())
             .max_tokens(self.max_tokens)
             .max_turns(self.max_turns)
-            .thinking(self.thinking)
-            .build()?;
+            .thinking(self.thinking);
+        if let Some(store) = store {
+            builder = builder.session(store);
+        }
+        let mut sub = builder.build()?;
 
         // Sub-Agent-Ereignisse werden bewusst NICHT an die Wurzel weitergereicht.
         let sink = |_ev: AgentEvent| {};
-        sub.prompt(task, &sink, cancel).await?;
+        let outcome = sub.prompt(task, &sink, cancel).await;
+
+        // Auch ein abgebrochener Lauf muss auf Platte stehen — sonst fehlt genau der Fall
+        // in der Spur, den man hinterher nachlesen will. `JsonlSessionStore` hat kein `Drop`,
+        // ohne `finalize` bliebe der Puffer ungeschrieben.
+        let entries = sub.session().map(|s| s.entries().len()).unwrap_or(0);
+        let _ = sub.finalize().await;
+        outcome?;
+
+        let audit = child_id.map(|id| {
+            json!({
+                AUDIT_DETAIL_KEY_KIND: "subagent",
+                "tool": self.name,
+                "session": id,
+                "task": task_preview(task),
+                "entries": entries,
+            })
+        });
 
         let answer = last_assistant_text(sub.messages());
         if answer.is_empty() {
             // Kein Text-Ergebnis (z. B. max_turns erreicht) — nicht stumm als Erfolg ausgeben.
-            return Ok(ToolResult::text("(Sub-Agent lieferte keine Textantwort)"));
+            return Ok(with_audit(
+                ToolResult::text("(Sub-Agent lieferte keine Textantwort)"),
+                audit,
+            ));
         }
         // Wie jedes Tool-Output gekürzt, bevor es zurück in die Wurzel-Conversation fließt.
         let t = sepp_tools::truncate_head(
@@ -167,6 +227,17 @@ impl Tool for SubAgentTool {
         if let Some(note) = note {
             text.push_str(&note);
         }
-        Ok(ToolResult::text(text))
+        Ok(with_audit(ToolResult::text(text), audit))
+    }
+}
+
+/// Feldname der Eintragsart innerhalb des Audit-Objekts.
+const AUDIT_DETAIL_KEY_KIND: &str = "kind";
+
+/// Hängt den Verweis auf die Kind-Session an `details["audit"]` (Details gehen nicht ans Modell).
+fn with_audit(result: ToolResult, audit: Option<Value>) -> ToolResult {
+    match audit {
+        Some(a) => result.with_details(json!({ AUDIT_DETAIL_KEY: a })),
+        None => result,
     }
 }

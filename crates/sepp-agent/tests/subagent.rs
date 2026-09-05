@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use sepp_agent::SubAgentTool;
 use sepp_core::{ContentBlock, Model, Result, ToolResult, ToolSpec, Usage};
 use sepp_provider::{CompletionRequest, Provider, StopReason, StreamEvent};
+use sepp_session::SessionStore; // Trait im Scope für `.id()`/`.entries()`
 use sepp_tools::Tool;
 
 struct FakeProvider {
@@ -198,4 +199,129 @@ async fn subagent_missing_description_errors() {
         .execute(json!({}), CancellationToken::new(), None)
         .await;
     assert!(res.is_err());
+}
+
+// ── Audit-Spur: die Kind-Session ──────────────────────────────────────────────────────────
+
+/// Mit einer `SessionFactory` schreibt der Sub-Agent eine eigene Session-Datei, die im Header
+/// auf die Wurzel verweist. Der volle Verlauf steht dort — auch die interne Tool-Runde, die
+/// die Wurzel bewusst nicht sieht.
+#[tokio::test]
+async fn subagent_writes_child_session_with_parent_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = sepp_session::JsonlSessionStore::create(dir.path()).unwrap();
+    let root_id = root.id().to_string();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inner: Arc<dyn Tool> = Arc::new(StaticTool {
+        calls: calls.clone(),
+    });
+    let turn1 = vec![
+        StreamEvent::MessageStart,
+        StreamEvent::ToolUseStart {
+            id: "a".into(),
+            name: "inner".into(),
+        },
+        StreamEvent::ToolUseInputDelta {
+            id: "a".into(),
+            partial_json: "{}".into(),
+        },
+        StreamEvent::ToolUseStop { id: "a".into() },
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        },
+    ];
+    let turn2 = vec![
+        StreamEvent::MessageStart,
+        StreamEvent::TextDelta {
+            text: "fertig: ok".into(),
+        },
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+        },
+    ];
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![turn1, turn2])),
+    });
+
+    let path = dir.path().to_path_buf();
+    let parent = root_id.clone();
+    let tool = SubAgentTool::new(provider, model())
+        .tools(vec![inner])
+        .session_factory(Arc::new(move || {
+            sepp_session::JsonlSessionStore::create_child(&path, &parent)
+                .ok()
+                .map(|s| Box::new(s) as Box<dyn sepp_session::SessionStore>)
+        }));
+
+    let res = tool
+        .execute(
+            json!({ "description": "  nutze das\n  innere Tool  " }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Die Wurzel bekommt weiterhin nur die Antwort — plus den Verweis in den Details.
+    assert!(matches!(&res.content[0], ContentBlock::Text { text } if text == "fertig: ok"));
+    let audit = &res.details["audit"];
+    assert_eq!(audit["kind"], "subagent");
+    assert_eq!(audit["tool"], "task");
+    assert_eq!(audit["task"], "nutze das innere Tool");
+    let child_id = audit["session"]
+        .as_str()
+        .expect("Kind-Session-ID")
+        .to_string();
+    assert_ne!(child_id, root_id);
+
+    // Die Kind-Datei steht auf Platte, verweist auf die Wurzel und enthält den vollen Verlauf.
+    let infos = sepp_session::JsonlSessionStore::list(dir.path()).unwrap();
+    let child = infos
+        .iter()
+        .find(|i| i.id == child_id)
+        .expect("Kind gelistet");
+    assert_eq!(child.parent_session.as_deref(), Some(root_id.as_str()));
+    assert_eq!(
+        child.entry_count, 4,
+        "Prompt, Tool-Use, Tool-Ergebnis, Antwort"
+    );
+    assert_eq!(audit["entries"], 4);
+
+    let reopened = sepp_session::JsonlSessionStore::open(&child.path).unwrap();
+    let has_tool_use = reopened.entries().iter().any(|e| match &e.payload {
+        sepp_session::EntryPayload::Message { message } => message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "inner")),
+        _ => false,
+    });
+    assert!(
+        has_tool_use,
+        "der interne Tool-Aufruf steht in der Kind-Spur"
+    );
+}
+
+#[tokio::test]
+async fn subagent_without_factory_reports_no_audit() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::MessageStart,
+            StreamEvent::TextDelta {
+                text: "Antwort: 42".into(),
+            },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]])),
+    });
+    let res = SubAgentTool::new(provider, model())
+        .execute(
+            json!({ "description": "rechne" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(res.details.is_null(), "ohne Fabrik bleibt alles wie bisher");
 }

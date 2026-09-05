@@ -4,6 +4,20 @@
 //! Ergebnisse (getrunkt durch die Tools) zurückspeisen → wiederholen, bis keine Tool-Calls
 //! mehr kommen. Optional persistiert ein [`SessionStore`] jeden Schritt; ein Kontext-Budget
 //! löst bei Schwellüberschreitung automatische Compaction aus.
+//!
+//! **Audit-Spur.** Neben den Nachrichten schreibt der Loop nachvollziehbare Nebeneinträge als
+//! [`EntryPayload::Custom`]. Zwei Quellen speisen sie, beide policy-frei (`sepp-agent` kennt
+//! `sepp-policy` nicht):
+//!
+//! * eine [`AuditSource`] — eine Closure, die der Loop nach jedem Tool-Batch abfragt; das CLI
+//!   füllt sie aus dem Guard. Sie erfasst auch Verweigerungen, die als Fehler aus dem Tool
+//!   kommen und deshalb gar kein Ergebnis mit `details` haben.
+//! * der **reservierte Schlüssel `details["audit"]`** eines [`sepp_core::ToolResult`]: liefert
+//!   ein Tool dort ein Objekt mit `kind`, schreibt der Loop es als eigenen Eintrag. So meldet
+//!   [`SubAgentTool`] seine Kind-Session.
+//!
+//! Custom-Einträge liegen auf dem aktiven Pfad, sind für das Modell aber unsichtbar:
+//! `path_messages()` liefert nur `Message` und `Compaction`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +59,22 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// Ein Nebeneintrag für die Audit-Spur: landet als `EntryPayload::Custom { kind, data }`
+/// in der Session.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub kind: String,
+    pub data: Value,
+}
+
+/// Quelle für Audit-Einträge, die der Loop nach jedem Tool-Batch abfragt und leert.
+/// Das CLI hinterlegt hier `Guard::drain_audit()`; ohne Quelle ändert sich nichts.
+pub type AuditSource = Arc<dyn Fn() -> Vec<AuditRecord> + Send + Sync>;
+
+/// Reservierter Schlüssel in `ToolResult.details`: ein Objekt mit `kind` (String) wird vom Loop
+/// als eigener Audit-Eintrag in die Session geschrieben.
+pub const AUDIT_DETAIL_KEY: &str = "audit";
+
 /// Ein während des Streams aufgesammelter Tool-Call.
 struct PendingCall {
     id: String,
@@ -67,6 +97,17 @@ pub fn default_compact_threshold(model: &Model) -> u64 {
     (model.context_window.saturating_mul(3) / 4).min(MAX_COMPACT_THRESHOLD)
 }
 
+/// Liest den reservierten Schlüssel [`AUDIT_DETAIL_KEY`] aus `ToolResult.details`.
+/// Erwartet ein Objekt mit einem String-Feld `kind`; alles andere wird ignoriert.
+fn audit_record(details: &Value) -> Option<AuditRecord> {
+    let data = details.get(AUDIT_DETAIL_KEY)?;
+    let kind = data.get("kind")?.as_str()?.to_string();
+    Some(AuditRecord {
+        kind,
+        data: data.clone(),
+    })
+}
+
 /// Eine laufende Agent-Session.
 pub struct AgentSession {
     provider: Arc<dyn Provider>,
@@ -79,6 +120,7 @@ pub struct AgentSession {
     last_usage: Option<Usage>,
     hooks: Option<Box<dyn HookHost>>,
     hooks_started: bool,
+    audit_source: Option<AuditSource>,
 }
 
 impl AgentSession {
@@ -188,6 +230,28 @@ impl AgentSession {
             s.append(payload)?;
         }
         Ok(())
+    }
+
+    /// Schreibt Audit-Nebeneinträge. Ein Schreibfehler darf den Turn nicht abbrechen — die Spur
+    /// ist Begleitung, nicht Ergebnis.
+    fn record_audit(&mut self, records: &[AuditRecord]) {
+        let Some(store) = self.session.as_mut() else {
+            return;
+        };
+        for r in records {
+            let _ = store.append(EntryPayload::Custom {
+                kind: r.kind.clone(),
+                data: r.data.clone(),
+            });
+        }
+    }
+
+    /// Zieht die aufgelaufenen Einträge aus der [`AuditSource`] (falls gesetzt).
+    fn drain_audit_source(&self) -> Vec<AuditRecord> {
+        match &self.audit_source {
+            Some(src) => src(),
+            None => Vec::new(),
+        }
     }
 
     async fn flush_session(&mut self) -> Result<()> {
@@ -451,9 +515,15 @@ impl AgentSession {
             let results = self.run_tools(&calls, &cancel, on_event).await?;
 
             let mut tr_content: Vec<ContentBlock> = Vec::with_capacity(results.len());
+            let mut tool_audit: Vec<AuditRecord> = Vec::new();
             for (call, res) in calls.iter().zip(results) {
                 let (blocks, is_error) = match res {
-                    Ok(r) => (r.content, r.is_error),
+                    Ok(r) => {
+                        if let Some(rec) = audit_record(&r.details) {
+                            tool_audit.push(rec);
+                        }
+                        (r.content, r.is_error)
+                    }
                     Err(SeppError::Aborted) => return Err(SeppError::Aborted),
                     Err(e) => (vec![ContentBlock::text(e.to_string())], true),
                 };
@@ -463,6 +533,12 @@ impl AgentSession {
                     is_error,
                 });
             }
+            // Die Entscheidungen fielen vor der Ausführung, also stehen sie vor dem Ergebnis:
+            // Assistant-Message → Guard-Einträge → Tool-eigene Einträge → Tool-Result-Message.
+            let guard_audit = self.drain_audit_source();
+            self.record_audit(&guard_audit);
+            self.record_audit(&tool_audit);
+
             let tool_msg = Message {
                 role: Role::User,
                 content: tr_content,
@@ -621,6 +697,7 @@ pub struct AgentSessionBuilder {
     session: Option<Box<dyn SessionStore>>,
     auto_compact_threshold: Option<u64>,
     hooks: Option<Box<dyn HookHost>>,
+    audit_source: Option<AuditSource>,
 }
 
 impl AgentSessionBuilder {
@@ -666,6 +743,12 @@ impl AgentSessionBuilder {
     /// Hook-Host (Tier 1) für Eingriffe in den Loop.
     pub fn hooks(mut self, hooks: Box<dyn HookHost>) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+    /// Quelle für Audit-Einträge, die nach jedem Tool-Batch in die Session geschrieben werden
+    /// (siehe [`AuditSource`]).
+    pub fn audit_source(mut self, src: AuditSource) -> Self {
+        self.audit_source = Some(src);
         self
     }
 
@@ -715,6 +798,7 @@ impl AgentSessionBuilder {
             max_tokens,
             max_turns,
             session: self.session,
+            audit_source: self.audit_source,
             auto_compact_threshold: self.auto_compact_threshold,
             last_usage: None,
             hooks: self.hooks,

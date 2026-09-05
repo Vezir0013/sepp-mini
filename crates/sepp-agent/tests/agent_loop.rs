@@ -639,3 +639,167 @@ async fn provider_name_reports_provider_label() {
         .unwrap();
     assert_eq!(session.provider_name(), "fake");
 }
+
+// ── Audit-Spur ────────────────────────────────────────────────────────────────────────────
+
+/// Tool, das im reservierten Schlüssel `details["audit"]` einen Eintrag meldet.
+struct AuditingTool;
+
+#[async_trait::async_trait]
+impl Tool for AuditingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "echo".into(),
+            label: "Tool".into(),
+            description: "Test-Tool mit Audit-Detail".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cancel: CancellationToken,
+        _on_update: Option<&(dyn Fn(ToolResult) + Send + Sync)>,
+    ) -> Result<ToolResult> {
+        Ok(ToolResult::text("ERGEBNIS").with_details(json!({
+            "audit": { "kind": "subagent", "session": "kind-1" },
+            "sonstiges": 1
+        })))
+    }
+}
+
+/// Ein Turn, der `echo` aufruft, gefolgt von einem Abschluss-Turn.
+fn tool_then_done() -> VecDeque<Vec<StreamEvent>> {
+    VecDeque::from(vec![
+        vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "echo".into(),
+            },
+            StreamEvent::ToolUseInputDelta {
+                id: "t1".into(),
+                partial_json: "{}".into(),
+            },
+            StreamEvent::ToolUseStop { id: "t1".into() },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        text_turn("Fertig."),
+    ])
+}
+
+fn custom_entries(store: &dyn SessionStore) -> Vec<(String, serde_json::Value)> {
+    store
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.payload {
+            sepp_session::EntryPayload::Custom { kind, data } => Some((kind.clone(), data.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn audit_source_entries_land_before_the_tool_result() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(tool_then_done()),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = Arc::new(StaticTool {
+        name: "echo".into(),
+        calls: calls.clone(),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![tool])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .audit_source(Arc::new(|| {
+            vec![sepp_agent::AuditRecord {
+                kind: "guard".into(),
+                data: json!({ "decision": "allow", "action": "fs_read /x" }),
+            }]
+        }))
+        .build()
+        .unwrap();
+    session
+        .prompt("los", &|_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let store = session.session().unwrap();
+    let kinds: Vec<&str> = store
+        .entries()
+        .iter()
+        .map(|e| match &e.payload {
+            sepp_session::EntryPayload::Message { message } => match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                _ => "andere",
+            },
+            sepp_session::EntryPayload::Custom { kind, .. } => kind.as_str(),
+            _ => "?",
+        })
+        .collect();
+    // user → assistant(tool_use) → guard → tool_result(user) → assistant(Text)
+    assert_eq!(
+        kinds,
+        vec!["user", "assistant", "guard", "user", "assistant"],
+        "Guard-Eintrag steht vor dem Tool-Ergebnis"
+    );
+
+    let audit = custom_entries(store);
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].1["decision"], "allow");
+
+    // Custom-Einträge sind für das Modell unsichtbar.
+    assert_eq!(store.path_messages().len(), 4);
+}
+
+#[tokio::test]
+async fn tool_audit_detail_becomes_its_own_entry() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(tool_then_done()),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![Arc::new(AuditingTool)])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    session
+        .prompt("los", &|_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let audit = custom_entries(session.session().unwrap());
+    assert_eq!(audit.len(), 1, "genau ein Eintrag aus details[\"audit\"]");
+    assert_eq!(audit[0].0, "subagent");
+    assert_eq!(audit[0].1["session"], "kind-1");
+}
+
+#[tokio::test]
+async fn without_audit_source_nothing_extra_is_written() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(tool_then_done()),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![Arc::new(StaticTool {
+            name: "echo".into(),
+            calls,
+        })])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    session
+        .prompt("los", &|_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(custom_entries(session.session().unwrap()).is_empty());
+}
