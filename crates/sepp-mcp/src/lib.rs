@@ -5,8 +5,11 @@
 //! vergebenen Tools wird `<server>__<tool>` als Präfix genutzt. Konfiguration über
 //! `[[mcp.servers]]` in `settings.toml`.
 //!
-//! Hinweis: Die OS-Sandbox für MCP-Subprozesse (`sepp-policy`) kommt in Phase 4; die
-//! `allow_*`-Felder werden hier bereits geparst, aber noch nicht durchgesetzt.
+//! Sandbox: stdio-Server werden vor dem Spawn per [`sepp_policy::Sandbox`] eingesperrt (Env
+//! Default-deny, Landlock/Seatbelt für Dateisystem, TCP-Verbot ohne `net`, Exec-Allowlist bei
+//! `exec`-Liste). Die Policy kommt entweder aus `[mcp.servers.capabilities]` ([`connect`]) oder
+//! — mit Sepp Guard — bereits gemergt aus der Policy-Datei ([`connect_with_policy`]). Das stderr
+//! des Servers wird gepipet und über `tracing` geloggt, statt in die TUI zu schreiben.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -22,6 +25,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::{ContentBlock, ImageSource, Result, SeppError, ToolResult, ToolSpec};
+use sepp_policy::Policy;
 use sepp_tools::Tool;
 
 type Service = RunningService<RoleClient, ()>;
@@ -145,8 +149,21 @@ pub fn resolve_name(taken: &HashSet<String>, server: &str, raw: &str) -> String 
     }
 }
 
-/// Verbindet zu einem MCP-Server und listet seine Tools.
+/// Die Policy aus der Legacy-Deklaration `[mcp.servers.capabilities]` des Servers.
+pub fn policy_from_config(cfg: &McpServerConfig) -> Policy {
+    cfg.capabilities.to_policy()
+}
+
+/// Verbindet zu einem MCP-Server und listet seine Tools; stdio-Server laufen mit der Policy aus
+/// `[mcp.servers.capabilities]` in der Sandbox.
 pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
+    connect_with_policy(cfg, &policy_from_config(cfg)).await
+}
+
+/// Wie [`connect`], aber mit einer bereits zusammengeführten Policy (Sepp Guard: Legacy-
+/// Deklaration ∪ `[mcp.<name>]` aus der Policy-Datei, minus Verbote). Für `http` ist die Policy
+/// ohne Wirkung — der Server läuft auf einem fremden Rechner.
+pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Result<McpConnection> {
     let service: Service = match cfg.transport.as_str() {
         "http" => {
             let url = cfg.url.as_deref().ok_or_else(|| {
@@ -169,14 +186,20 @@ pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
             }
             let mut command = tokio::process::Command::new(&cfg.command[0]);
             command.args(&cfg.command[1..]);
-            // Subprozess gemäß deklarierten Capabilities einsperren (Default deny), BEVOR rmcp
-            // ihn spawnt (Linux: Landlock; sonst Fallback + Warnung).
-            let policy = cfg.capabilities.to_policy();
+            // Subprozess gemäß Policy einsperren (Default deny), BEVOR rmcp ihn spawnt
+            // (Linux: Landlock, macOS: Seatbelt; sonst Fallback + Warnung).
             sepp_policy::default_sandbox()
-                .prepare(&mut command, &policy)
+                .prepare(&mut command, policy)
                 .map_err(|e| SeppError::Provider(format!("mcp '{}': sandbox: {e}", cfg.name)))?;
-            let transport = TokioChildProcess::new(command)
+            // stderr NICHT erben (würde in der TUI den Bildschirm beschreiben), sondern pipen
+            // und zeilenweise über tracing loggen.
+            let (transport, stderr) = TokioChildProcess::builder(command)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .map_err(|e| SeppError::Provider(format!("mcp '{}': spawn: {e}", cfg.name)))?;
+            if let Some(stderr) = stderr {
+                spawn_stderr_logger(cfg.name.clone(), stderr);
+            }
             ().serve(transport)
                 .await
                 .map_err(|e| SeppError::Provider(format!("mcp '{}': connect: {e}", cfg.name)))?
@@ -199,6 +222,17 @@ pub async fn connect(cfg: &McpServerConfig) -> Result<McpConnection> {
         service,
         tools,
     })
+}
+
+/// Loggt das stderr eines stdio-Servers zeilenweise (`target = "mcp"`), bis EOF.
+fn spawn_stderr_logger(server: String, stderr: tokio::process::ChildStderr) {
+    use tokio::io::AsyncBufReadExt;
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(target: "mcp", server = %server, "{line}");
+        }
+    });
 }
 
 /// Ein einzelnes Remote-Tool als `sepp_tools::Tool`.
@@ -349,6 +383,26 @@ mod tests {
         assert!(!pol.allows(&sepp_policy::Capability::Exec {
             program: "rm".into()
         }));
+    }
+
+    #[test]
+    fn policy_from_config_uses_legacy_capabilities() {
+        let toml = r#"
+            [[mcp.servers]]
+            name = "git"
+            transport = "stdio"
+            command = ["git-mcp"]
+            [mcp.servers.capabilities]
+            fs_write = ["/abs/repo"]
+            net = ["api.example.com"]
+        "#;
+        let settings: Settings = toml::from_str(toml).unwrap();
+        let pol = policy_from_config(&settings.mcp.servers[0]);
+        assert!(pol.net_allowed());
+        assert!(pol.allows(&sepp_policy::Capability::FsWrite {
+            prefix: "/abs/repo/x".into()
+        }));
+        assert_eq!(pol.exec_programs(), None);
     }
 
     #[test]
