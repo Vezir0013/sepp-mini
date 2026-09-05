@@ -7,6 +7,14 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.1.20] - 2026-09-05
+
 Sepp Guard, Phase 3: **die Spur.** Phase 1 hat den Agenten eingesperrt, Phase 2 hat ihn fragen
 lassen — aber wer hinterher wissen wollte, was passiert ist, musste Fließtext im Modellkontext
 lesen und fand von Sub-Agenten gar nichts. Jetzt ist jede Entscheidung ein eigener Eintrag, jede
@@ -44,12 +52,6 @@ Delegation eine eigene Sitzung, und `sepp audit` liest beides vor.
   reist jetzt in der `Authorization` des Aufrufs mit.
 - Das Guard-Protokoll wuchs über die gesamte Sitzung, weil es nie abgeholt wurde; der neue
   Loop-Haken leert es nach jedem Tool-Batch.
-
-### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.1.19] - 2026-09-05
 
@@ -658,7 +660,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...v0.1.17
