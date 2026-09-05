@@ -69,23 +69,37 @@ impl SqliteSessionStore {
         Ok(conn)
     }
 
-    /// Legt eine neue Session in `project_dir` an (`<id>.sqlite`).
+    /// Legt eine neue Wurzel-Session in `project_dir` an (`<id>.sqlite`).
     pub fn create(project_dir: &Path) -> Result<Self> {
+        Self::create_with(project_dir, None)
+    }
+
+    /// Legt eine Kind-Session an, deren `parent_session`-Meta auf `parent_id` verweist.
+    pub fn create_child(project_dir: &Path, parent_id: &str) -> Result<Self> {
+        Self::create_with(project_dir, Some(parent_id))
+    }
+
+    fn create_with(project_dir: &Path, parent: Option<&str>) -> Result<Self> {
         std::fs::create_dir_all(project_dir)?;
+        crate::restrict_dir(project_dir);
         let id = uuid::Uuid::new_v4().to_string();
         let path = project_dir.join(format!("{id}.sqlite"));
         let conn = Self::open_conn(&path)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
+        crate::restrict_file(&path);
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let created_at = now_millis();
-        let meta = [
+        let mut meta = vec![
             ("version", FORMAT_VERSION.to_string()),
             ("session_id", id.clone()),
             ("cwd", cwd),
             ("created_at", created_at.to_string()),
         ];
+        if let Some(parent) = parent {
+            meta.push(("parent_session", parent.to_string()));
+        }
         for (k, v) in meta {
             conn.execute("INSERT INTO meta (k, v) VALUES (?1, ?2)", params![k, v])
                 .map_err(err)?;
@@ -208,6 +222,8 @@ fn read_info(path: &Path, modified: i64) -> Option<SessionInfo> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let name = meta_get(&conn, "name").ok().flatten();
+    let cwd = meta_get(&conn, "cwd").ok().flatten().unwrap_or_default();
+    let parent_session = meta_get(&conn, "parent_session").ok().flatten();
     let entry_count: usize = conn
         .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get::<_, i64>(0))
         .map(|n| n as usize)
@@ -219,6 +235,8 @@ fn read_info(path: &Path, modified: i64) -> Option<SessionInfo> {
         modified,
         name,
         entry_count,
+        cwd,
+        parent_session,
     })
 }
 
@@ -366,5 +384,41 @@ mod tests {
         s.append(user("anderer ast")).unwrap();
         assert_eq!(s.path_messages().len(), 2); // a -> "anderer ast"
         assert_eq!(s.entries().len(), 5); // nichts gelöscht
+    }
+
+    #[tokio::test]
+    async fn sqlite_child_session_records_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_id;
+        let child_id;
+        {
+            let mut root = SqliteSessionStore::create(dir.path()).unwrap();
+            root_id = root.id().to_string();
+            root.append(user("wurzel")).unwrap();
+            root.flush().await.unwrap();
+
+            let mut child = SqliteSessionStore::create_child(dir.path(), &root_id).unwrap();
+            child_id = child.id().to_string();
+            child.append(user("kind")).unwrap();
+            child.flush().await.unwrap();
+        }
+        let infos = SqliteSessionStore::list(dir.path()).unwrap();
+        let root = infos.iter().find(|i| i.id == root_id).unwrap();
+        let child = infos.iter().find(|i| i.id == child_id).unwrap();
+        assert_eq!(root.parent_session, None);
+        assert_eq!(child.parent_session.as_deref(), Some(root_id.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_dir_and_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("sessions");
+        let s = SqliteSessionStore::create(&dir).unwrap();
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let fmode = std::fs::metadata(s.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700);
+        assert_eq!(fmode, 0o600);
     }
 }

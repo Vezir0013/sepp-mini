@@ -85,6 +85,10 @@ pub struct SessionInfo {
     pub modified: i64,
     pub name: Option<String>,
     pub entry_count: usize,
+    /// Arbeitsverzeichnis beim Anlegen der Session.
+    pub cwd: String,
+    /// Wurzel-Session, falls dies eine Kind-Session ist (z. B. ein Sub-Agent-Lauf).
+    pub parent_session: Option<String>,
 }
 
 /// Abstraktion über einen Session-Speicher.
@@ -286,9 +290,23 @@ pub struct JsonlSessionStore {
 }
 
 impl JsonlSessionStore {
-    /// Legt eine neue Session in `project_dir` an (`<id>.jsonl`).
+    /// Legt eine neue Wurzel-Session in `project_dir` an (`<id>.jsonl`).
     pub fn create(project_dir: &Path) -> Result<Self> {
+        Self::create_with(project_dir, None)
+    }
+
+    /// Legt eine Kind-Session an, deren Header auf `parent_id` verweist.
+    ///
+    /// Genutzt für Sub-Agenten: der Lauf bekommt eine eigene Datei, bleibt aber der Wurzel
+    /// zuordenbar. Der Header wird nur einmal geschrieben, deshalb muss der Verweis hier
+    /// gesetzt werden — nachträglich geht es nicht.
+    pub fn create_child(project_dir: &Path, parent_id: &str) -> Result<Self> {
+        Self::create_with(project_dir, Some(parent_id))
+    }
+
+    fn create_with(project_dir: &Path, parent: Option<&str>) -> Result<Self> {
         std::fs::create_dir_all(project_dir)?;
+        restrict_dir(project_dir);
         let id = uuid::Uuid::new_v4().to_string();
         let path = project_dir.join(format!("{id}.jsonl"));
         let cwd = std::env::current_dir()
@@ -300,13 +318,18 @@ impl JsonlSessionStore {
             cwd,
             created_at: now_millis(),
             name: None,
-            parent_session: None,
+            parent_session: parent.map(str::to_string),
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)?;
+        // Sessions enthalten alles, was der Agent gelesen und geschrieben hat — nur der
+        // Eigentümer darf sie sehen.
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path)?;
         let mut writer = BufWriter::new(file);
         write_line(&mut writer, &Line::Header(header))?;
         Ok(JsonlSessionStore {
@@ -427,7 +450,33 @@ fn read_info(path: &Path, modified: i64) -> Option<SessionInfo> {
         modified,
         name: header.name,
         entry_count,
+        cwd: header.cwd,
+        parent_session: header.parent_session,
     })
+}
+
+/// Setzt das Sessions-Verzeichnis auf 0700 (best effort; auf Nicht-Unix ein No-op).
+pub(crate) fn restrict_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Setzt eine Session-Datei auf 0600. Für Backends, die die Datei nicht selbst öffnen
+/// (SQLite legt sie über `rusqlite` an); der JSONL-Store setzt den Modus beim Öffnen.
+#[cfg(feature = "sqlite")]
+pub(crate) fn restrict_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn write_line(writer: &mut BufWriter<File>, line: &Line) -> Result<()> {
@@ -581,5 +630,51 @@ mod tests {
         let s = JsonlSessionStore::open(&path).unwrap();
         let labeled = s.entries().iter().find(|e| e.id == eid).unwrap();
         assert_eq!(labeled.label.as_deref(), Some("checkpoint"));
+    }
+
+    #[tokio::test]
+    async fn child_session_records_parent_and_root_stays_parentless() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_id;
+        let child_id;
+        {
+            let mut root = JsonlSessionStore::create(dir.path()).unwrap();
+            root_id = root.id().to_string();
+            root.append(user("wurzel")).unwrap();
+            root.flush().await.unwrap();
+
+            let mut child = JsonlSessionStore::create_child(dir.path(), &root_id).unwrap();
+            child_id = child.id().to_string();
+            child.append(user("kind")).unwrap();
+            child.flush().await.unwrap();
+        }
+        let infos = JsonlSessionStore::list(dir.path()).unwrap();
+        assert_eq!(infos.len(), 2);
+        let root = infos.iter().find(|i| i.id == root_id).unwrap();
+        let child = infos.iter().find(|i| i.id == child_id).unwrap();
+        assert_eq!(root.parent_session, None, "Wurzel hat keinen Parent");
+        assert_eq!(child.parent_session.as_deref(), Some(root_id.as_str()));
+
+        // Der Verweis überlebt auch das Wiederöffnen und Weiterschreiben.
+        let mut reopened = JsonlSessionStore::open(&child.path).unwrap();
+        reopened.append(user("mehr")).unwrap();
+        reopened.flush().await.unwrap();
+        let again = JsonlSessionStore::list(dir.path()).unwrap();
+        let child = again.iter().find(|i| i.id == child_id).unwrap();
+        assert_eq!(child.parent_session.as_deref(), Some(root_id.as_str()));
+        assert_eq!(child.entry_count, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_dir_and_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("sessions");
+        let s = JsonlSessionStore::create(&dir).unwrap();
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let fmode = std::fs::metadata(s.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "Sessions-Verzeichnis muss 0700 sein");
+        assert_eq!(fmode, 0o600, "Session-Datei muss 0600 sein");
     }
 }
