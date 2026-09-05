@@ -1,13 +1,19 @@
 //! `sepp-tools` — der `Tool`-Trait, Helfer (Truncation, File-Mutation-Queue) und die
 //! eingebauten Tools (`read`/`write`/`edit`/`bash`).
+//!
+//! **Sepp Guard:** Jedes eingebaute Tool kann einen [`Guard`] tragen. Dann wird jede Aktion vor
+//! dem I/O autorisiert (`read`/`write`/`edit`: Pfadprüfung; `bash`: Rückfrage-Muster und
+//! Kindprozess in der OS-Sandbox mit der Agent-Policy). Ohne Guard (Tests, `--mode yolo`)
+//! verhalten sich die Tools wie bisher.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::{Result, ToolResult, ToolSpec};
+use sepp_policy::{Action, Actor, Authorization, Guard};
 
 mod bash;
 mod edit;
@@ -55,12 +61,96 @@ pub fn schema_for<T: schemars::JsonSchema>() -> Value {
     v
 }
 
-/// Die in Phase 1 eingebauten Tools als gemeinsames Toolset.
+/// Die eingebauten Tools als gemeinsames Toolset — **ohne** Guard (wie `--mode yolo`).
+/// Produktiv [`builtin_tools_with`] mit dem Guard des Agenten verwenden.
 pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with(None)
+}
+
+/// Die eingebauten Tools, alle an denselben Guard gebunden (`None` = ungesichert).
+pub fn builtin_tools_with(guard: Option<Arc<Guard>>) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(ReadTool),
-        Arc::new(WriteTool),
-        Arc::new(EditTool),
-        Arc::new(BashTool),
+        Arc::new(ReadTool::new(guard.clone())),
+        Arc::new(WriteTool::new(guard.clone())),
+        Arc::new(EditTool::new(guard.clone())),
+        Arc::new(BashTool::new(guard)),
     ]
+}
+
+/// Ergebnis einer Autorisierung beim Guard: die (evtl. leere) Zusatz-Gewährung für diesen
+/// Aufruf und der Audit-Eintrag als JSON für `ToolResult.details["guard"]`.
+pub(crate) struct Authorized {
+    pub auth: Authorization,
+    pub audit: Option<Value>,
+}
+
+/// Autorisiert eine Agent-Aktion, falls ein Guard gesetzt ist. Ohne Guard: immer erlaubt.
+/// Bei Verweigerung kommt `SeppError::CapabilityDenied` mit Hinweis zum Freigeben zurück; der
+/// Agent-Loop macht daraus ein Fehler-ToolResult fürs Modell.
+pub(crate) async fn authorize(guard: Option<&Arc<Guard>>, action: Action) -> Result<Authorized> {
+    match guard {
+        None => Ok(Authorized {
+            auth: Authorization::default(),
+            audit: None,
+        }),
+        Some(g) => {
+            let res = g.authorize(&Actor::Agent, action).await;
+            let audit = g.last_audit().map(|ev| Guard::audit_json(&ev));
+            Ok(Authorized { auth: res?, audit })
+        }
+    }
+}
+
+/// Hängt den Audit-Eintrag an `details["guard"]` (Details gehen nicht ans Modell).
+pub(crate) fn with_guard_details(mut result: ToolResult, audit: Option<Value>) -> ToolResult {
+    if let Some(a) = audit {
+        if !result.details.is_object() {
+            result.details = json!({});
+        }
+        if let Some(obj) = result.details.as_object_mut() {
+            obj.insert("guard".into(), a);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use sepp_policy::{
+        AgentSection, BuiltinDefaults, Grants, Guard, Mode, NullSandbox, PolicyFile, PolicySet,
+        ResolveCtx, Source,
+    };
+
+    /// Guard im Modus `mode`, der genau `dir` lesen und schreiben darf (kanonisiert), mit
+    /// `NullSandbox` (keine OS-Durchsetzung — die Tests prüfen die Pfadprüfung).
+    pub(crate) fn guard_for(dir: &Path, mode: Mode) -> Arc<Guard> {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let file = PolicyFile {
+            mode: Some(mode),
+            agent: Some(AgentSection {
+                grants: Grants {
+                    fs_read: vec![dir.display().to_string()],
+                    fs_write: vec![dir.display().to_string()],
+                    ..Grants::default()
+                },
+                ..AgentSection::default()
+            }),
+            ..PolicyFile::default()
+        };
+        let ctx = ResolveCtx {
+            home: None,
+            cwd: dir.clone(),
+            tmpdir: dir,
+        };
+        let set = PolicySet::merge(
+            vec![(Source::File("/test-policy.toml".into()), file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx,
+        );
+        Arc::new(Guard::new(set, Box::new(NullSandbox)))
+    }
 }

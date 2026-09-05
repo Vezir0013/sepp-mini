@@ -4,6 +4,11 @@
 //! offen, solange sie leben. Das Tool wartet daher nach Exit des direkten Kindprozesses nur
 //! eine kurze Drain-Frist (`POST_EXIT_DRAIN_MS`) und kehrt dann zurück, statt auf Pipe-EOF zu
 //! blockieren.
+//!
+//! **Mit Guard** läuft `sh` in der OS-Sandbox des Agenten (Landlock/Seatbelt): Environment
+//! geleert bis auf die Allowlist, Dateisystem auf die Agent-Policy begrenzt, TCP ohne `net`
+//! verboten. Scheitert ein Kommando an der Sandbox („Permission denied"), bekommt das Modell
+//! einen `[guard: …]`-Hinweis, wie der Mensch die Rechte erweitern kann.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +25,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::{Result, SeppError, ToolResult, ToolSpec};
+use sepp_policy::{Action, Guard};
 
 use crate::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
-use crate::{schema_for, Tool};
+use crate::{authorize, schema_for, with_guard_details, Tool};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
@@ -32,12 +38,20 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const POST_EXIT_DRAIN_MS: u64 = 1_000;
 
 /// Provider-Secrets, die nicht an Shell-Kommandos durchgereicht werden (Exfiltrationsschutz).
-const SECRET_ENV_VARS: &[&str] = &[
+/// Mit Guard ist das Environment ohnehin Default-deny (Allowlist); diese Liste bleibt als
+/// Defense-in-depth für `--mode yolo` und Tests ohne Guard.
+pub const SECRET_ENV_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
+    "ZAI_API_KEY",
+    "MOONSHOT_API_KEY",
 ];
+
+/// Hinweis ans Modell, wenn ein Kommando unter Guard an der Sandbox scheitert.
+const GUARD_HINT: &str = "[guard: Zugriff von der Sandbox verweigert; Rechte erweitern mit \
+                          `sepp policy allow agent …` oder in .sepp/policy.toml]";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BashParams {
@@ -84,8 +98,17 @@ where
     })
 }
 
-/// Führt ein Shell-Kommando aus.
-pub struct BashTool;
+/// Führt ein Shell-Kommando aus — mit Guard in der OS-Sandbox des Agenten.
+#[derive(Default)]
+pub struct BashTool {
+    guard: Option<Arc<Guard>>,
+}
+
+impl BashTool {
+    pub fn new(guard: Option<Arc<Guard>>) -> Self {
+        BashTool { guard }
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -110,6 +133,14 @@ impl Tool for BashTool {
         let p: BashParams = serde_json::from_value(input)
             .map_err(|e| SeppError::Tool(format!("bash: ungültige Parameter: {e}")))?;
         let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+        // Guard: Rückfrage-Muster prüfen (Modus ask) und Audit — VOR dem Bauen des Kommandos.
+        let authorized = authorize(
+            self.guard.as_ref(),
+            Action::Shell {
+                command: p.command.clone(),
+            },
+        )
+        .await?;
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -119,8 +150,8 @@ impl Tool for BashTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Provider-API-Keys nicht an (modell-gesteuerte) Shell-Kommandos durchreichen —
-        // Schutz gegen Exfiltration via Prompt-Injection. (Built-in-Tools laufen nicht durch
-        // die Extension-Sandbox; dies ist die gezielte Minimal-Absicherung.)
+        // Schutz gegen Exfiltration via Prompt-Injection. Mit Guard leert die Sandbox das
+        // Environment ohnehin (Allowlist); ohne Guard ist dies die Minimal-Absicherung.
         for key in SECRET_ENV_VARS {
             cmd.env_remove(key);
         }
@@ -134,6 +165,13 @@ impl Tool for BashTool {
                 }
                 Ok(())
             });
+        }
+
+        // Guard: Kindprozess in die OS-Sandbox sperren (Env-Allowlist, Landlock/Seatbelt) mit der
+        // effektiven Agent-Policy plus evtl. einmaliger Zusatz-Gewährung.
+        if let Some(g) = &self.guard {
+            let policy = g.agent_spawn_policy(&authorized.auth.extra);
+            g.prepare_process(&mut cmd, &policy)?;
         }
 
         let mut child = cmd
@@ -224,16 +262,32 @@ impl Tool for BashTool {
             }
             content.push_str(&line);
         }
+        // Unter Guard: eine Verweigerung durch die Sandbox als solche benennen, damit das Modell
+        // nicht rät und der Mensch weiß, wo er freigeben kann.
+        if self.guard.is_some() && is_error && looks_like_sandbox_denial(&combined) {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(GUARD_HINT);
+        }
         if content.is_empty() {
             content.push_str("(keine Ausgabe)");
         }
 
-        Ok(ToolResult {
-            content: vec![sepp_core::ContentBlock::text(content)],
-            details: json!({ "exit_code": exit_code, "command": p.command }),
-            is_error,
-        })
+        Ok(with_guard_details(
+            ToolResult {
+                content: vec![sepp_core::ContentBlock::text(content)],
+                details: json!({ "exit_code": exit_code, "command": p.command }),
+                is_error,
+            },
+            authorized.audit,
+        ))
     }
+}
+
+/// Typische Meldungen, wenn Landlock/Seatbelt einen Zugriff verweigern.
+fn looks_like_sandbox_denial(output: &str) -> bool {
+    output.contains("Permission denied") || output.contains("Operation not permitted")
 }
 
 #[cfg(unix)]
@@ -268,7 +322,7 @@ mod tests {
     fn run(cmd: &str, timeout_ms: Option<u64>) -> ToolResult {
         let rt = ct_runtime();
         rt.block_on(async {
-            let tool = BashTool;
+            let tool = BashTool::default();
             let mut input = json!({ "command": cmd });
             if let Some(t) = timeout_ms {
                 input["timeout_ms"] = json!(t);
@@ -309,7 +363,7 @@ mod tests {
     fn cancellation_aborts() {
         let rt = ct_runtime();
         rt.block_on(async {
-            let tool = BashTool;
+            let tool = BashTool::default();
             let cancel = CancellationToken::new();
             let c2 = cancel.clone();
             tokio::spawn(async move {
@@ -356,5 +410,114 @@ mod tests {
         assert!(!r.is_error, "exit: {:?}", r.details["exit_code"]);
         assert!(matches!(&r.content[0],
             sepp_core::ContentBlock::Text { text } if text.contains("200000")));
+    }
+
+    #[test]
+    fn blacklist_contains_all_provider_keys() {
+        for k in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "ZAI_API_KEY",
+            "MOONSHOT_API_KEY",
+        ] {
+            assert!(SECRET_ENV_VARS.contains(&k), "{k} fehlt in SECRET_ENV_VARS");
+        }
+    }
+
+    #[test]
+    fn guard_scrubs_env_and_records_audit() {
+        // NullSandbox: keine FS-Grenze, aber Env-Allowlist greift (Default-deny) und der
+        // Audit-Eintrag landet in details["guard"].
+        let dir = tempfile::tempdir().unwrap();
+        let guard = crate::test_support::guard_for(dir.path(), sepp_policy::Mode::Auto);
+        let rt = ct_runtime();
+        let r = rt.block_on(async {
+            std::env::set_var("SEPP_TEST_SECRET", "geheim");
+            BashTool::new(Some(guard))
+                .execute(
+                    json!({ "command": "echo \"[$SEPP_TEST_SECRET][$PATH]\"" }),
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap()
+        });
+        let text = match &r.content[0] {
+            sepp_core::ContentBlock::Text { text } => text.clone(),
+            other => panic!("Text erwartet: {other:?}"),
+        };
+        assert!(
+            text.starts_with("[]["),
+            "Secret darf nicht durchkommen: {text}"
+        );
+        assert!(!text.starts_with("[][]"), "PATH muss durchkommen: {text}");
+        assert_eq!(r.details["guard"]["decision"], "allow");
+    }
+
+    /// Gated wie die Landlock-Tests in sepp-policy: braucht durchsetzbares Landlock.
+    #[test]
+    #[ignore = "braucht durchsetzbares Landlock"]
+    fn bash_under_guard_writes_inside_allowed_dir_and_not_outside() {
+        use sepp_policy::{
+            default_sandbox, AgentSection, BuiltinDefaults, Grants, Guard, Mode, PolicyFile,
+            PolicySet, ResolveCtx, Source,
+        };
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_c = inside.path().canonicalize().unwrap();
+        let file = PolicyFile {
+            mode: Some(Mode::Auto),
+            agent: Some(AgentSection {
+                grants: Grants {
+                    fs_read: vec![inside_c.display().to_string(), "system".into()],
+                    fs_write: vec![inside_c.display().to_string()],
+                    ..Grants::default()
+                },
+                ..AgentSection::default()
+            }),
+            ..PolicyFile::default()
+        };
+        let ctx = ResolveCtx {
+            home: None,
+            cwd: inside_c.clone(),
+            tmpdir: inside_c.clone(),
+        };
+        let set = PolicySet::merge(
+            vec![(Source::File("/t.toml".into()), file)],
+            &BuiltinDefaults::default(),
+            None,
+            &ctx,
+        );
+        let guard = Arc::new(Guard::new(set, default_sandbox()));
+        let rt = ct_runtime();
+        let (ok, bad) = rt.block_on(async {
+            let tool = BashTool::new(Some(guard));
+            let ok = tool
+                .execute(
+                    json!({ "command": format!("echo hi > '{}/ok.txt'", inside_c.display()) }),
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let bad = tool
+                .execute(
+                    json!({ "command": format!("echo hi > '{}/escaped.txt'", outside.path().display()) }),
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            (ok, bad)
+        });
+        assert!(!ok.is_error, "{:?}", ok.content);
+        assert!(inside_c.join("ok.txt").exists());
+        assert!(bad.is_error);
+        assert!(!outside.path().join("escaped.txt").exists());
+        let text = match &bad.content[0] {
+            sepp_core::ContentBlock::Text { text } => text.clone(),
+            other => panic!("Text erwartet: {other:?}"),
+        };
+        assert!(text.contains("[guard:"), "Hinweis fehlt: {text}");
     }
 }

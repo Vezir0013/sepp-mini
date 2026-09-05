@@ -9,6 +9,7 @@ description = "Built-in Tools und Tool-Helfer (Truncation, File-Mutation-Queue) 
 
 [dependencies]
 sepp-core = { path = "../sepp-core" }
+sepp-policy = { path = "../sepp-policy" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
