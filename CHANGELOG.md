@@ -7,6 +7,15 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
+- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.1.19] - 2026-09-05
+
 Sepp Guard, Phase 2: **der Modus `ask` fragt jetzt wirklich.** Phase 1 hat den Agenten eingesperrt,
 aber außerhalb der Policy nur verweigert — jede Ausnahme kostete einen Neustart mit angepasster
 Datei. Jetzt erscheint in der TUI ein Dialog: einmal, für die Sitzung, dauerhaft oder nein. Die
@@ -40,13 +49,6 @@ Antwort „dauerhaft" schreibt das Recht selbst in die `policy.toml`, ohne Komme
 - `parse_allow_args` (inkl. `--global` an beliebiger Stelle) und `section_label`.
 - End-to-End in der echten TUI über ein Pseudo-Terminal gegen Ollama: alle vier Antworten
   (`n` verweigert, `e`/`s` schreiben ohne Datei-Eintrag, `d` schreibt und trägt ein).
-
-### Geplant
-- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.1.18] - 2026-09-05
 
@@ -619,7 +621,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.15...v0.1.16
