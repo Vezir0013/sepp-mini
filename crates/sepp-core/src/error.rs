@@ -19,9 +19,9 @@ pub enum SeppError {
     Session(String),
     #[error("config error: {0}")]
     Config(String),
-    #[error("serialization error")]
+    #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("aborted")]
     Aborted,
