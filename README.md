@@ -43,7 +43,8 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
 - 🛡️ **Sepp Guard: auch der Agent selbst ist eingesperrt.** `bash` läuft in derselben OS-Sandbox
   (Projekt und `$TMPDIR` schreibbar, Systempfade lesbar, kein Netz), `read`/`write`/`edit` prüfen
   Pfade gegen dieselbe Policy. Ein Regelwerk (`policy.toml`), ein Entscheider, und `sepp policy`
-  zeigt, wer was darf und wer es durchsetzt (siehe [Sicherheitsmodell](#sicherheitsmodell)).
+  zeigt, wer was darf und wer es durchsetzt. `sepp audit` liest die Spur nach: jede Entscheidung,
+  jeder Tool-Aufruf, jede Delegation (siehe [Sicherheitsmodell](#sicherheitsmodell)).
 - 🧩 **Vier Erweiterungs-Tiers** nach Macht/Isolation: **Resources** (Skills→System-Prompt,
   Prompt-Templates→Slash-Commands), **Hooks** (in-process Rhai), **WASM-Plugins** (memory-sandboxed,
   capability-gated, via `wasmi`), **MCP-Server** (out-of-process, OS-sandboxed).
@@ -389,12 +390,43 @@ fs_read  = ["~/.config/secrets"]
 Python). `sepp policy` zeigt die effektiven Rechte je Akteur mit Quelle und Vollstrecker und
 benennt, was auf dem System **nicht** durchsetzbar ist.
 
+**Die Spur: `sepp audit`.** Jede Guard-Entscheidung landet als eigener Session-Eintrag — auch die
+erlaubten, sonst sagt die Spur nur, was schiefging, nie was normal war. Jede `task`-Delegation
+schreibt eine eigene Kind-Session, die im Header auf ihre Wurzel verweist; im Audit wird sie
+eingerückt aufgeklappt. `sepp audit` gibt das Ganze lesbar aus:
+
+```
+$ sepp audit
+Sitzung 9016ce87-07f5-4829-9801-2da4c5568527  ·  2026-09-05 12:53:44Z  ·  6 Einträge
+Verzeichnis /home/du/projekt
+
+12:53:44  Nutzer    Delegiere: Lies README.md und nenne den Projektnamen.
+12:53:45  Tool →    task {"description":"Lies die Datei README.md und nenne den Projektnamen."}
+12:53:48  Guard     ALLOW · agent · lesen README.md
+12:53:48  Sub-Agent 4586db5f · „Lies die Datei README.md …" · 4 Einträge
+  12:53:45  Nutzer    Lies die Datei README.md und nenne den Projektnamen.
+  12:53:47  Tool →    read {"path":"README.md"}
+  12:53:47  Tool ✓    # rusty — ein winziges Testprojekt
+  12:53:48  Modell    Das Projekt heißt "rusty".
+12:53:48  Tool ✓    Das Projekt heißt "rusty".
+12:53:49  Modell    Das Projekt heißt "rusty".
+
+1 Prompts · 1 Tool-Aufrufe · 0 verweigert · 1 Sub-Agenten
+```
+
+Ohne Argument die jüngste Sitzung des Projekts, sonst ein ID-Präfix. `--no-children` lässt die
+Kind-Sessions zu; `--json` gibt ein Objekt je Eintrag aus, etwa für
+`sepp audit --json | jq 'select(.entry.payload.kind == "guard")'`. Session-Dateien liegen mit
+`0600` in einem `0700`-Verzeichnis — sie enthalten alles, was der Agent gelesen hat.
+
 **Grenzen, ehrlich benannt:** Landlock kennt keine Verbote unterhalb einer Gewährung (ein Deny
 unter `fs_read = ["~"]` gilt für `bash` nicht, für `read`/`write`/`edit` schon; `sepp policy`
 meldet solche Überlappungen). Netz ist für Kindprozesse „ganz oder gar nicht"; der Host-Filter
 kommt mit dem Egress-Proxy. Das TCP-Verbot braucht Landlock ABI 4 (Kernel ≥ 6.7). Exec-Listen sind
 auf macOS wegen Apples Shims fragil. Unter Guard verliert die Shell alle nicht freigegebenen
-Umgebungsvariablen (`[agent].env` ist der Schalter).
+Umgebungsvariablen (`[agent].env` ist der Schalter). Im Audit stehen Entscheidungen aus einem
+Sub-Agent-Lauf in der Wurzel-Spur, nicht in der Kind-Session: alle Tools teilen sich einen Guard,
+und eine Aufteilung könnte bei parallelen Aufrufen der falschen Sitzung zugeschlagen werden.
 
 Schwachstellen melden: [`SECURITY.md`](./SECURITY.md).
 
@@ -437,7 +469,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] OpenTelemetry-Export (`tracing`), optional aktivierbar
 - [ ] OAuth-Login für Subscription-Provider
 - [ ] Google-Provider-Adapter
-- [ ] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
+- [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
+- [ ] Egress-Proxy: Host-Filter für ausgehende Verbindungen (heute ist Netz „ganz oder gar nicht")
 - [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
 
 ## Mitwirken

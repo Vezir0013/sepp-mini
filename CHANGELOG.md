@@ -7,8 +7,45 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Sepp Guard, Phase 3: **die Spur.** Phase 1 hat den Agenten eingesperrt, Phase 2 hat ihn fragen
+lassen — aber wer hinterher wissen wollte, was passiert ist, musste Fließtext im Modellkontext
+lesen und fand von Sub-Agenten gar nichts. Jetzt ist jede Entscheidung ein eigener Eintrag, jede
+Delegation eine eigene Sitzung, und `sepp audit` liest beides vor.
+
+### Hinzugefügt
+- **`sepp audit [<id>]`** gibt die Spur einer Sitzung lesbar aus: Prompts, Antworten, Tool-Aufrufe
+  samt Ergebnis, Guard-Entscheidungen mit Grund und delegierte Sub-Agenten. Die Kind-Session eines
+  Sub-Agenten wird eingerückt aufgeklappt. Ohne Argument die jüngste Sitzung des Projekts, sonst
+  ein ID-Präfix. `--no-children` lässt die Kind-Sessions zu, `--json` gibt ein Objekt je Eintrag
+  aus (`sepp audit --json | jq 'select(.entry.payload.kind == "guard")'`).
+- **Guard-Entscheidungen stehen in der Session**, als Einträge der Art `guard` — auch die
+  erlaubten, sonst zeigt die Spur nur Ausnahmen und nie den Normalfall. Auch Verweigerungen sind
+  erfasst, die als Fehler aus dem Tool kommen und deshalb kein Ergebnis mit Details haben.
+- **Sub-Agenten schreiben eine eigene Kind-Session**, die im Header über `parent_session` auf ihre
+  Wurzel verweist; die Wurzel bekommt einen Eintrag der Art `subagent` mit ID, Aufgabe und Umfang.
+  Der Verlauf des Sub-Agenten bläht den Wurzel-Kontext weiterhin nicht auf — er ist jetzt nur
+  nicht mehr verloren. Auch ein abgebrochener Lauf wird geschrieben.
+- **Zwei Einhängepunkte in `sepp-agent`**, damit die Crate policy-frei bleibt: eine `AuditSource`,
+  die der Loop nach jedem Tool-Batch abfragt, und der reservierte Schlüssel `details["audit"]`
+  eines `ToolResult`, den der Loop als eigenen Eintrag schreibt.
+
+### Geändert
+- **Session-Dateien werden mit `0600` in einem `0700`-Verzeichnis angelegt.** Sie enthalten alles,
+  was der Agent gelesen und geschrieben hat; bisher galt die umask.
+- `/tree` blendet Guard-Einträge aus (sie stünden sonst zwischen jedem Tool-Aufruf) und zeigt eine
+  Delegation als `→ Sub-Agent <id>`.
+- Ein mehrdeutiges Session-Präfix bei `-r`/`sepp audit` ist jetzt ein Fehler mit Vorschlägen,
+  statt still die zuletzt geänderte Sitzung zu nehmen.
+
+### Behoben
+- **Der Audit-Eintrag in `details["guard"]` konnte vom falschen Tool stammen.** Er wurde nach der
+  Autorisierung aus dem gemeinsamen Guard-Protokoll gefischt (`last_audit`); da Tool-Aufrufe
+  parallel laufen, konnte dort die Entscheidung eines anderen Aufrufs stehen. Die Entscheidung
+  reist jetzt in der `Authorization` des Aufrufs mit.
+- Das Guard-Protokoll wuchs über die gesamte Sitzung, weil es nie abgeholt wurde; der neue
+  Loop-Haken leert es nach jedem Tool-Batch.
+
 ### Geplant
-- Sepp Guard Phase 3: Guard-Einträge in der Session, Sub-Agenten als Kind-Sessions
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports) samt Secret-Broker
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
