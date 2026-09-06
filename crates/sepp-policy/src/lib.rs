@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use sepp_core::{Result, SeppError};
 
+pub mod fsutil;
 pub mod guard;
 pub mod policy_edit;
 mod sandbox;
