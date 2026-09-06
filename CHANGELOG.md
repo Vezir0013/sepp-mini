@@ -8,6 +8,29 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 ## [Unreleased]
 
 ### Behoben
+- **Ein Fehler im Hook sah aus wie „kein Hook".** Rhai meldet „Funktion nicht gefunden" für zwei
+  sehr verschiedene Dinge: Das Skript definiert den Handler nicht — dann ist Überspringen
+  richtig — oder der Handler existiert und ruft in seinem Rumpf etwas Falsches auf. Geprüft
+  wurde nur die Fehlerart, nicht ihr Inhalt, und beides galt als „kein Handler". Ein Tippfehler
+  wie `handled("x")` (die Funktion nimmt kein Argument) schaltete den Hook damit stumm ab; das
+  Modell antwortete normal, niemand erfuhr etwas. Rhai unterscheidet die Fälle sehr wohl, in
+  Name **und** Position — beides wird jetzt geprüft, und ein gescheitertes Skript meldet sich
+  mit Dateiname, Handler und Zeile. Die Arbeit läuft dabei weiter; nur ein gescheiterter
+  `on_tool_call` lässt sein Werkzeug ausfallen, weil er `block` hätte sagen können.
+  Ebenfalls neu gefangen, weil zur Laufzeit nicht unterscheidbar: ein Handler mit falscher
+  Parameterzahl und ein vertippter Handler-Name — beides meldet sich beim Laden.
+- **Fremder Text ging roh ans Terminal.** Paketbeschreibungen, Rechte-Pfade, Hostnamen,
+  Dateinamen aus einem Archiv, Registry-Beschreibungen und Werkzeug-Ergebnisse wurden
+  unverändert ausgegeben — ausgerechnet im Zustimmungsdialog, direkt neben der Frage „Rechte
+  gewähren?". Ein Wagenrücklauf in der Beschreibung löscht die Zeile darüber und schreibt eine
+  harmlose an ihre Stelle; ein Rechts-nach-links-Zeichen lässt `gro.esiob` als `boise.org`
+  erscheinen. Solcher Text wird jetzt bereinigt: Gefährliche und unsichtbare Zeichen werden
+  durch ein **sichtbares** Ersatzzeichen ersetzt, nicht entfernt — wer sie löscht, macht einen
+  manipulierten Namen von einem harmlosen ununterscheidbar. Betroffen sind `sepp pkg`,
+  `sepp audit`, `sepp policy` und die Startmeldungen ohne TUI; in der Oberfläche selbst war es
+  nie ein Problem, weil ratatui Steuerzeichen ohnehin verwirft. Eine sehr lange
+  Paketbeschreibung wird zusätzlich gekürzt — auch sie kann die Rechteliste aus dem Bild
+  schieben. `check_url_scheme` lehnt Whitespace, Steuer- und Formatzeichen jetzt selbst ab.
 - **Ein überlasteter Anbieter kostete einen ganzen Turn.** Jeder Nicht-2xx brach den Prompt sofort
   ab — ein `429` (Ratenlimit) oder ein `529` („overloaded", bei Anthropic unter Last regelmäßig)
   beendete die Arbeit mit einer Fehlermeldung, und der Mensch musste von Hand erneut senden. Jetzt
@@ -33,12 +56,27 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   `CancellationToken` nicht und lieferte die bis dahin gesammelte, abgeschnittene Zusammenfassung
   zurück — die dann echte Nachrichten ersetzt hätte. Jetzt meldet sich der Abbruch als solcher.
 
+### Hinzugefügt
+- **Hook-Meldungen erreichen die Oberfläche.** `notify(…)` schrieb bisher nur ins Log und war
+  damit überall unsichtbar: In der TUI gibt es keinen Log-Empfänger, im One-shot liegt die
+  Meldung unter der Standardschwelle. Jetzt geht sie denselben Weg wie ein Hinweis des Agenten
+  und erscheint in TUI, One-shot und RPC. Der Start meldet außerdem, wie viele Hook-Skripte
+  geladen wurden — bisher war nur der Fehlerfall sichtbar.
+
 ### Geändert
 - **RPC kennt ein weiteres Ereignis:** `{"type":"notice","text":…}` meldet einen Wiederanlauf.
   Additiv wie alle bisherigen Erweiterungen — ein Client, der es nicht kennt, ignoriert die Zeile.
   Die Stream-Invariante lautet jetzt `Notice* MessageStart … Usage? MessageStop`.
 
 ### Tests
+- Neunzehn Fälle für die beiden Befunde oben: das Rhai-Verhalten beider „nicht gefunden"-Fälle
+  festgenagelt (es gehört einer fremden Crate, ein stiller Wechsel würde Hooks wieder verstummen
+  lassen), Tippfehler im Handler mit Skriptname gemeldet, fehlender Handler weiterhin still,
+  falsche Parameterzahl und vertippter Name beim Laden, eine Meldung je Sitzung statt je Aufruf,
+  ein Ende-zu-Ende-Lauf über den echten Loop; dazu harmloser Text bleibt unverändert (der
+  wichtigste Fall), ein vollständiger Angriff auf den Zustimmungsdialog lässt die Rechteliste
+  unversehrt, keine Eintragsart schmuggelt etwas in die Audit-Spur, und sechs neue schlechte
+  URLs.
 - Sieben Fälle gegen lokale `TcpListener` (Wiederanlauf mit Hinweis vor `MessageStart`, dreimal
   `503`, `401` ohne zweiten Versuch, Abbruch im Backoff und beim Warten auf die Antwort,
   gedeckelter Fehler-Body, der geteilte OpenAI-Pfad) plus acht reine Funktionen für Backoff,
