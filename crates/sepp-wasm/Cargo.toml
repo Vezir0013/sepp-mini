@@ -15,7 +15,11 @@ sepp-policy = { path = "../sepp-policy" }
 # wasmi: reiner Rust-WASM-Interpreter (leicht, keine C-Abhängigkeit, memory-sandboxed).
 # Bewusst statt wasmtime/extism — passt zum „leichtgewichtig"-Ziel; gleiches Sicherheitsmodell.
 wasmi = "=1.1.0"
+serde = { workspace = true }
 serde_json = { workspace = true }
+# host_http: der Host ist der Netzwerkstack des Moduls — eigener Worker-Thread mit eigener Runtime.
+reqwest = { workspace = true }
+base64 = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true } # spawn_blocking: wasmi synchron aus dem Reactor auslagern
 tokio-util = { workspace = true }

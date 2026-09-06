@@ -1906,6 +1906,7 @@ dependencies = [
 name = "sepp-plugin"
 version = "0.2.1"
 dependencies = [
+ "base64",
  "schemars",
  "sepp-core",
  "sepp-plugin-macros",
@@ -1993,9 +1994,12 @@ name = "sepp-wasm"
 version = "0.2.1"
 dependencies = [
  "async-trait",
+ "base64",
+ "reqwest 0.12.28",
  "sepp-core",
  "sepp-policy",
  "sepp-tools",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

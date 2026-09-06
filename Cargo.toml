@@ -45,6 +45,7 @@ async-trait = "=0.1.89"
 # --- HTTP / Streaming (Provider) ---
 reqwest = { version = "=0.12.28", features = ["json", "stream", "rustls-tls"], default-features = false }
 bytes = "=1.11.1"
+base64 = "=0.22.1"     # host_http: binäre Bodies (Host und Plugin-SDK)
 
 # --- Plattform (Prozess-Gruppen für bash-Tool, nur unix) ---
 libc = "=0.2.186"
