@@ -1,0 +1,100 @@
+// sepp mini — logische Plugin-Schnittstelle (Tier 2, WASM).
+//
+// Diese Datei ist die eine Wahrheit der Schnittstelle. Das Guest-SDK (crates/sepp-plugin) und
+// der Host (crates/sepp-wasm) setzen sie von Hand um; es gibt keinen Generator. Der Test
+// `wit_names_every_host_import_and_export_exactly` in sepp-wasm hält beide Seiten synchron:
+// Jeder Core-Importname aus `env` und jeder Export, den der Host kennt, muss hier stehen — und
+// umgekehrt. (Der Test sammelt alle Bezeichner mit den Präfixen der Import- und Exportnamen;
+// deshalb steht hier kein Platzhalter mit diesen Präfixen.)
+//
+// WIT ist Bauzeit, wasmi ist Laufzeit: Der Host spricht Core-WASM (kein Component Model), die
+// Kodierung steht am Ende dieser Datei. Die Paketversion entspricht der ABI-Version
+// (sepp-wasm `PLUGIN_ABI`). Änderungen sind nur additiv: Eine neue Host-Funktion bricht kein
+// altes Modul, weil ein Modul nur importiert, was es benutzt.
+package sepp:plugin@1.0.0;
+
+/// Was der Host jedem Modul anbietet. Ob eine Funktion beim Instanziieren vorhanden ist,
+/// entscheidet die Policy (Manifest ∩ policy.toml [plugin.<name>]) — das Gate steht je
+/// Funktion. Ein Modul, das eine gegatete Funktion importiert, ohne dass sie gewährt ist,
+/// lädt nicht.
+interface host {
+    /// Eine Zeile ins Log des Hosts (stderr, tracing-Target `wasm`). Gate: immer.
+    log: func(message: string);
+
+    /// Eine Datei roh lesen. Der Pfad wird wie bei read/write/edit aufgelöst (relativ zum
+    /// Arbeitsverzeichnis von sepp, `~` wird expandiert) und gegen dieselbe Policy geprüft.
+    /// Höchstens 16 MiB. Gate: fs_read | fs_write (Schreiben schließt Lesen ein).
+    fs-read: func(path: string) -> result<list<u8>, string>;
+
+    /// PROVISORISCH — Stufe 3 setzt es um. Heute liefert der Host immer
+    /// err("host_http ist in dieser Version noch nicht implementiert"); das Gate steht schon.
+    record http-request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+    /// Eine HTTP-Anfrage über den Host. sepp ist der Netzwerkstack des Moduls: Host-Allowlist
+    /// exakt, Secrets werden erst an der Grenze eingesetzt, jeder Request landet in der
+    /// Audit-Spur. Gate: net.
+    http: func(request: http-request) -> result<http-response, string>;
+}
+
+/// Was jedes Modul exportiert. Genau ein Werkzeug je Modul (ABI 1).
+interface tool {
+    /// Die Werkzeugbeschreibung als ToolSpec-JSON: {"name","label","description","parameters"}.
+    /// `name` muss ^[A-Za-z0-9_-]{1,64}$ erfüllen (sonst lehnt der Host das Modul beim Laden
+    /// ab); `parameters` ist ein JSON-Schema ohne $schema und title.
+    spec: func() -> string;
+
+    /// Argument-JSON hinein, ToolResult-JSON hinaus: {"content":[…],"details"?,"is_error"?}.
+    /// Trappt nie: Ungültige Argumente und Fehler sind ein Ergebnis mit is_error = true.
+    /// Der Host kürzt `content` selbst (50 KiB / 2000 Zeilen), das Modul muss es nicht.
+    call: func(arguments: string) -> string;
+}
+
+world plugin {
+    import host;
+    export tool;
+}
+
+// ── Kodierung ABI 1 (Core-WASM) ────────────────────────────────────────────────────────────
+//
+// Alle Importe liegen im Modul `env`. Zeiger und Längen sind i32 in den linearen Speicher, der
+// unter dem Namen "memory" exportiert sein muss. Nutzdaten je Richtung höchstens 16 MiB.
+// Puffer werden nie freigegeben: Die Instanz wird nach jedem Werkzeugaufruf verworfen, ein
+// Zustand über zwei Aufrufe hinweg ist unmöglich.
+//
+//   tool.spec    → Export sepp_spec() -> i64
+//                  i64 = (ptr << 32) | len, UTF-8-JSON im linearen Speicher.
+//   tool.call    → Export sepp_call(ptr, len) -> i64
+//                  Der Host holt sich vorher mit Export sepp_alloc(len) -> i32 einen Puffer
+//                  und schreibt die Argument-JSON hinein.
+//
+//   host.log     → env.host_log(ptr, len)                          Gate: immer
+//   host.fs-read → env.host_fs_read_bytes(ptr, len) -> i32         Gate: fs_read | fs_write
+//                  Eingabe: JSON {"path":"…"}. Rückgabe n >= 0: n rohe Bytes liegen bereit;
+//                  n < 0: -n-1 Bytes UTF-8-Fehlertext liegen bereit. Das ist die Kodierung von
+//                  result<list<u8>, string>.
+//                  Legacy mit demselben Gate, vom SDK nicht genutzt: env.host_fs_read(ptr, len)
+//                  -> i32 legt JSON {"bytes","text","lossy"} bzw. {"error"} ab (Text
+//                  verlustbehaftet, from_utf8_lossy); Rückgabe = Länge des JSON.
+//   host.http    → env.host_http(ptr, len) -> i32                  Gate: net
+//                  Eingabe: Request-JSON {"method","url","headers":[["k","v"],…],"body"?}.
+//                  Legt Response-JSON {"status","headers","body"} oder {"error":"…"} ab;
+//                  Rückgabe = Länge des JSON. OFFEN (Stufe 3): Kodierung binärer Bodies —
+//                  heute UTF-8-String; Kandidaten sind ein base64-Feld oder eine rohe Variante
+//                  analog host_fs_read_bytes. Beides additiv lösbar.
+//
+//   Abholweg     → env.host_result_read(ptr, cap) -> i32           Gate: immer
+//                  Kopiert min(len, cap) Bytes des zuletzt abgelegten Ergebnisses in den
+//                  Puffer des Moduls und liefert die kopierte Zahl; 0 = nichts liegt an,
+//                  -1 = Ziel außerhalb des Speichers. Das Ergebnis bleibt bis zur nächsten
+//                  Fähigkeit erhalten — ein zu kleiner Puffer erlaubt einen zweiten Versuch.
+//                  Warum zweistufig: Der Host darf aus einer Host-Funktion heraus nicht
+//                  sepp_alloc rufen (nicht resumierbar, kollidiert mit dem Fuel-Slicing).

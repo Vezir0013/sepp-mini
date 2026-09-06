@@ -21,7 +21,10 @@
 //! `max_wall_time_ms = 0` heißt beliebig lange laufen dürfen — niemals unkontrollierbar sein.
 //!
 //! **Plugin-ABI Version 1** ([`PLUGIN_ABI`]); ein Manifest deklariert sie über `abi`, ein
-//! höherer Wert wird abgelehnt.
+//! höherer Wert wird abgelehnt. Der Vertragstext der Schnittstelle ist `wit/sepp.wit` im
+//! Repo-Root; die Tabellen [`HOST_IMPORTS`] und [`EXPORTS`] hier sind seine Kodierung, und ein
+//! Test hält beide synchron. Autoren schreiben gegen das SDK `sepp-plugin`, das Zeiger und
+//! Abholweg kapselt — die Rohform unten muss nur kennen, wer ohne SDK baut.
 //!
 //! Exports, **alle vier beim Laden geprüft**: `sepp_alloc(i32)->i32`, `sepp_spec()->i64`,
 //! `sepp_call(i32,i32)->i64` und die Memory unter dem Namen `memory`. Der Rückgabewert `i64`
@@ -149,6 +152,71 @@ const MAX_PLUGIN_BYTES: u32 = 16 * 1024 * 1024;
 /// abgelehnt — lieber gar nicht laden als mit falschen Erwartungen laufen.
 pub const PLUGIN_ABI: u32 = 1;
 
+/// Unter welcher Gewährung eine Host-Funktion im Linker erscheint.
+///
+/// Das ist das Capability-Gate in Tabellenform: [`build_linker`] registriert eine Funktion nur,
+/// wenn ihr Gate für die effektive Policy offen ist. Ein Modul, das sie trotzdem importiert,
+/// lädt nicht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Immer registriert (gegatete Host-API ohne fs/net).
+    Always,
+    /// `FsRead` — oder `FsWrite`, das laut `Policy::allows_path` und beiden Sandbox-Adaptern das
+    /// Lesen einschließt. Ohne diesen Zweig bekäme ein Plugin mit reiner Schreibgewährung die
+    /// Lesefunktion gar nicht erst hingelegt und lüde nicht einmal.
+    FsRead,
+    /// `Net` — irgendein Host gewährt.
+    Net,
+}
+
+impl Gate {
+    /// Ist das Gate für diese Policy offen?
+    pub fn open(self, policy: &Policy) -> bool {
+        match self {
+            Gate::Always => true,
+            Gate::FsRead => policy
+                .granted
+                .iter()
+                .any(|c| matches!(c, Capability::FsRead { .. } | Capability::FsWrite { .. })),
+            Gate::Net => policy
+                .granted
+                .iter()
+                .any(|c| matches!(c, Capability::Net { .. })),
+        }
+    }
+}
+
+const HOST_LOG: &str = "host_log";
+const HOST_RESULT_READ: &str = "host_result_read";
+const HOST_FS_READ: &str = "host_fs_read";
+const HOST_FS_READ_BYTES: &str = "host_fs_read_bytes";
+const HOST_HTTP: &str = "host_http";
+
+/// Alle Host-Importe des ABI 1 (Modul `env`) mit ihrem Gate — die Tabelle, gegen die
+/// `wit/sepp.wit` geprüft wird. [`build_linker`] registriert genau diese Namen.
+pub const HOST_IMPORTS: &[(&str, Gate)] = &[
+    (HOST_LOG, Gate::Always),
+    (HOST_RESULT_READ, Gate::Always),
+    (HOST_FS_READ, Gate::FsRead),
+    (HOST_FS_READ_BYTES, Gate::FsRead),
+    (HOST_HTTP, Gate::Net),
+];
+
+/// Die Pflicht-Exports eines Moduls mit Signatur (Parameter, Ergebnisse); dazu kommt die Memory
+/// unter [`MEMORY_EXPORT`]. [`check_exports`] prüft genau diese Liste.
+pub const EXPORTS: &[(&str, &[wasmi::ValType], &[wasmi::ValType])] = &[
+    ("sepp_alloc", &[wasmi::ValType::I32], &[wasmi::ValType::I32]),
+    ("sepp_spec", &[], &[wasmi::ValType::I64]),
+    (
+        "sepp_call",
+        &[wasmi::ValType::I32, wasmi::ValType::I32],
+        &[wasmi::ValType::I64],
+    ),
+];
+
+/// Name, unter dem ein Modul seinen linearen Speicher exportieren muss.
+pub const MEMORY_EXPORT: &str = "memory";
+
 /// Fuel-Tank für `instantiate_and_start`: die Start-Sektion ist nicht resumierbar und bekommt
 /// deshalb ein festes, großzügiges Einmal-Budget statt Slicing — fail-closed bei Überschreitung.
 const START_FUEL: u64 = 10_000_000;
@@ -162,14 +230,9 @@ const LOAD_WALL_MS: u64 = 5_000;
 /// kompilierten Modul. Kostet kein Fuel und meldet den erwarteten Typ, damit ein Autor weiß,
 /// was er falsch gemacht hat.
 fn check_exports(module: &Module) -> Result<()> {
-    use wasmi::{ExternType, ValType};
+    use wasmi::ExternType;
 
-    let want: &[(&str, &[ValType], &[ValType])] = &[
-        ("sepp_alloc", &[ValType::I32], &[ValType::I32]),
-        ("sepp_spec", &[], &[ValType::I64]),
-        ("sepp_call", &[ValType::I32, ValType::I32], &[ValType::I64]),
-    ];
-    for (name, params, results) in want {
+    for (name, params, results) in EXPORTS {
         match module.get_export(name) {
             Some(ExternType::Func(ty)) if ty.params() == *params && ty.results() == *results => {}
             Some(ExternType::Func(ty)) => {
@@ -196,9 +259,11 @@ fn check_exports(module: &Module) -> Result<()> {
             }
         }
     }
-    match module.get_export("memory") {
+    match module.get_export(MEMORY_EXPORT) {
         Some(ExternType::Memory(_)) => Ok(()),
-        _ => Err(SeppError::Tool("wasm: kein 'memory'-Export".into())),
+        _ => Err(SeppError::Tool(format!(
+            "wasm: kein '{MEMORY_EXPORT}'-Export"
+        ))),
     }
 }
 
@@ -337,9 +402,9 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
     linker
         .func_wrap(
             "env",
-            "host_log",
+            HOST_LOG,
             |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
-                if let Some(Extern::Memory(mem)) = caller.get_export("memory") {
+                if let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) {
                     // Über `read_input`, damit es im Linker genau einen Weg gibt, Modulspeicher
                     // zu lesen: Die Inline-Rechnung hier klemmte negative Werte nicht und lief
                     // bei `ptr = -1` in einen Additions-Overflow.
@@ -362,9 +427,9 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
     linker
         .func_wrap(
             "env",
-            "host_result_read",
+            HOST_RESULT_READ,
             |mut caller: Caller<'_, HostState>, ptr: i32, cap: i32| -> i32 {
-                let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) else {
                     return -1;
                 };
                 let take = caller.data().result.len().min(cap.max(0) as usize);
@@ -384,22 +449,15 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
         )
         .map_err(|e| SeppError::Tool(format!("wasm linker host_result_read: {e}")))?;
 
-    // host_fs_read: nur mit FsRead-Capability — oder FsWrite, das laut `Policy::allows_path` und
-    // beiden Sandbox-Adaptern das Lesen einschließt. Ohne diesen Zweig bekäme ein Plugin mit
-    // reiner Schreibgewährung die Lesefunktion gar nicht erst hingelegt und lüde nicht einmal.
-    // Führt aus, legt das Ergebnis bereit und liefert dessen Größe; abgeholt wird mit
-    // `host_result_read`.
-    if policy
-        .granted
-        .iter()
-        .any(|c| matches!(c, Capability::FsRead { .. } | Capability::FsWrite { .. }))
-    {
+    // host_fs_read: nur hinter `Gate::FsRead` (FsRead oder FsWrite, siehe dort). Führt aus,
+    // legt das Ergebnis bereit und liefert dessen Größe; abgeholt wird mit `host_result_read`.
+    if Gate::FsRead.open(policy) {
         linker
             .func_wrap(
                 "env",
-                "host_fs_read",
+                HOST_FS_READ,
                 |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-                    let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                    let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) else {
                         return -1;
                     };
                     let Some(raw) = read_input(&caller, &mem, ptr, len) else {
@@ -414,9 +472,9 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
         linker
             .func_wrap(
                 "env",
-                "host_fs_read_bytes",
+                HOST_FS_READ_BYTES,
                 |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-                    let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                    let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) else {
                         return -1;
                     };
                     let Some(raw) = read_input(&caller, &mem, ptr, len) else {
@@ -427,17 +485,13 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_fs_read_bytes: {e}")))?;
     }
-    // host_http: nur mit Net-Capability — DAS ist das Capability-Gate. Noch eine Attrappe, aber
+    // host_http: nur hinter `Gate::Net` — DAS ist das Capability-Gate. Noch eine Attrappe, aber
     // eine ehrliche: Sie erklärt, statt eine Null zu liefern.
-    if policy
-        .granted
-        .iter()
-        .any(|c| matches!(c, Capability::Net { .. }))
-    {
+    if Gate::Net.open(policy) {
         linker
             .func_wrap(
                 "env",
-                "host_http",
+                HOST_HTTP,
                 |mut caller: Caller<'_, HostState>, _ptr: i32, _len: i32| -> i32 {
                     stage_err(
                         &mut caller,
@@ -602,7 +656,7 @@ impl WasmHost {
             .instantiate_and_start(&mut store, &module)
             .map_err(|e| SeppError::Tool(format!("wasm instantiate: {e}")))?;
         let memory = instance
-            .get_memory(&store, "memory")
+            .get_memory(&store, MEMORY_EXPORT)
             .ok_or_else(|| SeppError::Tool("wasm: kein 'memory'-Export".into()))?;
         let spec_fn = instance
             .get_typed_func::<(), i64>(&store, "sepp_spec")
@@ -865,7 +919,7 @@ impl WasmPlugin {
             .instantiate_and_start(&mut store, module)
             .map_err(|e| SeppError::Tool(format!("wasm instantiate: {e}")))?;
         let memory = instance
-            .get_memory(&store, "memory")
+            .get_memory(&store, MEMORY_EXPORT)
             .ok_or_else(|| SeppError::Tool("wasm: kein 'memory'-Export".into()))?;
         let alloc = instance
             .get_typed_func::<i32, i32>(&store, "sepp_alloc")
@@ -1003,6 +1057,40 @@ mod tests {
             speclen = spec.len(),
         );
         wat::parse_str(&wat).expect("net wat")
+    }
+
+    /// Minimales Plugin, das genau die genannten Host-Funktionen importiert (Signatur nach
+    /// Tabelle: `host_log` ohne Ergebnis, alle anderen `(i32,i32)->i32`). Lädt nur, wenn der
+    /// Linker jeden dieser Namen kennt — der Prüfstand für [`HOST_IMPORTS`].
+    fn imports_wat(names: &[&str]) -> Vec<u8> {
+        let spec =
+            r#"{"name":"imp","label":"Imp","description":"x","parameters":{"type":"object"}}"#;
+        let imports: String = names
+            .iter()
+            .map(|n| {
+                let result = if *n == HOST_LOG { "" } else { " (result i32)" };
+                format!("  (import \"env\" \"{n}\" (func (param i32 i32){result}))\n")
+            })
+            .collect();
+        let wat = format!(
+            r#"(module
+{imports}  (memory (export "memory") 1)
+  (data (i32.const 8) "{spec}")
+  (global $bump (mut i32) (i32.const 1024))
+  (func (export "sepp_alloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64)
+    (i64.const 0))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+        );
+        wat::parse_str(&wat).expect("imports wat")
     }
 
     /// Baut ein minimales Plugin (Standard-Exports) mit eigenem `sepp_call`-Rumpf.
@@ -1222,6 +1310,74 @@ mod tests {
             Limits::default(),
         );
         assert!(granted.is_ok(), "Plugin mit Net-Capability sollte laden");
+    }
+
+    /// `wit/sepp.wit` ist der Vertragstext, die Tabellen hier sind seine Kodierung. Jeder Name,
+    /// den die eine Seite kennt, muss die andere nennen — sonst driftet die Doku vom Code weg,
+    /// und ein SDK-Autor baut gegen eine Funktion, die es nicht gibt (oder umgekehrt).
+    #[test]
+    fn wit_names_every_host_import_and_export_exactly() {
+        const WIT: &str = include_str!("../../../wit/sepp.wit");
+        let tokens = || WIT.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        let wit_imports: std::collections::BTreeSet<&str> =
+            tokens().filter(|t| t.starts_with("host_")).collect();
+        let wit_exports: std::collections::BTreeSet<&str> =
+            tokens().filter(|t| t.starts_with("sepp_")).collect();
+
+        let table_imports: std::collections::BTreeSet<&str> =
+            HOST_IMPORTS.iter().map(|(n, _)| *n).collect();
+        let table_exports: std::collections::BTreeSet<&str> =
+            EXPORTS.iter().map(|(n, _, _)| *n).collect();
+
+        assert_eq!(
+            wit_imports, table_imports,
+            "Host-Importe: WIT vs. HOST_IMPORTS"
+        );
+        assert_eq!(wit_exports, table_exports, "Exports: WIT vs. EXPORTS");
+        assert!(
+            WIT.contains(&format!("\"{MEMORY_EXPORT}\"")),
+            "die WIT muss den Memory-Export nennen"
+        );
+        assert!(
+            WIT.contains(&format!("@{PLUGIN_ABI}.")),
+            "die WIT-Paketversion muss zur ABI-Version passen"
+        );
+    }
+
+    /// Die Tabelle verspricht nichts, was der Linker nicht hält: Unter voller Gewährung lädt ein
+    /// Modul, das jeden Eintrag importiert. (`Linker::get` liefert für `func_wrap` nichts, deshalb
+    /// der Umweg über die Instanziierung.)
+    #[test]
+    fn every_table_import_is_registered_under_full_grant() {
+        let names: Vec<&str> = HOST_IMPORTS.iter().map(|(n, _)| *n).collect();
+        let full = Policy::new(vec![
+            Capability::FsRead { prefix: "/".into() },
+            Capability::Net { host: "*".into() },
+        ]);
+        WasmHost::new()
+            .load(&imports_wat(&names), full, Limits::default())
+            .expect("alle Tabellen-Importe sind registriert");
+    }
+
+    /// Und umgekehrt: Jeder gegatete Eintrag fehlt ohne seine Gewährung — je Funktion einzeln,
+    /// damit ein Gate, das versehentlich immer offen ist, sofort auffällt.
+    #[test]
+    fn gated_imports_are_absent_without_their_grant() {
+        for (name, gate) in HOST_IMPORTS {
+            let res =
+                WasmHost::new().load(&imports_wat(&[name]), Policy::default(), Limits::default());
+            match gate {
+                Gate::Always => assert!(
+                    res.is_ok(),
+                    "{name} muss immer da sein: {:?}",
+                    res.err().map(|e| e.to_string())
+                ),
+                _ => {
+                    let err = res.err().expect(name).to_string();
+                    assert!(err.contains("instantiate"), "{name}: {err}");
+                }
+            }
+        }
     }
 
     /// Spec-Test 1: Endlosschleife wird unterbrochen, nicht getötet — der Refuel-Loop tankt
