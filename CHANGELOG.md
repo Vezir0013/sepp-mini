@@ -7,12 +7,99 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Ein Paket bringt keine Rechte mit — es bittet um sie. Bis jetzt hieß „eine Erweiterung
+installieren": Dateien an vier Orte kopieren, ein Manifest lesen, die passenden Zeilen in die
+`policy.toml` schreiben und hoffen, dass Loader und Guard denselben Namen meinen. Ab jetzt ist das
+ein Befehl: `sepp pkg install <datei.seppkg>` prüft die Signatur des Herausgebers, zeigt, was drin
+ist und welche Rechte es braucht, und schreibt sie nach Zustimmung als **markierten Block** in die
+Policy des Nutzers — den `sepp pkg remove` wieder herausnimmt. Die Leitsätze aus dem Paket-Plan
+gelten wörtlich: eine Rechtequelle (kein Paket enthält eine `policy.toml`), die Verzeichnisse des
+Nutzers gehören dem Nutzer (Pakete leben unter `pkg/`), Content in `config_root`, Nachweise in
+`state_root`, alles additiv.
+
+### Hinzugefügt
+- **Das Paketformat `.seppkg` (Format 1)** — ein zstd-komprimiertes tar mit `manifest.toml` und
+  `manifest.sig` als ersten Einträgen, dann `skills/`, `prompts/`, `hooks/`, `plugins/`
+  (je `<n>.wasm` + `<n>.toml`). Das Manifest nennt Name, Version, Herausgeber mit
+  Ed25519-Public-Key, Variablen (`[vars.NAME]`, Art `path` oder `string`, optional Default), die
+  Rechte je Plugin (`[rights.<plugin>]`) und **`[files]` mit SHA-256 je Datei**. Die Signatur
+  deckt das Manifest, die Prüfung je Datei ist ein Hash-Vergleich. Unbekannte Felder werden
+  gelesen, gemeldet, ignoriert; ein höheres `format` verlangt ein neueres `sepp`.
+- **`sepp pkg keygen | pack | install | list | remove`** im neuen Crate `sepp-pkg` (Manifest,
+  Hash, Signatur, Container, Installation gegen abstrakte Wurzeln — testbar ohne Umgebung) mit
+  dünnem `pkg_cmd.rs`. `install` prüft fail-closed in dieser Reihenfolge, und **vor der
+  Signaturprüfung landet kein Nutzdaten-Byte auf Platte**: Magic → Manifest und Signatur zuerst im
+  Archiv → Signatur → Manifest → Vertrauen in den Herausgeber → Variablen → `[rights]` gegen das
+  Plugin-Manifest → Zustimmung → Kollisionen → Entpacken in ein Staging-Verzeichnis mit Hash je
+  Datei (keine Datei ohne Eintrag, kein Eintrag ohne Datei, keine Symlinks, kein `..`, Deckel für
+  Größe und Zahl) → Umbenennen → Policy-Block → Nachweis. Ein Fehler nach dem Umbenennen rollt
+  das Verzeichnis zurück.
+- **Vertrauen per TOFU mit Bestätigung.** Beim ersten Paket eines Herausgebers zeigt `install`
+  Namen und Fingerprint (erste 16 Hex von SHA-256 des Schlüssels) und fragt einmal; danach liegt
+  der Schlüssel unter `<state_root>/trusted-keys/<name>.json` (0700/0600), und jedes weitere Paket
+  dieses Namens muss dazu passen — ein anderer Schlüssel ist ein Fehler, nie eine stille Ersetzung.
+  Nicht-interaktiv: `--trust-key <fingerprint>`; die Rechte-Zustimmung `--yes`; Variablen
+  `--var NAME=WERT`. Fehlt etwas, bricht `install` mit genau der Liste ab, der man zugestimmt hätte.
+- **Markierte Policy-Blöcke** (`policy_edit::write_package_section`/`remove_package_section`):
+  `# von sepp pkg: <name> <version> — nicht von Hand ändern` … `# Ende sepp pkg: <name>`. Die
+  Marker sind Kommentare, keine Schlüssel — jeder Metadaten-Schlüssel würde vom Loader als
+  „unbekannt, ohne Wirkung" gemeldet. Ein Block wird als Zeilenbereich behandelt, weil `toml_edit`
+  einen Kommentar *nach* dem letzten Wert nicht halten kann; das Ergebnis wird vor dem Schreiben
+  noch einmal wie vom Loader geparst. Ein Upgrade ersetzt den Block an Ort und Stelle, `remove`
+  stellt die Datei byte-identisch her, ein handgeschriebener Abschnitt gleichen Namens ist ein
+  Fehler. Pfadrechte werden bei der Installation **absolut** geschrieben (`${BELEGE_DIR}` →
+  `/home/anna/belege`), weil relative Pfade sonst gegen das Arbeitsverzeichnis des Prozesses
+  aufgelöst würden; `sepp policy` zeigt echte Pfade.
+- **Die Loader lesen `<config_root>/pkg/<name>/`** als weitere Wurzel — nach der globalen, vor der
+  projektlokalen: Bei gleichnamigen Prompts gewinnt der Nutzer, Paket-Hooks laufen nach seinen.
+  `settings.toml` bekommt bewusst keine Paketpfade. `sepp init` legt `pkg/` an, im State-Root
+  `pkg/` und `trusted-keys/` mit 0700 — auch ohne `--system`. `sepp policy` zeigt Paket-Plugins
+  ohne Änderung.
+- **Kollisionen werden vorab geprüft.** Ein Plugin gleichen Namens beim Nutzer oder in einem
+  anderen Paket ist ein Fehler (beide teilten sich die `[plugin.<name>]`-Gewährung); gleichnamige
+  Prompts und Skills sind eine Warnung im Zustimmungsdialog. Ein Paketname gehört einem
+  Herausgeber: Ein anderer darf ein installiertes Paket nicht überschreiben.
+- **`[rights]` ⊆ Plugin-Manifest.** Ein Paket darf nur um die *Art* von Zugriff bitten, die das
+  Plugin-Manifest deklariert (Host, Variable, Dateizugriff) — sonst wäre die Gewährung wirkungslos
+  oder das Paket lügt. Ein Pfad außerhalb des Manifest-Präfixes ist eine Warnung („der Schnitt
+  wäre leer"), kein Fehler. Paket-Hooks bekommen eine eigene Zustimmungszeile: Sie laufen im
+  Agent-Loop und können jeden Werkzeugaufruf blockieren.
+- **`pack` ist reproduzierbar** (sortierte Einträge, Modus 0644, mtime 0, uid/gid 0): zweimal
+  packen ergibt dieselben Bytes. `pack` prüft wie der Installer, trägt `[files]` und den Public
+  Key kommentarerhaltend ein und schreibt nie über ein vorhandenes Paket.
+
+### Geändert
+- **`policy_edit::allow` schreibt atomar** (temporäre Datei daneben, `fsync`, `rename`; neues
+  `sepp_policy::fsutil`) und behält den Dateimodus — eine `policy.toml` unter `/etc/sepp` bleibt
+  für alle lesbar. Die Doktrin des Moduls („nur ergänzen, nie entfernen") hat jetzt genau eine
+  benannte Ausnahme: Blöcke, die `sepp pkg` selbst markiert hat.
+- Die Krypto kommt aus `ring` (SHA-256, Ed25519, `SystemRandom`), das über `rustls` ohnehin im
+  Baum liegt — keine neue Krypto-Dependency. Neu sind `tar`, `zstd` (ohne Default-Features) und
+  `semver`; `toml` ist in `sepp-cli` jetzt eine echte Dependency.
+- Dreizehn Crates im Gleichschritt (`sepp-pkg` mit 0.3.0).
+
+### Tests
+- `policy_edit`: Paketblock schreiben → parsen → erwartete Gewährungen; Upgrade ersetzt an Ort;
+  `remove` stellt Bytes her; handgeschriebener Akteur und kaputte Marker werden abgelehnt;
+  `allow` hinterlässt keine temporäre Datei und behält den Modus. `fsutil`: atomar, Modus,
+  Symlink-Ziel, 0700.
+- `sepp-pkg`: Manifest (Beispiel, unbekannte Felder, zwölf Ablehnungsfälle), Signatur
+  (Round-Trip, manipuliert, falscher Schlüssel), Schlüsseldateien nie überschreiben; Container
+  (Round-Trip und Reproduzierbarkeit, Hash-Mismatch, ungelistete und fehlende Datei, `..` und
+  absolute Pfade, Symlink-Eintrag, übergroßer Header vor dem Lesen, falsches Magic, Manifest
+  nicht zuerst); Variablen (Vorrang, Fehlende, Auflösung zu absoluten Pfaden); TOFU (neu →
+  bekannt → anderer Schlüssel); Integration über den ganzen Weg (installieren, upgraden mit
+  übernommenen Variablen, niedrigere Version ablehnen, entfernen, zweiter Herausgeber,
+  Kollisionen, Rechte über das Manifest hinaus, manipuliertes Paket).
+- `sepp-cli`: Parser, Datum ohne Zeitbibliothek, `init` legt `pkg/` und `trusted-keys/` (0700)
+  an; `#[ignore]`-Test packt das gebaute `textstat.wasm`, installiert es gegen Wurzeln im
+  Temp-Verzeichnis, lädt es aus `pkg/demo/plugins` und zählt Wörter.
+
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern
   nur Ports; für WASM-Plugins gilt der Filter seit `host_http` exakt)
 - Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
-- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
-  als Zustimmung bei der Installation
+- Registry und `sepp pkg install <name>` gegen einen signierten Index; `sepp pkg untrust`
 - OpenTelemetry-Export (optional aktivierbar)
 - OAuth-Login für Subscription-Provider
 - Google-Provider-Adapter

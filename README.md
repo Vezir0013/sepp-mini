@@ -270,6 +270,7 @@ Verzeichnisse bleiben unangetastet.
 | **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
 | **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]`; Rust-SDK `sepp-plugin` + `sepp plugin new` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/), Vertrag [`wit/sepp.wit`](./wit/sepp.wit) |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
+| **Pakete** | Skills, Prompts, Hooks und Plugins gebündelt, signiert; Rechte als Zustimmung bei der Installation | `sepp pkg install <datei.seppkg>` → `~/.sepp/pkg/<name>/`; Rechte als markierter Block in `policy.toml` |
 
 Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
 
@@ -372,6 +373,66 @@ aus dem Modul `env` fünf Funktionen: `host_log` und `host_result_read` immer, `
 Der Host verwirft nach jedem Aufruf die ganze Instanz, ein Plugin hält keinen Zustand zwischen zwei
 Aufrufen. Und die Standardbibliothek trägt für `wasm32-unknown-unknown` nur zur Hälfte — ein Modul
 hat weder Uhr noch Zufall noch Dateizugriff außer über den Host.
+
+### Ein Paket installieren
+
+Ein Paket (`.seppkg`) bündelt Skills, Prompts, Hooks und Plugins, ist vom Herausgeber signiert und
+**bringt keine Rechte mit — es bittet um sie**:
+
+```bash
+sepp pkg install rechnungspruefung-1.0.0.seppkg
+```
+
+`install` prüft die Signatur, zeigt beim ersten Paket eines Herausgebers dessen Fingerprint zur
+Bestätigung (danach muss jedes weitere Paket dieses Namens zum Schlüssel passen), fragt die
+Variablen des Pakets ab (etwa den Ordner mit den Belegen), listet je Plugin die beantragten Rechte
+mit echten Pfaden und je Hook den Hinweis, dass er jeden Werkzeugaufruf blockieren kann — und
+schreibt die Rechte erst nach Zustimmung als markierten Block in deine `policy.toml`:
+
+```toml
+# von sepp pkg: rechnungspruefung 1.0.0 — nicht von Hand ändern
+[plugin.pdf_extract]
+fs_read = ["/home/anna/buchhaltung/2026"]
+net = ["api.example.com"]
+# Ende sepp pkg: rechnungspruefung
+```
+
+Danach ist das Paket rechtlich nichts Besonderes: `sepp policy` zeigt es wie handgeschriebene
+Zeilen. Die Dateien liegen unter `~/.sepp/pkg/<name>/`, deine eigenen Verzeichnisse bleiben
+unangetastet. `sepp pkg list` zeigt Pakete und vertraute Herausgeber, `sepp pkg remove <name>`
+nimmt Verzeichnis, Block und Nachweis wieder heraus. Nicht-interaktiv: `--yes`,
+`--trust-key <fingerprint>`, `--var NAME=WERT`.
+
+### Ein Paket bauen
+
+```bash
+sepp pkg keygen                  # Schlüsselpaar unter ~/.sepp/pkg/, einmalig
+sepp pkg pack rechnungspruefung  # Verzeichnis → rechnungspruefung-1.0.0.seppkg
+```
+
+Das Verzeichnis enthält `manifest.toml` und die Inhalte in denselben Unterordnern wie beim Nutzer:
+
+```toml
+format = 1
+name = "rechnungspruefung"
+version = "1.0.0"
+description = "Eingangsrechnungen nach §14 UStG prüfen"
+
+[publisher]
+name = "acme"                    # den Schlüssel trägt `pack` ein
+
+[vars.BELEGE_DIR]
+description = "Ordner mit den Belegen"
+kind = "path"
+
+[rights.pdf_extract]             # nicht mehr, als plugins/pdf_extract.toml deklariert
+fs_read = ["${BELEGE_DIR}"]
+net = ["api.example.com"]
+```
+
+`pack` berechnet SHA-256 je Datei, trägt `[files]` ein, signiert das Manifest mit Ed25519 und
+packt reproduzierbar (zstd-komprimiertes tar). Der Vertrag des Formats steht in
+`crates/sepp-pkg/src/lib.rs`.
 
 ## Sicherheitsmodell
 
@@ -525,12 +586,13 @@ sepp-core      Typen + reine Logik (kein I/O, kein tokio)
   ├── sepp-tools      built-in Tools read/write/edit/bash (unter Sepp Guard) + Truncation
   ├── sepp-session    Baum-Sessions (JSONL, optional SQLite)
   ├── sepp-plugin     Guest-SDK für WASM-Plugins (Ziel wasm32; + sepp-plugin-macros für #[tool])
+  ├── sepp-pkg        Paketformat .seppkg: Manifest, Hash, Signatur (ring), Container (tar+zstd), Installation
   └── sepp-policy     Capabilities / Policy / Sepp Guard / Sandbox (Landlock, Seatbelt) / Secret-Broker
         ├── sepp-hooks  Rhai-Hook-Bus
         ├── sepp-wasm   WASM-Plugin-Host (wasmi); Vertrag: wit/sepp.wit
         └── sepp-mcp    MCP-Client als Tool-Quelle
 sepp-agent     Agent-Loop, Tool-Dispatch, Budget, Sub-Agenten (bindet alle sepp-*)
-sepp-cli       Frontends: TUI / One-shot / RPC; sepp init / policy / audit / plugin new
+sepp-cli       Frontends: TUI / One-shot / RPC; sepp init / policy / audit / plugin new / pkg
 ```
 
 ## Entwicklung
@@ -561,7 +623,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [x] `host_http` für WASM-Plugins als durchsetzender Proxy: Host-Allowlist je Anfrage, Secret-Broker, Audit, keine Redirects
 - [ ] Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
 - [x] Plugin-SDK `sepp-plugin`, das Speicher und Zeiger kapselt; Vertrag `wit/sepp.wit`; `sepp plugin new`
-- [ ] Paketformat und `sepp pkg install`
+- [x] Paketformat `.seppkg` (signiert, Rechte als Zustimmung) und `sepp pkg keygen | pack | install | list | remove`
+- [ ] Registry: `sepp pkg install <name>` gegen einen signierten Index
 
 ## Mitwirken
 
