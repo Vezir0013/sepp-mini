@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "schemars",
  "serde",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-plugin"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "schemars",
  "sepp-core",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-plugin-macros"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "proc-macro2",
  "quote",

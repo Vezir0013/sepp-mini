@@ -7,6 +7,8 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-06
+
 Drei Löcher im Zaun, alle an der Release-Binary nachgestellt, alle geschlossen. Gemeinsam ist
 ihnen: Der Guard entschied über etwas anderes, als danach wirkte — über einen Systempfad, der im
 eigenen Prozess mehr preisgab als in der Sandbox; über ein Verzeichnis, das die Rechte des
@@ -1239,7 +1241,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.1...v0.3.0
