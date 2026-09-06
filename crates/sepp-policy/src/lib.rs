@@ -295,36 +295,54 @@ fn covers(g: &Capability, r: &Capability) -> bool {
 }
 
 /// `*` matcht jeden Host; `*.example.com` matcht Subdomains (`api.example.com`), nicht den
-/// Apex; sonst exakt.
+/// Apex; sonst exakt. Hostnamen sind case-insensitiv (DNS) — `Api.Example.com` in der Policy
+/// trifft den Host `api.example.com`, den der Parser liefert.
 fn host_matches(pattern: &str, host: &str) -> bool {
     if pattern == "*" {
         return true;
     }
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
     match pattern.strip_prefix("*.") {
         Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
         None => pattern == host,
     }
 }
 
-/// Host einer http(s)-URL — ohne Schema, Userinfo, Port und Pfad.
+/// Host einer http(s)-URL — ohne Schema, Userinfo, Port und Pfad; Domains in Kleinschreibung,
+/// IPv6-Literale ohne Klammern.
 ///
 /// Reicht für das Net-Gate: [`Capability::Net`] kennt nur Hostnamen (exakt oder `*.suffix`).
 /// Andere Schemata liefern `None` — der Aufrufer lehnt sie ab. Genutzt vom MCP-Client
-/// (Secret-Header) und vom WASM-Host (`host_http`), deshalb hier und nicht in einem von beiden.
-pub fn url_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    // Userinfo abschneiden (`user:pass@host`).
-    let authority = authority.rsplit('@').next()?;
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        // IPv6-Literal: alles bis zur schließenden Klammer.
-        v6.split(']').next()?
-    } else {
-        authority.split(':').next()?
-    };
-    (!host.is_empty()).then_some(host)
+/// (Secret-Header), vom WASM-Host (`host_http`) und von der Schema-Regel der Registry, deshalb
+/// hier und nicht in einem von ihnen.
+///
+/// **Derselbe Parser wie der HTTP-Client.** Bis 0.5.0 zerlegte diese Funktion die URL von Hand
+/// (`rsplit('@')`), reqwest aber nach WHATWG: Für `https://evil.example\@api.example.com/x`
+/// sah die Policy `api.example.com`, verbunden wurde mit `evil.example` — samt eingesetztem
+/// Secret-Header. Jetzt entscheidet die `url`-Crate, die auch reqwest benutzt; zusätzlich wird
+/// eine URL mit Backslash vor dem Pfad oder mit Whitespace/Steuerzeichen (der Parser würde sie
+/// still umdeuten oder entfernen) gar nicht erst akzeptiert. Ein Aufrufer darf einen anderen
+/// Host als den hier gelieferten nie zu sehen bekommen — genau das war der Fehler.
+pub fn url_host(url: &str) -> Option<String> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    // `https:///x` liest der Parser als Host `x` — ein leerer Authority-Teil ist keine Adresse.
+    if authority.is_empty() || authority.contains('\\') {
+        return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    match parsed.host()? {
+        url::Host::Domain(d) => Some(d.to_ascii_lowercase()),
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
+    }
 }
 
 /// Vorgabe für [`Manifest::abi`]: ein Manifest ohne Angabe meint Version 1.
@@ -657,17 +675,86 @@ mod tests {
     #[test]
     fn url_host_strips_scheme_userinfo_port_and_path() {
         assert_eq!(
-            url_host("https://api.example.com/mcp"),
+            url_host("https://api.example.com/mcp").as_deref(),
             Some("api.example.com")
         );
         assert_eq!(
-            url_host("http://u:p@api.example.com:8443/x?y"),
+            url_host("http://u:p@api.example.com:8443/x?y").as_deref(),
             Some("api.example.com")
         );
-        assert_eq!(url_host("https://[::1]:8080/mcp"), Some("::1"));
+        assert_eq!(url_host("https://[::1]:8080/mcp").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("http://127.0.0.1:8765/index.toml").as_deref(),
+            Some("127.0.0.1")
+        );
         assert_eq!(url_host("api.example.com/mcp"), None, "ohne Schema");
         assert_eq!(url_host("ftp://api.example.com/x"), None, "fremdes Schema");
         assert_eq!(url_host("https:///mcp"), None, "leerer Host");
+    }
+
+    /// Der Host, den die Policy prüft, muss der sein, zu dem der Client verbindet. Die Fälle
+    /// hier sind die, in denen die Handzerlegung bis 0.5.0 vom WHATWG-Parser abwich.
+    #[test]
+    fn url_host_agrees_with_the_http_client_or_refuses() {
+        // Backslash: WHATWG liest `\` bei http(s) als `/` — Host wäre `evil.example`, die
+        // Handzerlegung sah `api.example.com`. Wird gar nicht erst akzeptiert.
+        assert_eq!(url_host("https://evil.example\\@api.example.com/x"), None);
+        assert_eq!(url_host("https://api.example.com\\x/"), None);
+        // Userinfo bis zum letzten `@`: hier stimmen beide überein, der Host ist der hintere.
+        assert_eq!(
+            url_host("https://api.example.com@evil.example/").as_deref(),
+            Some("evil.example")
+        );
+        // Tab/Newline: der Parser entfernt sie still — wir lehnen ab.
+        assert_eq!(url_host("https://evil.example\t@api.example.com/"), None);
+        assert_eq!(url_host("https://api.example.com/\n"), None);
+        // Groß-/Kleinschreibung: DNS ist case-insensitiv, der Parser liefert klein.
+        assert_eq!(
+            url_host("https://API.Example.COM/x").as_deref(),
+            Some("api.example.com")
+        );
+        // Prozent-kodierter Backslash bleibt Userinfo — beide Parser: `api.example.com`.
+        assert_eq!(
+            url_host("https://evil.example%5C@api.example.com/").as_deref(),
+            Some("api.example.com")
+        );
+        // Differenziell gegen die Crate, die reqwest benutzt.
+        for u in [
+            "https://api.example.com/",
+            "http://localhost:11434/v1",
+            "https://user:pw@h.example.com:8443/p?q#f",
+            "https://[2001:db8::1]/x",
+            "https://xn--mnchen-3ya.example/",
+        ] {
+            let theirs = url::Url::parse(u).unwrap();
+            let expect = match theirs.host().unwrap() {
+                url::Host::Domain(d) => d.to_string(),
+                url::Host::Ipv4(a) => a.to_string(),
+                url::Host::Ipv6(a) => a.to_string(),
+            };
+            assert_eq!(url_host(u).as_deref(), Some(expect.as_str()), "{u}");
+        }
+    }
+
+    #[test]
+    fn net_host_match_is_case_insensitive() {
+        let pol = Policy::new(vec![
+            Capability::Net {
+                host: "Api.Example.com".into(),
+            },
+            Capability::Net {
+                host: "*.Kanzlei.example".into(),
+            },
+        ]);
+        assert!(pol.allows(&Capability::Net {
+            host: "api.example.com".into()
+        }));
+        assert!(pol.allows(&Capability::Net {
+            host: "mail.kanzlei.example".into()
+        }));
+        assert!(!pol.allows(&Capability::Net {
+            host: "kanzlei.example".into()
+        }));
     }
 
     #[test]

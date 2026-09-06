@@ -305,7 +305,7 @@ pub async fn connect_with_policy(cfg: &McpServerConfig, policy: &Policy) -> Resu
                         cfg.name
                     ))
                 })?;
-                resolve_headers(cfg, host, policy, &broker)?
+                resolve_headers(cfg, &host, policy, &broker)?
             };
             let transport = StreamableHttpClientTransport::from_config(
                 StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers),

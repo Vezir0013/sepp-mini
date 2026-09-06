@@ -343,7 +343,7 @@ pub fn check_url_scheme(url: &str) -> Result<()> {
         return Err(SeppError::Config(format!("pkg: {url:?}: URL ohne Host")));
     }
     if url.starts_with("http://") {
-        if url_host(url).is_some_and(is_loopback) {
+        if url_host(url).is_some_and(|h| is_loopback(&h)) {
             return Ok(());
         }
         return Err(SeppError::Config(format!(

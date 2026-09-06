@@ -752,9 +752,14 @@ fn http_attempt(
         .map_err(|e| Refused::error(format!("host_http: ungültige Anfrage: {e}")))?;
     audit.insert("method".into(), Value::String(req.method.clone()));
 
-    let host = url_host(&req.url)
-        .ok_or_else(|| Refused::error("host_http: die URL ist keine http(s)-URL mit Host"))?
-        .to_string();
+    // Derselbe Host, den der Client ansteuert (`url_host` nutzt den Parser von reqwest) — für
+    // Allowlist, Secret-Gate und Spur. Eine URL, die der Parser umdeuten würde, ist keine.
+    let host = url_host(&req.url).ok_or_else(|| {
+        Refused::error(
+            "host_http: die URL ist keine http(s)-URL mit eindeutigem Host (Backslash, \
+             Whitespace oder Steuerzeichen sind nicht erlaubt)",
+        )
+    })?;
     audit.insert("host".into(), Value::String(host.clone()));
     audit.insert("url".into(), Value::String(audit_url(&req.url)));
     if !placeholder_names(&req.url).is_empty() {
