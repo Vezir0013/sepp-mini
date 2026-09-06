@@ -245,8 +245,9 @@ Wichtige Optionen: `-p/--print`, `-c/--continue`, `-r/--resume [id]`, `-m/--mode
 
 Standardmäßig liegt alles unter der einen Wurzel `~/.sepp/`. Für System-Installationen ist die Wurzel
 **FHS-fähig** getrennt in **config_root** (`settings.toml`, `skills/`, `prompts/`, `hooks/`,
-`plugins/`; via `$SEPP_CONFIG_DIR`, Default `/etc/sepp` im Systemfall) und **state_root** (`sessions/`,
-`trust.json`; via `$SEPP_STATE_DIR`, Default `/var/lib/sepp`). `SEPP_HOME` setzt beide zugleich.
+`plugins/`, `pkg/`; via `$SEPP_CONFIG_DIR`, Default `/etc/sepp` im Systemfall) und **state_root**
+(`sessions/`, `trust.json`, `pkg/` mit Nachweisen und Schlüsseln, `trusted-keys/`; via
+`$SEPP_STATE_DIR`, Default `/var/lib/sepp`). `SEPP_HOME` setzt beide zugleich.
 Projektlokale **Config**-Erweiterungen (`<repo>/.sepp/…`, nur skills/prompts/hooks/plugins/settings)
 laden erst, nachdem das Projekt **getrustet** wurde; Sessions/Trust liegen zentral im state_root.
 
@@ -264,7 +265,7 @@ Verzeichnisse bleiben unangetastet.
 | **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
 | **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]`; Rust-SDK `sepp-plugin` + `sepp plugin new` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/), Vertrag [`wit/sepp.wit`](./wit/sepp.wit) |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
-| **Pakete** | Skills, Prompts, Hooks und Plugins gebündelt, signiert; Rechte als Zustimmung bei der Installation | `sepp pkg install <datei.seppkg>` → `~/.sepp/pkg/<name>/`; Rechte als markierter Block in `policy.toml` |
+| **Pakete** | Skills, Prompts, Hooks und Plugins gebündelt, signiert; Rechte als Zustimmung bei der Installation | `sepp pkg install <datei.seppkg>` oder `sepp pkg install <name>` aus einer Registry (`[[registries]]` in `settings.toml`) → `~/.sepp/pkg/<name>/`; Rechte als markierter Block in `policy.toml` |
 
 Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
 
@@ -397,6 +398,28 @@ unangetastet. `sepp pkg list` zeigt Pakete und vertraute Herausgeber, `sepp pkg 
 nimmt Verzeichnis, Block und Nachweis wieder heraus. Nicht-interaktiv: `--yes`,
 `--trust-key <fingerprint>`, `--var NAME=WERT`.
 
+Aus einer **Registry** kommt ein Paket beim Namen. Die Registry ist ein signierter Index auf einem
+beliebigen Webspace, den du einmal in `~/.sepp/settings.toml` einträgst — samt Public Key des
+Betreibers, gepinnt, ohne Dialog:
+
+```toml
+[[registries]]
+name = "kionova"
+url = "https://pkg.example.com/index.toml"
+key = "<base64, 32 Byte — nennt der Betreiber>"
+```
+
+```bash
+sepp pkg search rechnung             # Index durchsuchen
+sepp pkg install rechnungspruefung   # höchste Version — oder rechnungspruefung@1.0.0
+sepp pkg untrust acme                # Vertrauen in einen Herausgeber zurücknehmen
+```
+
+Das Paket wird gedeckelt und gehasht geladen und geht dann exakt denselben Weg wie eine Datei:
+Signatur, Fingerprint, Zustimmung — der Dialog nennt zusätzlich Registry und URL, und der
+Herausgeber-Schlüssel aus dem Index muss zum Paket passen. Ein Index nennt Pakete, er gewährt
+nichts. Netz gibt es nur hier: `https://` immer, `http://` nur für localhost.
+
 ### Ein Paket bauen
 
 ```bash
@@ -427,6 +450,19 @@ net = ["api.example.com"]
 `pack` berechnet SHA-256 je Datei, trägt `[files]` ein, signiert das Manifest mit Ed25519 und
 packt reproduzierbar (zstd-komprimiertes tar). Der Vertrag des Formats steht in
 `crates/sepp-pkg/src/lib.rs`.
+
+### Eine Registry betreiben
+
+```bash
+sepp pkg keygen --registry            # Betreiber-Schlüsselpaar: ~/.sepp/pkg/registry.key|.pub
+sepp pkg index ./site --name kionova  # index.toml + index.sig neben die .seppkg-Dateien in ./site
+```
+
+`index` prüft jedes Paket wie der Installer, schreibt je Eintrag Name, Version, Herausgeber samt
+Schlüssel, URL (relativ zum Index oder mit `--base-url` absolut), SHA-256 und Größe, signiert den
+Index und gibt den fertigen `[[registries]]`-Eintrag aus, den Nutzer übernehmen. Ausliefern
+heißt: das Verzeichnis auf einen Webspace legen — GitHub Pages, ein Release, ein Ordner hinter
+nginx. Der Vertrag des Index steht in `crates/sepp-pkg/src/registry.rs`.
 
 ## Sicherheitsmodell
 
@@ -580,7 +616,7 @@ sepp-core      Typen + reine Logik (kein I/O, kein tokio)
   ├── sepp-tools      built-in Tools read/write/edit/bash (unter Sepp Guard) + Truncation
   ├── sepp-session    Baum-Sessions (JSONL, optional SQLite)
   ├── sepp-plugin     Guest-SDK für WASM-Plugins (Ziel wasm32; + sepp-plugin-macros für #[tool])
-  ├── sepp-pkg        Paketformat .seppkg: Manifest, Hash, Signatur (ring), Container (tar+zstd), Installation
+  ├── sepp-pkg        Paketformat .seppkg: Manifest, Hash, Signatur (ring), Container (tar+zstd), Installation, Registry-Index
   └── sepp-policy     Capabilities / Policy / Sepp Guard / Sandbox (Landlock, Seatbelt) / Secret-Broker
         ├── sepp-hooks  Rhai-Hook-Bus
         ├── sepp-wasm   WASM-Plugin-Host (wasmi); Vertrag: wit/sepp.wit

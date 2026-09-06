@@ -7,6 +7,75 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Ein Index nennt Pakete, er gewährt nichts. Bis jetzt kam ein Paket als Datei — per Mail, Download,
+USB-Stick — und `sepp pkg install <datei>` prüfte es. Ab jetzt reicht der Name:
+`sepp pkg install rechnungspruefung` holt das Paket aus einer **Registry**, einem signierten Index
+auf einem beliebigen Webspace, den der Nutzer einmal in seiner `settings.toml` einträgt — samt
+Public Key des Betreibers, gepinnt, ohne Dialog. Zwei Lagen Vertrauen: der Betreiber bürgt für die
+Liste, der Herausgeber für das Paket. Alles, was Stufe 4 beim Paket prüft (Signatur, TOFU,
+Zustimmung, Kollisionen, Hash je Datei), prüft es hier genauso, weil das geladene Paket exakt den
+Weg einer Datei geht. Netz gibt es nur in `sepp pkg`, außerhalb des Guard — eine Handlung des
+Nutzers wie `install.sh` — und nie in `sepp-pkg`, das ohne Netz und ohne async bleibt.
+
+### Hinzugefügt
+- **Registry-Index (Format 1):** `index.toml` mit `[[packages]]` (Name, Version, Beschreibung,
+  Herausgeber samt Schlüssel, URL, SHA-256, Größe) und `index.sig` (Ed25519 über die rohen
+  Index-Bytes, base64) neben den `.seppkg`-Dateien — statischer Webspace genügt. Prüfreihenfolge
+  fail-closed: Größe → Signatur gegen den gepinnten Schlüssel → Text → Struktur. Unbekannte
+  Felder werden gemeldet, nicht abgelehnt; mehrere Versionen je Name sind erlaubt.
+- **`[[registries]]` in der globalen `settings.toml`** (`name`, `url`, `key`) — bewusst nicht
+  projektlokal: Ein Repo darf per Trust keine Paketquelle mit eigenem Schlüssel einschleusen.
+  `sepp init` schreibt ein auskommentiertes Beispiel. Schema-Regel für jede URL, auch für jedes
+  Redirect-Ziel: `https://` immer, `http://` nur für `localhost`, `127.0.0.1`, `::1`.
+- **`sepp pkg install <name>[@version]`** (`--registry <name>` wählt eine): Registries in
+  Konfigurationsreihenfolge fragen, höchste oder exakte Version; das Paket gestreamt nach
+  `<state_root>/pkg/.downloads/` laden — gedeckelt auf die Größe aus dem Index, gehasht beim
+  Schreiben, bei Abweichung sofort weg — dann der Weg von `install <datei>`, plus: der
+  Herausgeber-Schlüssel aus dem Index muss zum Paket passen (vor jedem Dialog), und die
+  Zustimmung zeigt „Quelle: Registry … · URL". Die geladene Datei verschwindet nach jedem Ausgang.
+- **`sepp pkg search [text]`**: Treffer aller (oder einer) Registries als Tabelle, je Name die
+  höchste Version, installierte markiert.
+- **`sepp pkg untrust <herausgeber>`**: nimmt das TOFU-Vertrauen zurück; installierte Pakete
+  bleiben und werden genannt, beim nächsten Paket wird der Fingerprint neu bestätigt.
+- **Betreiber-Werkzeuge:** `sepp pkg keygen --registry` (eigenes Schlüsselpaar `registry.key`/
+  `.pub`, getrennt vom Herausgeber-Schlüssel) und `sepp pkg index <dir> [--out] [--name]
+  [--base-url] [--key]`, das jedes `.seppkg` wie der Installer prüft, `index.toml` + `index.sig`
+  reproduzierbar baut (bis auf `generated_at`) und den fertigen `[[registries]]`-Eintrag für die
+  Nutzer ausgibt. Nie über vorhandene Dateien hinweg.
+- **`sepp-pkg::registry`** mit der `Fetcher`-Abstraktion (eine Methode, `fetch_to_writer`): Deckel,
+  Hash und Aufräumen liegen einmal im Crate und sind ohne Netz testbar. Das CLI stellt den
+  HTTP-Fetcher (`pkg_fetch.rs`) auf eigener Runtime: Verbindungs- und Lese-Timeout, User-Agent,
+  Deckel vor dem Puffern und beim Streamen, höchstens fünf Weiterleitungen und nur auf Ziele nach
+  der Schema-Regel.
+- **`installed.json` kennt die Quelle** (`source`: `datei` oder `registry:<name>`; `sepp pkg list`
+  zeigt sie in der Spalte QUELLE) und führt unbekannte Felder mit, statt sie beim nächsten
+  Schreiben zu verlieren.
+
+### Geändert
+- Fehlertexte, die bisher rieten, „die Datei zu löschen" (anderer Schlüssel unter bekanntem
+  Namen, Hinweis nach `remove`), nennen jetzt `sepp pkg untrust <name>`.
+- `sepp pkg` spricht für `install <name>` und `search` mit dem Netz — außerhalb des Guard, ohne
+  Audit, wie `install.sh`; Proxy-Variablen der Umgebung gelten. Alle anderen Unterbefehle bleiben
+  ohne Netz und ohne Runtime.
+- Ein 0.4.0-`sepp` liest `installed.json` mit `source` weiter, verwirft das Feld aber beim
+  nächsten Schreiben — informativ, kein Sicherheitsverlust.
+
+### Tests
+- `sepp-pkg`: Index (parsen, unbekannte Felder, je kaputtem Feld eine Ablehnung, Signatur
+  manipuliert/falscher Schlüssel/zu groß, doppelte Einträge), Auflösung (höchste, exakte,
+  fehlende Version), Suche, URL-Regeln (relativ, absolut, `..`, Query, Fragment, Loopback),
+  `[[registries]]` (fehlende Datei, Doppelname, kaputter Schlüssel, http ohne Loopback, Query),
+  Index bauen (reproduzierbar, sortiert, verifiziert, `--base-url`, kaputtes Paket, leer),
+  Laden mit Fake-Fetcher (Hash, Größe, Aufräumen, 0700); `untrust`, Quelle im Nachweis, alte
+  Nachweise laden, fremde Felder überleben.
+- `sepp-cli`: HTTP-Fetcher gegen lokale Listener (Body, User-Agent, Weiterleitungen bis zum
+  Limit, Weiterleitung auf `http://` außerhalb Loopback ohne Verbindung abgelehnt, Content-Length
+  und Body über dem Deckel, 404, Schema-Regel vor jeder Anfrage); **End-to-End** ohne wasm32:
+  packen → Index bauen → statischer Server auf 127.0.0.1 → `install demo` mit vorweggenommenen
+  Antworten → Nachweis, Policy-Block, leeres `.downloads/`; `search`; Negativfälle (nicht im
+  Index, fremde Registry, keine Registry, fremder Index-Schlüssel, manipuliertes Paket, gleiche
+  Version); `index` schreibt beide Dateien und überschreibt nie; Parser-Formen.
+
 ## [0.4.0] - 2026-09-06
 
 Ein Paket bringt keine Rechte mit — es bittet um sie. Bis jetzt hieß „eine Erweiterung
