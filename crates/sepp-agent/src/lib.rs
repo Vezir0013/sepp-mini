@@ -74,8 +74,10 @@ pub struct AuditRecord {
 pub type AuditSource = Arc<dyn Fn() -> Vec<AuditRecord> + Send + Sync>;
 
 /// Reservierter Schlüssel in `ToolResult.details`: ein Objekt mit `kind` (String) wird vom Loop
-/// als eigener Audit-Eintrag in die Session geschrieben.
-pub const AUDIT_DETAIL_KEY: &str = "audit";
+/// als eigener Audit-Eintrag in die Session geschrieben. Definiert im Vertrag
+/// ([`sepp_core::AUDIT_DETAIL_KEY`]), damit jede Stelle, die fremde Ergebnisse annimmt, denselben
+/// Namen kennt — hier nur re-exportiert.
+pub use sepp_core::AUDIT_DETAIL_KEY;
 
 /// Ein während des Streams aufgesammelter Tool-Call.
 struct PendingCall {

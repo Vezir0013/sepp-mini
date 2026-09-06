@@ -14,4 +14,7 @@ pub use message::{ContentBlock, ImageSource, Message, Role, Usage};
 pub use model::{Model, ThinkingLevel};
 #[cfg(feature = "schema")]
 pub use tool::schema_for;
-pub use tool::{is_valid_tool_name, sanitize_tool_name, ToolResult, ToolSpec, MAX_TOOL_NAME_LEN};
+pub use tool::{
+    is_valid_tool_name, sanitize_tool_name, ToolResult, ToolSpec, AUDIT_DETAIL_KEY,
+    GUARD_DETAIL_KEY, MAX_TOOL_NAME_LEN, RESERVED_DETAIL_KEYS,
+};

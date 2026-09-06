@@ -16,7 +16,50 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// Der für den **Host** reservierte Schlüssel in [`ToolResult::details`] für die Audit-Spur.
+///
+/// Ein Objekt darunter mit einem String-Feld `kind` wird vom Agent-Loop als eigener Eintrag in
+/// die Session geschrieben — das ist der Nachweis, was während eines Turns entschieden und getan
+/// wurde. Ein Nachweis, den der Beobachtete selbst schreiben kann, ist keiner.
+pub const AUDIT_DETAIL_KEY: &str = "audit";
+
+/// Der für den **Host** reservierte Schlüssel in [`ToolResult::details`] für die
+/// Guard-Entscheidung dieses Aufrufs (`sepp_tools::with_guard_details`).
+pub const GUARD_DETAIL_KEY: &str = "guard";
+
+/// Die Schlüssel in `details`, die dem Host gehören — die eine Liste, gegen die Ergebnisse aus
+/// fremder Hand gesäubert werden ([`ToolResult::strip_reserved_details`]).
+///
+/// Warum eine Liste und nicht nur der Audit-Schlüssel: Dass ein gefälschtes `details["guard"]`
+/// heute nichts bewirkt, liegt allein daran, dass es niemand ausliest. Genau diese Konstellation
+/// war der Fehler bei `audit` — der Host besaß den Schlüssel nur manchmal, der Loop las ihn
+/// immer. Ein Namensraum, der als Ganzes dem Host gehört, hält auch dann, wenn später jemand
+/// einen dieser Schlüssel zu lesen beginnt.
+pub const RESERVED_DETAIL_KEYS: &[&str] = &[AUDIT_DETAIL_KEY, GUARD_DETAIL_KEY];
+
 impl ToolResult {
+    /// Nimmt fremden `details` alle [`RESERVED_DETAIL_KEYS`] und liefert die, die gesetzt waren.
+    ///
+    /// Für Ergebnisse aus **fremder Hand** (WASM-Plugin, MCP-Server): Deren `details` sind freies
+    /// JSON. Wer einen reservierten Schlüssel selbst setzt, schriebe sonst einen Nachweis, den
+    /// niemand erbracht hat — mit beliebigem `kind`. Der Host füllt ihn danach selbst, wenn er
+    /// etwas zu melden hat. Die eingebauten Werkzeuge und der Sub-Agent dürfen ihn setzen; ihr
+    /// Code steht in diesem Repo und ist keine fremde Hand.
+    ///
+    /// Andere Felder des Werkzeugs überleben unverändert. Ein `details`, das kein Objekt ist
+    /// (`Null`, Zahl, Liste), bleibt unangetastet — dort kann sich nichts verstecken, weil der
+    /// Loop nur auf der obersten Ebene nachsieht.
+    pub fn strip_reserved_details(&mut self) -> Vec<&'static str> {
+        let serde_json::Value::Object(map) = &mut self.details else {
+            return Vec::new();
+        };
+        RESERVED_DETAIL_KEYS
+            .iter()
+            .filter(|k| map.remove(**k).is_some())
+            .copied()
+            .collect()
+    }
+
     /// Erfolgreiches Text-Ergebnis.
     pub fn text(text: impl Into<String>) -> Self {
         ToolResult {
@@ -103,6 +146,43 @@ pub fn schema_for<T: schemars::JsonSchema>() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Der reservierte Namensraum gehört dem Host — fremde Ergebnisse verlieren ihn, alles
+    /// andere bleibt, wie das Werkzeug es geliefert hat.
+    #[test]
+    fn strip_reserved_details_removes_host_keys_and_keeps_the_rest() {
+        let mut r = ToolResult::text("x").with_details(json!({
+            "audit": { "kind": "guard", "decision": "allow" },
+            "guard": { "erfunden": true },
+            "words": 3,
+            "nested": { "audit": "bleibt, das ist nicht die oberste Ebene" }
+        }));
+        assert_eq!(r.strip_reserved_details(), vec!["audit", "guard"]);
+        assert_eq!(r.details["words"], 3);
+        assert!(r.details.get("audit").is_none(), "{}", r.details);
+        assert!(r.details.get("guard").is_none(), "{}", r.details);
+        assert_eq!(
+            r.details["nested"]["audit"],
+            "bleibt, das ist nicht die oberste Ebene"
+        );
+        // Zweimal ist kein Fehler, meldet aber nichts mehr.
+        assert!(r.strip_reserved_details().is_empty());
+    }
+
+    /// Saubere `details` und alles, was kein Objekt ist, bleiben unangetastet — unter einer
+    /// Liste oder einer Zahl kann sich kein reservierter Schlüssel verstecken.
+    #[test]
+    fn strip_reserved_details_leaves_clean_and_non_object_details_alone() {
+        let mut plain = ToolResult::text("x").with_details(json!({ "words": 1 }));
+        assert!(plain.strip_reserved_details().is_empty());
+        assert_eq!(plain.details, json!({ "words": 1 }));
+        for v in [json!(null), json!(42), json!("audit"), json!(["audit"])] {
+            let mut r = ToolResult::text("x").with_details(v.clone());
+            assert!(r.strip_reserved_details().is_empty());
+            assert_eq!(r.details, v);
+        }
+    }
 
     #[test]
     fn valid_names_are_accepted() {

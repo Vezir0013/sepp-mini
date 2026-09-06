@@ -8,6 +8,23 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 ## [Unreleased]
 
 ### Behoben
+- **Ein Werkzeug konnte sich seinen eigenen Nachweis schreiben.** Der Agent-Loop übernimmt ein
+  Objekt unter `details["audit"]` mit einem `kind`-Feld als Session-Eintrag — das ist der
+  Nachweis, was in einem Turn entschieden wurde. Ein WASM-Plugin und ein MCP-Server liefern ihr
+  Ergebnis aber als fremdes JSON und durften diesen Schlüssel setzen: Beide konnten sich eine
+  Guard-Entscheidung erfinden, die in `sepp audit` von einer echten nicht zu unterscheiden war
+  und die `/tree` als Guard-Eintrag sogar ausblendet. Beim Plugin griff der Host nur, wenn im
+  selben Aufruf eine HTTP-Anfrage lief; ohne Netz blieb der gefälschte Eintrag unangetastet.
+  Reserviert ist jetzt ein **Namensraum** statt eines Schlüssels: `audit` und `guard` gehören dem
+  Host, stehen im Vertrag (`sepp_core::RESERVED_DETAIL_KEYS`, dazu
+  `ToolResult::strip_reserved_details`) und werden an jeder Grenze entfernt, an der fremdes JSON
+  zu einem Ergebnis wird — im WASM-Host direkt nach dem Einlesen, im MCP-Client beim Bau des
+  Ergebnisses. Dass ein gefälschtes `details["guard"]` heute nichts bewirkt, liegt allein daran,
+  dass es niemand ausliest; genau diese Konstellation war der Fehler bei `audit`. Die übrigen
+  Felder des Werkzeugs bleiben unberührt, der Versuch wird geloggt und beim Plugin zusätzlich im
+  Audit-Eintrag des Hosts vermerkt (`stripped_plugin_keys`), und kein Werkzeug fällt deshalb aus.
+  Die eingebauten Werkzeuge und der Sub-Agent dürfen die Schlüssel weiter setzen; ihr Code steht
+  in diesem Repo.
 - **Ein Abbruch mitten im Werkzeug machte die Sitzung unbrauchbar.** Esc oder Ctrl+C während
   `bash` lief, ließ die Assistant-Nachricht mit dem `tool_use` in der Session zurück, ohne ein
   `tool_result` dazu — jeder Anbieter lehnt den nächsten Request damit ab (Anthropic 400
@@ -68,6 +85,12 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   Platzhalter statt ein leeres Ergebnis zu liefern. Das Session-Format bleibt unverändert.
 
 ### Tests
+- `sepp-core`: der reservierte Namensraum verschwindet aus fremden `details`, verschachtelte
+  `audit`-Felder und alles, was kein Objekt ist, bleiben unberührt.
+- `sepp-wasm`: ein Plugin ohne HTTP-Anfrage, das `details["audit"]` mit `kind = "guard"` und
+  `details["guard"]` liefert, bekommt beide entzogen und funktioniert weiter.
+- `sepp-mcp`: erste Testabdeckung der Ergebnis-Abbildung überhaupt (dafür als reine Funktion
+  herausgezogen) — gefälschter Audit-Schlüssel weg, Text/Bild/`is_error`/Fallback unverändert.
 - `sepp-agent`: Abbruch im Werkzeug → Verlauf mit Fehler-Ergebnis vollständig, Store gleich,
   nächster Prompt läuft; Panik im Werkzeug → Fehler-Ergebnis statt verlorenem Turn;
   Compaction nach einem großen Werkzeug-Ergebnis mitten im Loop; Zusammenfassung mit

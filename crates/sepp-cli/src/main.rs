@@ -1920,10 +1920,12 @@ mod tests {
     }
 
     /// Der WASM-Host legt seine Audit-Spur unter demselben `details`-Schlüssel ab, den der
-    /// Agent ausliest — die beiden Crates kennen sich nicht, deshalb hier der Abgleich.
+    /// Agent ausliest. Seit 0.5.2 kommt er aus einer Quelle (`sepp-core`) — der Abgleich bleibt
+    /// trotzdem stehen: Er schlägt an, sobald jemand wieder eine eigene Konstante einführt.
     #[test]
     fn wasm_host_and_agent_agree_on_the_audit_detail_key() {
         assert_eq!(sepp_wasm::AUDIT_DETAIL_KEY, sepp_agent::AUDIT_DETAIL_KEY);
+        assert_eq!(sepp_wasm::AUDIT_DETAIL_KEY, sepp_core::AUDIT_DETAIL_KEY);
     }
 
     #[test]

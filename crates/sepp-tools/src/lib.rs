@@ -103,7 +103,7 @@ pub(crate) fn with_guard_details(mut result: ToolResult, audit: Option<Value>) -
             result.details = json!({});
         }
         if let Some(obj) = result.details.as_object_mut() {
-            obj.insert("guard".into(), a);
+            obj.insert(sepp_core::GUARD_DETAIL_KEY.into(), a);
         }
     }
     result
