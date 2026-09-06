@@ -1852,6 +1852,7 @@ dependencies = [
  "directories",
  "futures",
  "ratatui",
+ "reqwest 0.12.28",
  "sepp-agent",
  "sepp-core",
  "sepp-hooks",

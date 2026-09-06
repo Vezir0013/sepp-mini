@@ -175,6 +175,13 @@ pub fn settings_paths(project_trusted: bool) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Die `settings.toml`, aus der `[[registries]]` gelesen wird — **nur die globale**. Anders als
+/// [`settings_paths`] bewusst ohne die projektlokale Datei: Ein Repo darf per Trust keine
+/// Paketquelle mit eigenem Schlüssel einschleusen.
+pub fn registries_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("settings.toml"))
+}
+
 /// WASM-Plugin-Verzeichnisse (`<config_root>/plugins`, dann `pkg/*/plugins`): global immer,
 /// projektlokal nur nach Trust. `settings.toml` bekommt bewusst **keine** Paketpfade: Ein Paket
 /// bringt keine Konfigurationsquelle mit, es liefert Inhalte.

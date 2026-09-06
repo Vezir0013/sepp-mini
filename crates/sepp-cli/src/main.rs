@@ -9,6 +9,7 @@
 
 mod audit_cmd;
 mod pkg_cmd;
+mod pkg_fetch;
 mod plugin_cmd;
 mod policy_cmd;
 mod session;
@@ -64,7 +65,8 @@ enum Cmd {
     Audit(audit_cmd::AuditArgs),
     /// `sepp plugin new <name>` — Gerüst für ein WASM-Plugin mit dem SDK `sepp-plugin`.
     Plugin(plugin_cmd::PluginCmd),
-    /// `sepp pkg keygen | pack | install | list | remove` — Pakete bauen und installieren.
+    /// `sepp pkg keygen | pack | install | search | list | remove | untrust | index` — Pakete
+    /// bauen, finden, installieren; eine Registry betreiben.
     Pkg(pkg_cmd::PkgCmd),
     Run(RunOpts),
 }
@@ -110,7 +112,8 @@ fn main() -> ExitCode {
         Ok(Cmd::Audit(a)) => audit_cmd::run_audit(a),
         // Ein Gerüst schreiben ist reines fs — ebenfalls ohne Runtime.
         Ok(Cmd::Plugin(c)) => plugin_cmd::run_plugin(c),
-        // Pakete: fs, Krypto, Dialoge über stderr/stdin — kein Netz, keine Runtime.
+        // Pakete: fs, Krypto, Dialoge über stderr/stdin. Netz nur für `install <name>` und
+        // `search`, und dann mit eigener Runtime im Fetcher (pkg_fetch.rs) — hier keine.
         Ok(Cmd::Pkg(c)) => pkg_cmd::run_pkg(c),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
@@ -339,10 +342,12 @@ fn print_help() {
          \x20                           Sub-Agenten (ohne id: jüngste; --json, --no-children)\n\
          \x20 sepp plugin new <name>    Gerüst für ein WASM-Plugin mit dem SDK sepp-plugin anlegen\n\
          \x20                           (--dir <pfad>; --sdk-path <pfad> statt Git-Tag)\n\
-         \x20 sepp pkg install <datei>  Paket (.seppkg) installieren: Signatur prüfen, Rechte zeigen,\n\
-         \x20                           zustimmen (--yes, --trust-key <fp>, --var NAME=WERT)\n\
-         \x20 sepp pkg list | remove <n>  Installierte Pakete zeigen bzw. entfernen\n\
+         \x20 sepp pkg install <datei|name[@version]>  Paket aus Datei oder Registry (--registry <n>) installieren:\n\
+         \x20                           Signatur prüfen, Rechte zeigen, zustimmen (--yes, --trust-key <fp>, --var NAME=WERT)\n\
+         \x20 sepp pkg search [text]    Pakete in den Registries finden ([[registries]] in settings.toml)\n\
+         \x20 sepp pkg list | remove <n> | untrust <herausgeber>  Pakete zeigen, entfernen, Vertrauen zurücknehmen\n\
          \x20 sepp pkg keygen | pack <dir>  Paket bauen: Schlüssel anlegen, Verzeichnis signieren und packen\n\
+         \x20 sepp pkg keygen --registry | index <dir>  Registry betreiben: Betreiber-Schlüssel, signierten Index bauen\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -430,6 +435,14 @@ const SETTINGS_TEMPLATE: &str = r#"# sepp mini — globale Einstellungen (~/.sep
 # mode = "ask"
 # [policy.agent]
 # net = true
+#
+# Paketquelle für `sepp pkg install <name>` und `sepp pkg search` — nur hier, nicht projektlokal.
+# `key` ist der Public Key des Betreibers; `sepp pkg index` bzw. `keygen --registry` zeigt den
+# fertigen Eintrag. Der Index ist damit gepinnt, die Pakete darin prüft `install` wie eine Datei.
+# [[registries]]
+# name = "kionova"
+# url = "https://pkg.example.com/index.toml"
+# key = "<base64, 32 Byte>"
 "#;
 
 /// `sepp init [--global|--system]` — legt das Konfig-Skelett samt kommentierter Beispiel-

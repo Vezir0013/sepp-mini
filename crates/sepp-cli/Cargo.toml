@@ -34,6 +34,8 @@ sepp-wasm = { path = "../sepp-wasm" }
 sepp-pkg = { path = "../sepp-pkg" }
 
 serde_json = { workspace = true }
+# `sepp pkg install <name>` / `search`: Index und Paket per HTTPS holen (eigene Runtime, pkg_fetch.rs)
+reqwest = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
