@@ -135,19 +135,31 @@ pub fn project_session_dir() -> Result<PathBuf> {
         .join(format!("{:016x}", h.finish())))
 }
 
+/// Die Wurzeln installierter Pakete (`<config_root>/pkg/<name>`), alphabetisch. Ein Paket ist
+/// für die Loader eine Wurzel wie jede andere — deshalb ändert sich an ihnen nichts. Die Regel,
+/// was ein Paketverzeichnis ist (kein `.`-Präfix, nur Verzeichnisse), liegt in `sepp-pkg`.
+pub fn pkg_roots() -> Result<Vec<PathBuf>> {
+    Ok(sepp_pkg::package_dirs_in(&config_root()?.join("pkg")))
+}
+
 /// Resource-Wurzeln (jede enthält optional `skills/`, `prompts/`, `themes/`): global immer,
-/// projektlokal nur, wenn das Projekt vertraut ist.
+/// dann die Pakete, projektlokal nur, wenn das Projekt vertraut ist. Die Reihenfolge ist
+/// inhaltlich: Bei gleichnamigen Prompts gewinnt der erste Treffer — also der des Nutzers vor
+/// dem eines Pakets.
 pub fn resource_roots(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut roots = vec![config_root()?];
+    roots.extend(pkg_roots()?);
     if project_trusted {
         roots.push(project_root()?);
     }
     Ok(roots)
 }
 
-/// Hook-Verzeichnisse (`<config_root>/hooks`): global immer, projektlokal nur nach Trust.
+/// Hook-Verzeichnisse (`<config_root>/hooks`, dann `pkg/*/hooks`): global immer, projektlokal
+/// nur nach Trust. Paket-Hooks laufen nach denen des Nutzers.
 pub fn hook_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![config_root()?.join("hooks")];
+    dirs.extend(pkg_roots()?.into_iter().map(|r| r.join("hooks")));
     if project_trusted {
         dirs.push(project_root()?.join("hooks"));
     }
@@ -163,9 +175,12 @@ pub fn settings_paths(project_trusted: bool) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// WASM-Plugin-Verzeichnisse (`<config_root>/plugins`): global immer, projektlokal nur nach Trust.
+/// WASM-Plugin-Verzeichnisse (`<config_root>/plugins`, dann `pkg/*/plugins`): global immer,
+/// projektlokal nur nach Trust. `settings.toml` bekommt bewusst **keine** Paketpfade: Ein Paket
+/// bringt keine Konfigurationsquelle mit, es liefert Inhalte.
 pub fn plugin_dirs(project_trusted: bool) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![config_root()?.join("plugins")];
+    dirs.extend(pkg_roots()?.into_iter().map(|r| r.join("plugins")));
     if project_trusted {
         dirs.push(project_root()?.join("plugins"));
     }

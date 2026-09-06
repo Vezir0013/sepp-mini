@@ -8,6 +8,7 @@
 //! Oberfläche zerstören).
 
 mod audit_cmd;
+mod pkg_cmd;
 mod plugin_cmd;
 mod policy_cmd;
 mod session;
@@ -63,6 +64,8 @@ enum Cmd {
     Audit(audit_cmd::AuditArgs),
     /// `sepp plugin new <name>` — Gerüst für ein WASM-Plugin mit dem SDK `sepp-plugin`.
     Plugin(plugin_cmd::PluginCmd),
+    /// `sepp pkg keygen | pack | install | list | remove` — Pakete bauen und installieren.
+    Pkg(pkg_cmd::PkgCmd),
     Run(RunOpts),
 }
 
@@ -107,6 +110,8 @@ fn main() -> ExitCode {
         Ok(Cmd::Audit(a)) => audit_cmd::run_audit(a),
         // Ein Gerüst schreiben ist reines fs — ebenfalls ohne Runtime.
         Ok(Cmd::Plugin(c)) => plugin_cmd::run_plugin(c),
+        // Pakete: fs, Krypto, Dialoge über stderr/stdin — kein Netz, keine Runtime.
+        Ok(Cmd::Pkg(c)) => pkg_cmd::run_pkg(c),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
             eprintln!("Fehler: {e}\n");
@@ -151,6 +156,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         }
         Some("plugin") => {
             return plugin_cmd::parse_plugin_args(&args[1..]).map(Cmd::Plugin);
+        }
+        Some("pkg") => {
+            return pkg_cmd::parse_pkg_args(&args[1..]).map(Cmd::Pkg);
         }
         _ => {}
     }
@@ -331,6 +339,10 @@ fn print_help() {
          \x20                           Sub-Agenten (ohne id: jüngste; --json, --no-children)\n\
          \x20 sepp plugin new <name>    Gerüst für ein WASM-Plugin mit dem SDK sepp-plugin anlegen\n\
          \x20                           (--dir <pfad>; --sdk-path <pfad> statt Git-Tag)\n\
+         \x20 sepp pkg install <datei>  Paket (.seppkg) installieren: Signatur prüfen, Rechte zeigen,\n\
+         \x20                           zustimmen (--yes, --trust-key <fp>, --var NAME=WERT)\n\
+         \x20 sepp pkg list | remove <n>  Installierte Pakete zeigen bzw. entfernen\n\
+         \x20 sepp pkg keygen | pack <dir>  Paket bauen: Schlüssel anlegen, Verzeichnis signieren und packen\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -501,7 +513,7 @@ fn run_init(scope: session::InitScope) -> ExitCode {
 /// gelesen.
 fn init_config_at(root: &Path, preset: Option<policy_cmd::Preset>) -> anyhow::Result<()> {
     ensure_dir(root)?;
-    for sub in ["skills", "prompts", "hooks", "plugins"] {
+    for sub in ["skills", "prompts", "hooks", "plugins", "pkg"] {
         ensure_dir(&root.join(sub))?;
     }
     let settings = root.join("settings.toml");
@@ -528,11 +540,27 @@ fn init_config_at(root: &Path, preset: Option<policy_cmd::Preset>) -> anyhow::Re
     Ok(())
 }
 
-/// Legt die **State**-Wurzel an (`sessions/`). Bei `restrictive` (System-Installation) wird der
-/// State-Root auf `0700` gesetzt — hier landen künftig Trust und `auth.json`.
+/// Legt die **State**-Wurzel an (`sessions/`, `pkg/`, `trusted-keys/`). Bei `restrictive`
+/// (System-Installation) wird der State-Root auf `0700` gesetzt; `pkg/` (Nachweise, eigener
+/// Signierschlüssel) und `trusted-keys/` (Herausgeber) sind **immer** `0700` — Schlüssel sind
+/// auch im Nutzer-Home schutzwürdig.
 fn init_state_at(root: &Path, restrictive: bool) -> anyhow::Result<()> {
     ensure_dir(root)?;
     ensure_dir(&root.join("sessions"))?;
+    for private in ["pkg", "trusted-keys"] {
+        let dir = root.join(private);
+        let existed = dir.is_dir();
+        sepp_policy::fsutil::ensure_private_dir(&dir)?;
+        println!(
+            "{}: {}",
+            if existed {
+                "übersprungen (existiert)"
+            } else {
+                "angelegt (0700)"
+            },
+            dir.display()
+        );
+    }
     #[cfg(unix)]
     if restrictive {
         use std::os::unix::fs::PermissionsExt;
@@ -1672,7 +1700,7 @@ mod tests {
         init_config_at(&root, None).unwrap();
         let settings = root.join("settings.toml");
         let first = std::fs::read_to_string(&settings).unwrap();
-        for sub in ["skills", "prompts", "hooks", "plugins"] {
+        for sub in ["skills", "prompts", "hooks", "plugins", "pkg"] {
             assert!(root.join(sub).is_dir(), "{sub} sollte existieren");
         }
         // Config-only: KEIN sessions/ (zentral im state_root) und KEINE .gitignore mehr.
@@ -1790,6 +1818,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_pkg_subcommand_only_first_arg() {
+        assert!(matches!(
+            parse(&args(&["pkg", "list"])).unwrap(),
+            Cmd::Pkg(pkg_cmd::PkgCmd::List)
+        ));
+        assert!(matches!(
+            parse(&args(&["pkg", "install", "x.seppkg", "--yes"])).unwrap(),
+            Cmd::Pkg(pkg_cmd::PkgCmd::Install { yes: true, .. })
+        ));
+        assert!(parse(&args(&["pkg"])).is_err());
+        assert!(parse(&args(&["pkg", "bogus"])).is_err());
+        // Nicht erstes Token → Prompt, damit `sepp -p "pkg …"` weiter funktioniert.
+        let cmd = parse(&args(&["-p", "pkg"])).unwrap();
+        assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "pkg"));
+    }
+
+    #[test]
     fn parse_plugin_subcommand_only_first_arg() {
         assert!(matches!(
             parse(&args(&["plugin", "new", "demo"])).unwrap(),
@@ -1812,6 +1857,20 @@ mod tests {
             root.join("sessions").is_dir(),
             "sessions/ sollte existieren"
         );
+        // Nachweise und Schlüssel: immer privat, auch ohne `restrictive`.
+        for private in ["pkg", "trusted-keys"] {
+            let dir = root.join(private);
+            assert!(dir.is_dir(), "{private}/ sollte existieren");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "{private}/ muss 0700 sein"
+                );
+            }
+        }
         // idempotent
         init_state_at(&root, false).unwrap();
     }
