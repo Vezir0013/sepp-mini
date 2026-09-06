@@ -1,8 +1,9 @@
 # Ein WASM-Plugin für sepp mini schreiben
 
-Dieses Verzeichnis ist ein vollständiges, lauffähiges Plugin und zugleich die Referenz für das
-Aufrufprotokoll. `src/lib.rs` ist in zwei Hälften geteilt: Der obere Teil ist bei jedem Plugin
-gleich und darf kopiert werden, der untere ist die eigentliche Arbeit.
+Dieses Verzeichnis ist ein vollständiges, lauffähiges Plugin und zugleich die Vorlage. Es ist mit
+dem SDK `sepp-plugin` geschrieben: Der Autor schreibt **eine Funktion**, das Attribut
+`#[sepp_plugin::tool]` erzeugt daraus das Aufrufprotokoll des Hosts. `src/lib.rs` ist deshalb
+kurz — und alles darin ist Arbeit, kein Protokoll.
 
 Das Beispiel zählt Zeichen, Wörter und Zeilen eines Textes und schätzt die Tokenzahl.
 
@@ -18,123 +19,98 @@ Beim nächsten Start meldet sepp `WASM: 1 Plugins geladen`, und `sepp policy` f�
 `plugin textstat` auf. Erweiterungen werden **nur beim Start** gelesen; nach jeder Änderung also
 sepp neu starten.
 
-## Was der Host erwartet
+Ein eigenes Plugin beginnt man nicht mit Kopieren, sondern mit `sepp plugin new <name>`: Das legt
+`Cargo.toml`, `src/lib.rs`, Manifest und README als Gerüst an.
 
-Vier Exports, sonst nichts. Alle werden beim Laden geprüft, Name **und** Signatur:
-
-| Export | Signatur |
-|---|---|
-| `memory` | die exportierte Memory, Name exakt `memory` |
-| `sepp_spec` | `() -> i64` |
-| `sepp_alloc` | `(i32) -> i32` |
-| `sepp_call` | `(i32, i32) -> i64` |
-
-Der Rückgabewert `i64` trägt zwei Zahlen: im oberen Wort die Adresse, im unteren die Länge.
-
-**`sepp_spec`** liefert die Werkzeugbeschreibung als JSON. Alle vier Felder sind Pflicht:
-
-```json
-{ "name": "…", "label": "…", "description": "…", "parameters": { "type": "object" } }
-```
-
-`parameters` ist ein JSON-Schema und geht unverändert an das Modell. Halte es schlank, ohne
-`$schema` und ohne `title`.
-
-**`sepp_call`** bekommt die Argumente als JSON und liefert das Ergebnis als JSON zurück. Pflicht
-ist nur `content`; `details` und `is_error` darfst du weglassen:
-
-```json
-{ "content": [{ "type": "text", "text": "…" }], "is_error": false }
-```
-
-Was in `content` steht, sieht das Modell. Was in `details` steht, nicht: Das ist der Platz für
-Zahlen, die die Oberfläche verarbeiten soll, ohne das Kontextfenster zu füllen.
-
-## Was der Host anbietet
-
-Vier Importe aus dem Modul `env`. Zwei gibt es immer, zwei nur mit dem passenden Recht:
-
-| Import | Signatur | Gate |
-|---|---|---|
-| `host_log` | `(i32 ptr, i32 len)` | immer |
-| `host_result_read` | `(i32 ptr, i32 cap) -> i32` | immer |
-| `host_fs_read` | `(i32 ptr, i32 len) -> i32` | `fs_read` |
-| `host_http` | `(i32 ptr, i32 len) -> i32` | `net` |
-
-**Der Abholweg ist bei allen Fähigkeiten gleich.** Eine Fähigkeit führt aus, legt ihr Ergebnis
-beim Host ab und meldet nur dessen Größe. Du stellst dann einen passenden Puffer und holst es
-mit `host_result_read` ab:
+## So sieht ein Plugin aus
 
 ```rust
-let req = br#"{"path":"./daten.csv"}"#;
-let n = unsafe { host_fs_read(req.as_ptr() as i32, req.len() as i32) };
-let mut buf = vec![0u8; n as usize];
-let got = unsafe { host_result_read(buf.as_mut_ptr() as i32, n) };
-buf.truncate(got as usize);   // buf enthält jetzt das JSON-Ergebnis
+use sepp_plugin::prelude::*;
+
+#[derive(Deserialize, JsonSchema)]
+struct Args {
+    /// Der zu vermessende Text.
+    text: String,
+}
+
+#[sepp_plugin::tool(desc = "Zählt Zeichen, Wörter und Zeilen.", label = "Textstatistik")]
+fn textstat(args: Args, host: &Host) -> Result<ToolResult> {
+    host.log("los");
+    let words = args.text.split_whitespace().count();
+    Ok(ToolResult::text(format!("{words} Wörter")).with_details(json!({ "words": words })))
+}
 ```
 
-Damit wird nie doppelt gesendet und du musst keine Größe raten. Das Ergebnis bleibt abrufbar,
-bis du die nächste Fähigkeit aufrufst, ein zu klein geratener Puffer kostet dich also nur einen
-zweiten Abholversuch.
+- **`Args`** sind die Parameter des Werkzeugs. Das JSON-Schema, das das Modell sieht, entsteht
+  daraus (`schemars`); Doc-Kommentare an den Feldern werden zu Beschreibungen. `serde` und
+  `schemars` müssen direkte Dependencies deines Crates sein — ihre Derive-Makros verlangen das.
+- **`#[sepp_plugin::tool]`** nimmt `desc` (Pflicht — das liest das Modell), optional `name`
+  (Default: Funktionsname; muss `^[A-Za-z0-9_-]{1,64}$` erfüllen, sonst ein Compile-Fehler) und
+  `label` (Anzeigename, Default: `name`). Genau ein `#[tool]` je Crate.
+- **`Host`** ist der Zugang zum Host: `host.log(..)` immer; `host.fs()` nur mit dem Cargo-Feature
+  `fs-read`; `host.http()` nur mit `net` (siehe unten).
+- **Fehler** sind ein `Err(..)` — aus `String`, `&str`, JSON- und UTF-8-Fehlern per `?`. Das SDK
+  macht daraus ein Ergebnis mit `is_error = true`. Ein Plugin trappt nie: Das Modell kann mit einer
+  Erklärung etwas anfangen, mit einem abgestürzten Werkzeug nicht. Ungültige Argumente behandelt
+  das SDK genauso.
+- **`details`** geht an die Oberfläche, nicht ans Modell — der Platz für Zahlen, die man
+  weiterverarbeiten will, ohne das Kontextfenster zu füllen. Was in `content` steht, kürzt der
+  Host selbst (50 KiB / 2000 Zeilen).
 
-Eine Fähigkeit liefert **immer** ein JSON-Objekt, auch wenn etwas schiefgeht:
-
-```json
-{"bytes":42,"text":"…","lossy":false}      // host_fs_read, Erfolg
-{"error":"… liegt außerhalb der Rechte"}   // jede Fähigkeit, Fehler
-```
-
-`host_http` ist noch eine Attrappe und liefert konstant einen Fehler mit dieser Erklärung.
-
-## Vier Dinge, die man einmal falsch macht
-
-**Das Vorzeichen beim Packen.** Ein `i32` mit gesetztem höchsten Bit schmiert beim Verbreitern
-sein Vorzeichen in die oberen 32 Bit und zerstört die Länge. Deshalb die Zwischenstufe:
-
-```rust
-((ptr as u32 as i64) << 32) | (len as u32 as i64)
-```
-
-**Es gibt kein Freigeben.** Das Protokoll kennt keinen Gegenspieler zu `sepp_alloc`. Belegter
-Speicher gehört ab dem Aufruf dem Host, und der Puffer muss die Rückkehr aus `sepp_call`
-überleben, weil der Host ihn erst danach liest. Im Beispiel steht deshalb zweimal ein bewusstes
-`std::mem::forget`. Das leckt nicht dauerhaft: Der Host wirft nach jedem Aufruf die ganze Instanz
-weg. Aus demselben Grund kann ein Plugin **keinen Zustand über zwei Aufrufe hinweg** halten.
-
-**Nur importieren, was du gewährt bekommst.** `host_fs_read` und `host_http` registriert der Host
-nur, wenn die Policy das passende Recht hergibt. Importierst du eine davon ohne Gewährung,
-scheitert schon die Instanziierung und das Plugin lädt gar nicht. Wer nichts anfordert, kommt
-ohne einen `[plugin.<name>]`-Abschnitt aus, so wie dieses Beispiel.
-
-**Die Standardbibliothek trägt nur zur Hälfte.** Rust lässt sich für `wasm32-unknown-unknown` mit
-`std` bauen, aber alles darin, was das Betriebssystem braucht, ist eine Attrappe. Eine
-Zeitmessung schlägt fehl, `std::fs` gibt Fehler zurück, und ein Zufallsgenerator hat keine
-Quelle. Ein Modul hat weder Uhr noch Zufall noch Umgebungsvariablen: Es kann nur, was der Host
-über die Importe hineinreicht. Wer eine Datei lesen will, nimmt `host_fs_read`, nicht `std::fs`.
+Testen geht **ohne wasm32-Target**: Das Makro erzeugt ein Modul `__sepp_plugin_export` mit
+`spec_json()` und `call_json(&[u8])`, das nativ läuft — `cargo test` im Plugin-Crate reicht.
 
 ## Wenn dein Plugin Rechte braucht
 
-Das Manifest ist die Selbstauskunft des Autors, keine Grenze. Du deklarierst, was du willst:
+Drei Stellen müssen zusammenpassen, sonst lädt das Modul nicht:
 
 ```toml
+# Cargo.toml — das Feature schaltet host.fs() UND den Host-Import frei
+sepp-plugin = { …, features = ["fs-read"] }
+```
+```toml
+# <name>.toml — das Manifest ist die Selbstauskunft des Autors
 [capabilities]
-net = ["api.example.com"]
+fs_read = ["./daten"]
 ```
-
-Wirksam wird es erst durch die Gegenzeichnung in der `policy.toml` des Nutzers:
-
 ```toml
+# ~/.sepp/policy.toml — die Gegenzeichnung des Nutzers (`sepp policy allow --global plugin.<name> fs_read ./daten`)
 [plugin.textstat]
-net = ["api.example.com"]
+fs_read = ["./daten"]
 ```
 
-Effektiv gilt der **Schnitt** aus beidem. Fehlt der Abschnitt, bekommt das Plugin nichts.
+Effektiv gilt der **Schnitt** aus Manifest und Policy. Durchgesetzt wird am Linker, nicht am
+Manifest: Der Host registriert eine gegatete Funktion nur, wenn das Recht übrig bleibt. Ein Modul,
+das sie importiert, ohne dass sie gewährt ist, lässt sich nicht instanziieren — die Startmeldung
+nennt den fehlenden Abschnitt. Deshalb: Ein Feature nur setzen, wenn das Manifest das Recht
+anfordert. Umgekehrt bewirkt ein Manifest, das Rechte fordert, ohne dass das Modul die Funktion
+importiert, nichts. Prüfen lässt sich die Lage jederzeit mit `sepp policy`.
 
-Durchgesetzt wird das am Linker, nicht am Manifest: Der Host registriert `host_http` nur, wenn das
-Recht übrig bleibt. Importiert dein Modul die Funktion ohne die Gewährung, lässt es sich nicht
-instanziieren und lädt gar nicht erst; die Startmeldung nennt dann den fehlenden Abschnitt.
-Umgekehrt heißt das: Ein Manifest, das Rechte fordert, ohne die zugehörige Funktion zu
-importieren, bewirkt nichts. Prüfen lässt sich die Lage jederzeit mit `sepp policy`.
+| Feature | Zugang | Host-Import | Gate im Manifest / in der Policy |
+|---|---|---|---|
+| — | `host.log(..)` | `host_log` | immer |
+| `fs-read` | `host.fs().read(..)`, `read_to_string(..)` | `host_fs_read_bytes` (+ Abholweg `host_result_read`) | `fs_read` oder `fs_write` |
+| `net` | `host.http().get(..).send()` | `host_http` (+ Abholweg) | `net` — **provisorisch**, der Host antwortet heute mit einem Fehler; Stufe 3 setzt es um |
+
+`host.fs().read` liefert die Datei **roh** (`Vec<u8>`) — ein PDF kommt als PDF an. Der Pfad wird
+wie bei den eingebauten Tools aufgelöst und gegen dieselbe Policy geprüft; ein Plugin kommt nicht
+weiter als der Agent selbst. Höchstens 16 MiB.
+
+## Drei Dinge, die man einmal falsch macht
+
+**Es gibt keinen Zustand zwischen zwei Aufrufen.** Der Host verwirft die Instanz nach jedem
+Werkzeugaufruf. Ein `static` ist beim nächsten Aufruf wieder leer; Sitzungen, Tokens oder Caches
+müssen im Host leben (das ist Gegenstand von Stufe 3).
+
+**Die Standardbibliothek trägt nur zur Hälfte.** Rust lässt sich für `wasm32-unknown-unknown` mit
+`std` bauen, aber alles darin, was das Betriebssystem braucht, ist eine Attrappe: Eine Zeitmessung
+schlägt fehl, `std::fs` gibt Fehler zurück, ein Zufallsgenerator hat keine Quelle. Ein Modul kann
+nur, was der Host hineinreicht — Dateien also über `host.fs()`, nicht über `std::fs`.
+
+**Das Wanduhr-Budget ist die reale Grenze.** wasmi ist ein Interpreter, grob 10- bis 20-mal
+langsamer als nativ. Wer Dokumente verarbeitet, testet an einer zweiseitigen Rechnung, setzt
+`max_wall_time_ms = 5000` — und der erste 90-seitige Sammelbeleg bricht ab. Limits großzügig
+wählen und in der Anleitung nennen.
 
 ## Das Manifest
 
@@ -153,19 +129,24 @@ Gefunden wird das Manifest als `<stamm>.toml` neben `<stamm>.wasm`, ersatzweise 
 und das Manifest müsste denselben Unterstrich tragen.
 
 Der `[limits]`-Abschnitt deckelt den Verbrauch. Fehlt er, gelten 256 Seiten Speicher, dreißig
-Sekunden Laufzeit und eine Million Instruktionen je Zeitscheibe.
+Sekunden Laufzeit und eine Million Instruktionen je Zeitscheibe. Rechenzeit läuft in Zeitscheiben:
+Nach `fuel_slice` Instruktionen gibt das Modul die Kontrolle an den Host zurück, der prüft, ob
+abgebrochen wurde oder die Uhr abgelaufen ist, und dann weiterlaufen lässt. Eine Endlosschleife
+blockiert deshalb nichts, sie wird nur irgendwann beendet.
 
-## Grenzen des Hosts
+## Das Protokoll darunter (nur für Neugierige)
 
-| | |
-|---|---|
-| Rückgabe je Aufruf | höchstens 16 MiB |
-| Instruktionen beim Instanziieren | 10 Millionen |
-| Ladezeit inklusive `sepp_spec` | 5 Sekunden |
+Wer ohne SDK baut — in einer anderen Sprache etwa — findet den Vertrag in `wit/sepp.wit` im
+Repo-Root: die logische Schnittstelle als WIT und darunter die Kodierung für Core-WASM (ABI 1).
+Kurzfassung: Das Modul exportiert `memory`, `sepp_alloc(i32)->i32`, `sepp_spec()->i64` und
+`sepp_call(i32,i32)->i64`; `i64` packt `(ptr << 32) | len`; `sepp_spec` liefert ToolSpec-JSON,
+`sepp_call` bekommt Argument-JSON und liefert ToolResult-JSON. Importe aus `env`: `host_log` und
+`host_result_read` immer, `host_fs_read` und `host_fs_read_bytes` mit `fs_read`, `host_http` mit
+`net` — fünf Funktionen, alle mit `(i32, i32)`-Parametern. Ein Test in `sepp-wasm` hält die
+WIT-Datei und den Host synchron.
 
-Rechenzeit läuft in Zeitscheiben: Nach `fuel_slice` Instruktionen gibt das Modul die Kontrolle an
-den Host zurück, der prüft, ob abgebrochen wurde oder die Uhr abgelaufen ist, und dann weiterlaufen
-lässt. Eine Endlosschleife blockiert deshalb nichts, sie wird nur irgendwann beendet.
+Grenzen des Hosts: höchstens 16 MiB je Rückgabe, 10 Millionen Instruktionen beim Instanziieren,
+5 Sekunden Ladezeit inklusive `sepp_spec`.
 
 ## Prüfen, ohne sepp zu starten
 
