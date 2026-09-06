@@ -3,6 +3,10 @@
 //! ab — der Provider muss dann einmal ohne das Feld wiederholen und es für den Rest der
 //! Sitzung weglassen, statt `--provider local` komplett zu brechen. Getestet gegen einen
 //! Mini-HTTP-Server auf 127.0.0.1 (kein echtes Netz, keine Keys).
+//!
+//! Davon streng zu trennen ist der Wiederanlauf bei vorübergehenden Störungen
+//! (`tests/retry_and_timeouts.rs`): Der wiederholt **denselben** Body und greift nur bei
+//! `429`/`408`/`5xx`. Nur der Fallback hier verändert den Request.
 
 #![cfg(feature = "openai")]
 
@@ -155,23 +159,28 @@ async fn falls_back_without_reasoning_effort_and_remembers_rejection() {
 
 #[tokio::test]
 async fn server_errors_do_not_trigger_fallback() {
-    // 5xx hat nichts mit dem Feld zu tun: kein Retry, Fehler geht durch, und der nächste
-    // Request sendet das Feld unverändert (kein fälschlich gesetztes Ablehnungs-Flag).
+    // 5xx hat nichts mit dem Feld zu tun. Der Wiederanlauf aus `http.rs` greift zwar, schickt
+    // aber **denselben** Body: `reasoning_effort` bleibt drin, und das Ablehnungs-Flag bleibt
+    // ungesetzt — sonst würde eine Lastspitze beim Anbieter das Thinking für den Rest der
+    // Sitzung stillschweigend abschalten.
     let (addr, bodies) = spawn_server(vec![
         (500, "{\"error\":\"boom\"}".to_string()),
+        (200, sse_body()),
         (200, sse_body()),
     ])
     .await;
     let p = provider_for(addr);
     let model = local_model();
 
-    let err = run_stream(&p, &model).await.expect_err("5xx must fail");
-    assert!(err.to_string().contains("500"), "{err}");
-
+    run_stream(&p, &model).await.expect("Wiederanlauf nach 5xx");
     run_stream(&p, &model).await.expect("second stream");
+
     let seen = bodies.lock().expect("lock");
-    assert_eq!(seen.len(), 2, "{seen:?}");
-    assert!(seen[1].contains("reasoning_effort"), "{}", seen[1]);
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(
+        seen.iter().all(|b| b.contains("reasoning_effort")),
+        "kein Fallback bei 5xx — das Feld bleibt in jedem Request: {seen:?}"
+    );
 }
 
 #[tokio::test]

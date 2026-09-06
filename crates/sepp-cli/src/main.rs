@@ -1481,6 +1481,10 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 AgentEvent::ToolStart { name, .. } => {
                     eprintln!("\x1b[2m· {name} …\x1b[0m");
                 }
+                // Nach stderr, nicht stdout: stdout bleibt der Datenkanal (nur TextDelta).
+                AgentEvent::Notice(msg) => {
+                    eprintln!("\x1b[2m⟳ {msg}\x1b[0m");
+                }
                 AgentEvent::Error(msg) => {
                     eprintln!("\n\x1b[31m[Fehler]\x1b[0m {msg}");
                 }
@@ -1612,6 +1616,9 @@ fn rpc_event(ev: &AgentEvent) -> Option<serde_json::Value> {
             Some(json!({ "type": "tool_end", "id": id, "is_error": is_error }))
         }
         AgentEvent::Error(m) => Some(json!({ "type": "error", "message": m })),
+        // Additiv: Ein Client, der `notice` nicht kennt, ignoriert die Zeile — deshalb ohne
+        // Format-Bump (siehe Konvention „stabile Formate nur additiv").
+        AgentEvent::Notice(t) => Some(json!({ "type": "notice", "text": t })),
         AgentEvent::TurnStart | AgentEvent::TurnEnd | AgentEvent::Done => None,
     }
 }
@@ -1759,6 +1766,10 @@ mod tests {
         assert_eq!(v["is_error"], true);
 
         // Lifecycle-Events erzeugen keine RPC-Zeile.
+        // Additiv: ein Client, der `notice` nicht kennt, ignoriert die Zeile.
+        let v = rpc_event(&AgentEvent::Notice("openai: Ratenlimit (429)".into())).unwrap();
+        assert_eq!(v["type"], "notice");
+        assert!(v["text"].as_str().unwrap().contains("429"));
         assert!(rpc_event(&AgentEvent::TurnStart).is_none());
         assert!(rpc_event(&AgentEvent::Done).is_none());
     }

@@ -8,20 +8,24 @@
 //!
 //! Auth aus `MOONSHOT_API_KEY` (Pflicht), Endpunkt aus `MOONSHOT_BASE_URL`. Feature `moonshot`.
 //!
-//! **Kein 4xx-Retry.** [`crate::openai::OpenAiProvider`] wiederholt einen mit 4xx abgelehnten
-//! Request einmal ohne `reasoning_effort`; dieser Connector ruft `stream_chat` direkt auf und
-//! erbt das bewusst nicht. Der Fallback existiert für die heterogene Population lokaler Server
-//! (Ollama/vLLM), bei denen Feldunterstützung unbekannt ist — Moonshot ist eine einzige,
+//! **Kein blinder 4xx-Retry.** [`crate::openai::OpenAiProvider`] wiederholt einen mit 4xx
+//! abgelehnten Request einmal ohne `reasoning_effort`; dieser Connector ruft `stream_chat` direkt
+//! auf und erbt das bewusst nicht. Der Fallback existiert für die heterogene Population lokaler
+//! Server (Ollama/vLLM), bei denen Feldunterstützung unbekannt ist — Moonshot ist eine einzige,
 //! dokumentierte Cloud-API. Auf einer Bezahl-API wäre ein blinder 4xx-Retry sogar schädlich:
-//! `is_client_error()` trifft auch 401 (zweiter sinnloser Call mit falschem Key) und 429
-//! (verdoppelt genau das, was gerade limitiert wird), und der echte Fehler würde durch einen
-//! zweiten, anders aussehenden ersetzt.
+//! `is_client_error()` trifft auch 401 (zweiter sinnloser Call mit falschem Key), und der echte
+//! Fehler würde durch einen zweiten, anders aussehenden ersetzt.
+//!
+//! Davon zu unterscheiden ist der Wiederanlauf in [`crate::http`], den dieser Connector sehr wohl
+//! erbt: Er greift nur bei `429`/`408`/`5xx`, wartet dazwischen und beachtet `Retry-After`. Ein
+//! Ratenlimit *mit* Wartezeit zu wiederholen ist das Gegenteil davon, es zu verdoppeln.
 
 use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 use sepp_core::Result;
 
+use crate::http::{http_client, RetryPolicy};
 use crate::openai::{
     build_chat_body, nonempty_trimmed, resolve_base_url, stream_chat, OpenAiDialect,
 };
@@ -36,6 +40,7 @@ pub struct MoonshotProvider {
     client: reqwest::Client,
     api_key: Option<String>,
     base_url: String,
+    retry: RetryPolicy,
 }
 
 impl MoonshotProvider {
@@ -44,9 +49,10 @@ impl MoonshotProvider {
     /// den anderen Providern (und für Tests).
     pub fn new(api_key: Option<String>, base_url: impl Into<String>) -> Self {
         MoonshotProvider {
-            client: reqwest::Client::new(),
+            client: http_client(),
             api_key,
             base_url: base_url.into(),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -79,6 +85,7 @@ impl Provider for MoonshotProvider {
             self.api_key.as_deref(),
             body,
             "moonshot",
+            &self.retry,
             cancel,
         )
         .await

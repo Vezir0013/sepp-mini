@@ -12,6 +12,7 @@ use sepp_core::{
     ContentBlock, ImageSource, Message, Result, Role, SeppError, ThinkingLevel, Usage,
 };
 
+use crate::http::{http_client, send_with_retry, HttpFail, RetryPolicy};
 use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
@@ -168,15 +169,17 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    retry: RetryPolicy,
 }
 
 impl AnthropicProvider {
     /// Erzeugt einen Provider mit explizitem API-Key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -385,24 +388,24 @@ impl Provider for AnthropicProvider {
         let body = self.build_body(&req);
         let url = format!("{}/v1/messages", self.base_url);
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SeppError::Provider(format!("anthropic request: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(SeppError::Provider(format!(
-                "anthropic: HTTP {status}: {}",
-                text.trim()
-            )));
-        }
+        // Der Request wird je Versuch neu gebaut: ein `RequestBuilder` ist nach `send()`
+        // verbraucht. Wiederanlauf und Abbruchbarkeit liegen in [`crate::http`].
+        let outcome = send_with_retry(
+            || {
+                self.client
+                    .post(&url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", API_VERSION)
+                    .json(&body)
+            },
+            "anthropic",
+            &self.base_url,
+            &self.retry,
+            &cancel,
+        )
+        .await
+        .map_err(HttpFail::into_sepp)?;
+        let resp = outcome.response;
 
         let state = DecodeState {
             bytes: Box::pin(resp.bytes_stream()),
@@ -422,6 +425,9 @@ impl Provider for AnthropicProvider {
                     return None;
                 }
                 tokio::select! {
+                    // `biased`: Ein gesetzter Abbruch gewinnt, statt gegen einen gleichzeitig
+                    // fertigen Chunk auszulosen.
+                    biased;
                     _ = st.cancel.cancelled() => return None,
                     chunk = st.bytes.next() => match chunk {
                         Some(Ok(b)) => {
@@ -456,7 +462,15 @@ impl Provider for AnthropicProvider {
             }
         });
 
-        Ok(Box::pin(stream))
+        // Hinweise über Wiederholungen stehen vor `MessageStart` — sie erklären dem Menschen
+        // die Verzögerung, die er gerade erlebt hat (Invariante: `Notice* MessageStart …`).
+        let notices = futures::stream::iter(
+            outcome
+                .notices
+                .into_iter()
+                .map(|text| StreamEvent::Notice { text }),
+        );
+        Ok(Box::pin(notices.chain(stream)))
     }
 }
 

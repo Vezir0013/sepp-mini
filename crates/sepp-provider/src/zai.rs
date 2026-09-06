@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use sepp_core::Result;
 
+use crate::http::{http_client, RetryPolicy};
 use crate::openai::{
     build_chat_body, nonempty_trimmed, resolve_base_url, stream_chat, OpenAiDialect,
 };
@@ -25,6 +26,7 @@ pub struct ZaiProvider {
     client: reqwest::Client,
     api_key: Option<String>,
     base_url: String,
+    retry: RetryPolicy,
 }
 
 impl ZaiProvider {
@@ -33,9 +35,10 @@ impl ZaiProvider {
     /// anderen Providern (und für Tests).
     pub fn new(api_key: Option<String>, base_url: impl Into<String>) -> Self {
         ZaiProvider {
-            client: reqwest::Client::new(),
+            client: http_client(),
             api_key,
             base_url: base_url.into(),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -67,6 +70,7 @@ impl Provider for ZaiProvider {
             self.api_key.as_deref(),
             body,
             "zai",
+            &self.retry,
             cancel,
         )
         .await

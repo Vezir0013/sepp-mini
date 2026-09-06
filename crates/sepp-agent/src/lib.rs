@@ -52,10 +52,20 @@ pub struct AgentState {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStart,
+    /// Ein Hinweis des Adapters an den Menschen, keine Ausgabe des Modells — etwa ein
+    /// Wiederanlauf nach `429`, der die gerade erlebte Verzögerung erklärt. Wird durchgereicht
+    /// und **nicht** in den Verlauf geschrieben.
+    Notice(String),
     TextDelta(String),
     ThinkingDelta(String),
-    ToolStart { id: String, name: String },
-    ToolEnd { id: String, is_error: bool },
+    ToolStart {
+        id: String,
+        name: String,
+    },
+    ToolEnd {
+        id: String,
+        is_error: bool,
+    },
     TurnEnd,
     Done,
     Error(String),
@@ -359,7 +369,7 @@ impl AgentSession {
             thinking: ThinkingLevel::Off,
             max_tokens: 1024,
         };
-        let mut stream = self.provider.stream(req, cancel).await?;
+        let mut stream = self.provider.stream(req, cancel.clone()).await?;
         let mut summary = String::new();
         while let Some(ev) = stream.next().await {
             match ev {
@@ -367,6 +377,12 @@ impl AgentSession {
                 StreamEvent::Error { message } => return Err(SeppError::Provider(message)),
                 _ => {}
             }
+        }
+        // Ein abgebrochener Stream endet stumm (der Adapter liefert weder `MessageStop` noch
+        // `Error`). Ohne diese Prüfung käme eine abgeschnittene Zusammenfassung als Erfolg
+        // zurück und würde echte Nachrichten ersetzen — Datenverlust durch Ctrl+C.
+        if cancel.is_cancelled() {
+            return Err(SeppError::Aborted);
         }
         Ok(summary.trim().to_string())
     }
@@ -491,6 +507,9 @@ impl AgentSession {
             while let Some(ev) = stream.next().await {
                 match ev {
                     StreamEvent::MessageStart => {}
+                    // Nur weiterreichen: Ein Hinweis ist keine Nachricht des Modells und darf
+                    // weder in `text_buf` noch in die Session.
+                    StreamEvent::Notice { text } => on_event(AgentEvent::Notice(text)),
                     StreamEvent::TextDelta { text } => {
                         on_event(AgentEvent::TextDelta(text.clone()));
                         text_buf.push_str(&text);

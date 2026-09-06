@@ -11,8 +11,9 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use sepp_core::{ContentBlock, Message, Result, Role, SeppError, ThinkingLevel, Usage};
+use sepp_core::{ContentBlock, Message, Result, Role, ThinkingLevel, Usage};
 
+use crate::http::{http_client, is_retryable, send_with_retry, HttpFail, RetryPolicy};
 use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
 
@@ -326,6 +327,7 @@ pub struct OpenAiProvider {
     /// deaktiviert. Der Provider lebt als `Arc` über die Session — der Fallback wird pro
     /// Sitzung genau einmal ausgehandelt.
     reasoning_effort_rejected: AtomicBool,
+    retry: RetryPolicy,
 }
 
 impl OpenAiProvider {
@@ -333,12 +335,13 @@ impl OpenAiProvider {
     /// Dialekt ist per Default [`OpenAiDialect::OpenAi`]; via [`Self::with_dialect`] änderbar.
     pub fn new(api_key: Option<String>, base_url: impl Into<String>) -> Self {
         OpenAiProvider {
-            client: reqwest::Client::new(),
+            client: http_client(),
             api_key,
             base_url: base_url.into(),
             dialect: OpenAiDialect::default(),
             label: "openai",
             reasoning_effort_rejected: AtomicBool::new(false),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -588,10 +591,11 @@ impl Provider for OpenAiProvider {
                 self.api_key.as_deref(),
                 body,
                 self.label,
+                &self.retry,
                 cancel,
             )
             .await
-            .map_err(ChatError::into_sepp);
+            .map_err(HttpFail::into_sepp);
         }
         match stream_chat(
             &self.client,
@@ -599,6 +603,7 @@ impl Provider for OpenAiProvider {
             self.api_key.as_deref(),
             body.clone(),
             self.label,
+            &self.retry,
             cancel.clone(),
         )
         .await
@@ -608,7 +613,14 @@ impl Provider for OpenAiProvider {
             // Wert "none" nicht (Ollama < 0.18, vLLM je nach Modell) — einmal ohne das Feld
             // wiederholen statt --provider local komplett zu brechen. 5xx/Transportfehler
             // gehen unverändert durch (dort ist das Feld nicht die Ursache).
-            Err(e) if e.status.is_some_and(|s| s.is_client_error()) => {
+            //
+            // `!is_retryable` schließt 429/408 aus: Die hat [`crate::http::send_with_retry`]
+            // bereits mit Backoff wiederholt, und ein vierter Versuch ohne das Feld würde ein
+            // Ratenlimit nur weiter belasten — an dem das Feld ohnehin unschuldig ist.
+            Err(e)
+                if e.status
+                    .is_some_and(|s| s.is_client_error() && !is_retryable(s)) =>
+            {
                 remove_reasoning_effort(&mut body);
                 let s = stream_chat(
                     &self.client,
@@ -616,10 +628,11 @@ impl Provider for OpenAiProvider {
                     self.api_key.as_deref(),
                     body,
                     self.label,
+                    &self.retry,
                     cancel,
                 )
                 .await
-                .map_err(ChatError::into_sepp)?;
+                .map_err(HttpFail::into_sepp)?;
                 self.reasoning_effort_rejected
                     .store(true, Ordering::Relaxed);
                 tracing::warn!(
@@ -641,27 +654,6 @@ fn remove_reasoning_effort(body: &mut Value) {
     }
 }
 
-/// Fehler aus [`stream_chat`] mit maschinenlesbarem HTTP-Status (`None` bei Transport-/
-/// Verbindungsfehlern) — Grundlage des `reasoning_effort`-Fallbacks im Local-Dialekt.
-/// Außerhalb davon via [`ChatError::into_sepp`] in den bisherigen [`SeppError`] überführen.
-pub(crate) struct ChatError {
-    pub(crate) status: Option<reqwest::StatusCode>,
-    pub(crate) error: SeppError,
-}
-
-impl ChatError {
-    fn transport(error: SeppError) -> Self {
-        ChatError {
-            status: None,
-            error,
-        }
-    }
-
-    pub(crate) fn into_sepp(self) -> SeppError {
-        self.error
-    }
-}
-
 /// Führt einen Chat-Completions-Stream gegen einen OpenAI-kompatiblen Endpunkt aus: POST mit
 /// optionalem Bearer, Statusprüfung, dann SSE → [`StreamEvent`]. Geteilt vom [`OpenAiProvider`]
 /// und dem dedizierten z.ai-Connector ([`crate::zai::ZaiProvider`]). `label` taucht in allen
@@ -673,32 +665,27 @@ pub(crate) async fn stream_chat(
     api_key: Option<&str>,
     body: Value,
     label: &'static str,
+    retry: &RetryPolicy,
     cancel: CancellationToken,
-) -> std::result::Result<BoxStream<'static, StreamEvent>, ChatError> {
+) -> std::result::Result<BoxStream<'static, StreamEvent>, HttpFail> {
     let url = format!("{base_url}/chat/completions");
-    let mut builder = client.post(&url).json(&body);
-    if let Some(key) = api_key {
-        builder = builder.bearer_auth(key);
-    }
-    let resp = builder.send().await.map_err(|e| {
-        // Verbindungsfehler nennen den Endpunkt: hilfreicher bei lokalen Servern (mlx/local),
-        // die zwischen Preflight und Request sterben können, statt eines rohen reqwest-Texts.
-        if e.is_connect() {
-            ChatError::transport(SeppError::Provider(format!(
-                "{label}: Verbindung zu {base_url} fehlgeschlagen: {e} — läuft der Server?"
-            )))
-        } else {
-            ChatError::transport(SeppError::Provider(format!("{label} request: {e}")))
-        }
-    })?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ChatError {
-            status: Some(status),
-            error: SeppError::Provider(format!("{label}: HTTP {status}: {}", text.trim())),
-        });
-    }
+    // Je Versuch ein frischer Builder — nach `send()` ist er verbraucht. Timeouts,
+    // Abbruchbarkeit und Wiederanlauf liegen in [`crate::http`].
+    let outcome = send_with_retry(
+        || {
+            let b = client.post(&url).json(&body);
+            match api_key {
+                Some(key) => b.bearer_auth(key),
+                None => b,
+            }
+        },
+        label,
+        base_url,
+        retry,
+        &cancel,
+    )
+    .await?;
+    let resp = outcome.response;
 
     let state = DecodeState {
         bytes: Box::pin(resp.bytes_stream()),
@@ -718,6 +705,9 @@ pub(crate) async fn stream_chat(
                 return None;
             }
             tokio::select! {
+                // `biased`: Ein gesetzter Abbruch gewinnt, statt gegen einen gleichzeitig
+                // fertigen Chunk auszulosen.
+                biased;
                 _ = st.cancel.cancelled() => return None,
                 chunk = st.bytes.next() => match chunk {
                     Some(Ok(b)) => feed(&mut st, &b),
@@ -735,7 +725,15 @@ pub(crate) async fn stream_chat(
             }
         }
     });
-    Ok(Box::pin(stream))
+    // Hinweise über Wiederholungen stehen vor `MessageStart` — sie erklären dem Menschen die
+    // Verzögerung, die er gerade erlebt hat (Invariante: `Notice* MessageStart …`).
+    let notices = futures::stream::iter(
+        outcome
+            .notices
+            .into_iter()
+            .map(|text| StreamEvent::Notice { text }),
+    );
+    Ok(Box::pin(notices.chain(stream)))
 }
 
 fn feed(st: &mut DecodeState, bytes: &[u8]) {

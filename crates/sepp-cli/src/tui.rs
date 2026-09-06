@@ -1179,6 +1179,10 @@ impl App {
                     });
                 }
             }
+            // Hinweis des Adapters (z. B. Wiederanlauf nach 429): erklärt die Verzögerung,
+            // die gerade sichtbar ist. In die Statuszeile, nicht ins Transcript — es ist keine
+            // Ausgabe des Modells und der Turn läuft weiter.
+            AgentEvent::Notice(s) => self.notify(s),
             AgentEvent::TurnEnd => self.finalize_streaming(),
             // Bewusst ins Transcript statt in die Notices: auf AgentEvent::Error folgt im
             // Agent-Loop immer ein Err → UiMsg::Done(Some(e)), und der Done-Handler pusht die
@@ -2149,6 +2153,27 @@ mod tests {
         let cut = seg_text(&status_bar_segments(stmt(), long_msg, vec![], 40));
         assert!(cut.contains('…'), "{cut}");
         assert!(cut.chars().count() <= 40, "{cut}");
+    }
+
+    #[tokio::test]
+    async fn provider_notice_shows_up_without_touching_the_transcript() {
+        // Ein Wiederanlauf soll die Verzögerung erklären, aber weder als Antwort des Modells
+        // erscheinen noch den laufenden Turn beenden.
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::TurnStart);
+        let before = app.transcript.len();
+        app.on_agent_event(AgentEvent::Notice(
+            "anthropic: überlastet (529) — Versuch 2 von 3 in 2 s".into(),
+        ));
+        let shown = app.message.as_ref().expect("Hinweis in der Statuszeile");
+        assert!(shown.text.contains("529"), "{}", shown.text);
+        assert_eq!(shown.kind, Kind::Info, "Hinweis ist kein Fehler");
+        assert_eq!(app.transcript.len(), before, "nichts ins Transcript");
+        assert_eq!(
+            app.activity,
+            Activity::WaitingProvider,
+            "der Turn läuft weiter"
+        );
     }
 
     #[tokio::test]

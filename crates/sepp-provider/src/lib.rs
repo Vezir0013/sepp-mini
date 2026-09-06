@@ -12,6 +12,8 @@ use sepp_core::{Message, Model, Result, ThinkingLevel, ToolSpec, Usage};
 
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub(crate) mod http;
 pub mod models;
 #[cfg(feature = "moonshot")]
 pub mod moonshot;
@@ -31,7 +33,9 @@ pub use openai::{decode_openai_sse, OpenAiDialect, OpenAiProvider};
 pub use zai::ZaiProvider;
 
 /// Ein normalisiertes Streaming-Ereignis. Die Reihenfolge-Invariante:
-/// `MessageStart (TextDelta|ThinkingDelta|ThinkingSignature|ToolUse*)* Usage? MessageStop`.
+/// `Notice* MessageStart (TextDelta|ThinkingDelta|ThinkingSignature|ToolUse*)* Usage? MessageStop`.
+/// `Notice` steht vor `MessageStart`, weil es von einem Wiederanlauf *vor* dem Stream berichtet
+/// (siehe `http::send_with_retry`); es gehört nicht in den Gesprächsverlauf.
 /// `ToolUseStop` kann auch mitten im Stream kommen (Server, die den tool_call-`index`
 /// recyceln, schließen den vorigen Call beim Start des nächsten), bleibt aber immer
 /// innerhalb der `ToolUse*`-Gruppe vor `Usage`/`MessageStop`. `ThinkingSignature` schließt
@@ -40,16 +44,40 @@ pub use zai::ZaiProvider;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
+    /// Ein Hinweis des Adapters an den Menschen, keine Ausgabe des Modells: erklärt eine
+    /// Verzögerung, die er gerade erlebt hat (etwa einen Wiederanlauf nach `429`). Wird nie
+    /// Teil des Verlaufs und nie ans Modell zurückgeschickt.
+    Notice {
+        text: String,
+    },
     MessageStart,
-    TextDelta { text: String },
-    ThinkingDelta { text: String },
-    ThinkingSignature { signature: String },
-    ToolUseStart { id: String, name: String },
-    ToolUseInputDelta { id: String, partial_json: String },
-    ToolUseStop { id: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
+    ThinkingSignature {
+        signature: String,
+    },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseInputDelta {
+        id: String,
+        partial_json: String,
+    },
+    ToolUseStop {
+        id: String,
+    },
     Usage(Usage),
-    MessageStop { stop_reason: StopReason },
-    Error { message: String },
+    MessageStop {
+        stop_reason: StopReason,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Grund für das Ende eines Turns.
