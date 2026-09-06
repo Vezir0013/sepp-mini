@@ -67,6 +67,18 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - **RPC kennt ein weiteres Ereignis:** `{"type":"notice","text":…}` meldet einen Wiederanlauf.
   Additiv wie alle bisherigen Erweiterungen — ein Client, der es nicht kennt, ignoriert die Zeile.
   Die Stream-Invariante lautet jetzt `Notice* MessageStart … Usage? MessageStop`.
+- **Das Supply-Chain-Gate meldet auch transitive Befunde.** `cargo-deny` bewertet
+  `unsound`- und `unmaintained`-Advisories seit einer Änderung seiner Standardwerte nur noch für
+  Abhängigkeiten, die ein Workspace-Crate direkt nennt. Zwei Befunde zu `lru`
+  (RUSTSEC-2026-0002, RUSTSEC-2026-0253), die transitiv über ratatui hereinkommen, blieben
+  deshalb in CI stumm, obwohl `cargo audit` sie nannte — ein Gate, das nur die erste Ebene
+  ansieht, sagt nichts über die Lieferkette. `deny.toml` setzt beide Felder jetzt ausdrücklich
+  auf „all"; jede Kette zählt. Die zwei lru-Befunde sind bewertet und mit Begründung
+  eingetragen: Beide brauchen Code, den ratatui nicht ausführt — vom `LruCache` benutzt der
+  Layout-Cache nur `get_or_insert`, `resize` und `cap`, also weder `IterMut` noch
+  `LruCache::pop`, und sein Schlüssel `(Rect, Layout)` hat kein `Drop`, das panicken kann.
+  Jeder Ignore trägt seinen Grund jetzt maschinenlesbar, damit die Ausgabe des Gates ihn nennt
+  und nicht nur die Datei.
 
 ### Tests
 - Neunzehn Fälle für die beiden Befunde oben: das Rhai-Verhalten beider „nicht gefunden"-Fälle

@@ -7,12 +7,28 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Beide Felder ausdrücklich setzen: cargo-deny hat den Default für `unsound` auf "workspace"
+# geändert (nur direkte Workspace-Deps schlagen an) — damit blieben zwei lru-Advisories, die
+# transitiv über ratatui hereinkommen, in CI stumm. Ein Gate, das transitive Befunde nicht
+# meldet, sagt nichts aus: hier gilt "all", jede Kette zählt.
+unmaintained = "all"
+unsound = "all"
 ignore = [
     # paste: unmaintained (kein Code-Defekt, kein sicheres Upgrade); nur transitiv via ratatui (TUI).
-    "RUSTSEC-2024-0436",
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, kein Code-Defekt; transitiv via ratatui" },
     # smartstring: unmaintained seit 2026-05 (Repo archiviert; kein Code-Defekt, kein sicheres
     # Upgrade); nur transitiv via rhai (Hooks). Beobachten, ob rhai auf compact_str/smol_str wechselt.
-    "RUSTSEC-2026-0249",
+    { id = "RUSTSEC-2026-0249", reason = "smartstring unmaintained, Repo archiviert; transitiv via rhai" },
+    # lru 0.12.5, zwei unsound-Befunde, transitiv via ratatui 0.29 (Layout-Cache). Beide brauchen
+    # Code, den ratatui nicht ausführt: von `LruCache` benutzt `layout::Layout` nur `get_or_insert`,
+    # `resize` und `cap`. `IterMut` kommt nicht vor (0002), `pop()` auch nicht (0253 — `resize`
+    # verdrängt über `pop_lru`), und der Schlüssel `(Rect, Layout)` hat kein Drop, das panicken
+    # kann; die Kette Panik-im-Drop → `catch_unwind` → Verdrängung ist damit nicht bildbar.
+    # Behebbar erst mit lru >= 0.18.2, das ratatui-core ab 0.30 zieht — ein Update der TUI-
+    # Bibliothek gehört in einen eigenen Schritt, nicht in ein Supply-Chain-Gate. Fällt es,
+    # meldet cargo-deny diese Einträge selbst als `advisory-not-detected`.
+    { id = "RUSTSEC-2026-0002", reason = "lru::IterMut wird von ratatui nicht benutzt (nur get_or_insert/resize/cap)" },
+    { id = "RUSTSEC-2026-0253", reason = "LruCache::pop wird nicht aufgerufen (resize nutzt pop_lru); Schlüssel (Rect, Layout) ohne panickendes Drop" },
 ]
 
 [licenses]
