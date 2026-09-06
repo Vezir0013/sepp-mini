@@ -1782,6 +1782,13 @@ mod tests {
         assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "audit"));
     }
 
+    /// Der WASM-Host legt seine Audit-Spur unter demselben `details`-Schlüssel ab, den der
+    /// Agent ausliest — die beiden Crates kennen sich nicht, deshalb hier der Abgleich.
+    #[test]
+    fn wasm_host_and_agent_agree_on_the_audit_detail_key() {
+        assert_eq!(sepp_wasm::AUDIT_DETAIL_KEY, sepp_agent::AUDIT_DETAIL_KEY);
+    }
+
     #[test]
     fn parse_plugin_subcommand_only_first_arg() {
         assert!(matches!(

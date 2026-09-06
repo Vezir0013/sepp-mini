@@ -318,10 +318,24 @@ fn enforcer(
                 Capability::Exec { .. } => format!("Execute-Allowlist ({fs})"),
             },
         },
+        // Ein Plugin hat weder Sockets noch Dateisystem — nur Host-Funktionen, die der Linker
+        // erst bei Gewährung registriert und die dann je Aufruf selbst prüfen. Für `net` ist
+        // sepp der Netzwerkstack des Moduls: Die Host-Allowlist gilt dort exakt, ohne
+        // Egress-Proxy.
         Actor::Plugin(_) => match cap {
-            Capability::FsRead { .. } => "wasmi-Linker-Gate (host_fs_read: Stub)".into(),
-            Capability::Net { .. } => "wasmi-Linker-Gate (host_http: Stub)".into(),
-            _ => "wasmi-Linker-Gate (kein Host-Import)".into(),
+            Capability::FsRead { .. } => {
+                "wasmi-Linker-Gate + Pfadprüfung je Aufruf (host_fs_read)".into()
+            }
+            Capability::FsWrite { .. } => {
+                "wasmi-Linker-Gate (schließt Lesen ein; kein Schreib-Import)".into()
+            }
+            Capability::Net { .. } => {
+                "wasmi-Linker-Gate + Host-Allowlist je Anfrage (host_http); Secrets: Broker".into()
+            }
+            Capability::Env { .. } => {
+                "Secret-Broker ($NAME in host_http-Headern, nur mit net)".into()
+            }
+            Capability::Exec { .. } => "wasmi-Linker-Gate (kein Host-Import)".into(),
         },
     }
 }
@@ -449,7 +463,7 @@ pub fn render_policy_table(
                         "net".into(),
                         "aus".into(),
                         "eingebaut".into(),
-                        "wasmi-Linker-Gate (host_http nicht registriert)".into(),
+                        "wasmi-Linker-Gate (host_http nicht registriert; lädt nicht, wenn importiert)".into(),
                     ]);
                 }
             }
@@ -552,14 +566,18 @@ pub fn render_policy_table(
             ));
         }
     }
+    // Für Plugins gilt die Host-Liste exakt (`host_http` ist der Netzwerkstack des Moduls);
+    // nur für Agent und MCP-Kindprozesse ist Netz ganz oder gar nicht, bis der Egress-Proxy da ist.
     if set.deny_net.is_none()
-        && set
-            .entries
-            .iter()
-            .any(|e| matches!(&e.cap, Capability::Net { host } if host != "*"))
+        && set.entries.iter().any(|e| {
+            !matches!(e.actor, Actor::Plugin(_))
+                && matches!(&e.cap, Capability::Net { host } if host != "*")
+        })
     {
-        unenforceable
-            .push("Host-Filter für net-Listen (TCP gesamt erlaubt; Egress-Proxy folgt)".into());
+        unenforceable.push(
+            "Host-Filter für net-Listen bei agent/mcp (TCP gesamt erlaubt; Egress-Proxy folgt)"
+                .into(),
+        );
     }
     for w in &set.warnings {
         unenforceable.push(w.clone());
@@ -997,6 +1015,53 @@ mod tests {
         assert!(out.contains("net  [jeder Akteur, jede Quelle]"), "{out}");
         // Ein Hinweis auf den fehlenden Host-Filter wäre unter einem Vollverbot gegenstandslos.
         assert!(!out.contains("Host-Filter für net-Listen"), "{out}");
+    }
+
+    /// Für Plugins gilt die Host-Liste exakt (`host_http`), für Agent und MCP noch nicht.
+    #[test]
+    fn plugin_host_lists_are_enforced_and_do_not_trigger_the_host_filter_note() {
+        let builtin = BuiltinDefaults {
+            extra_deny: Vec::new(),
+            default_mode: Mode::Ask,
+        };
+        let plugin_only = PolicyFile::parse(
+            "[plugin.datev]\nnet = [\"api.datev.de\"]\nenv = [\"DATEV_TOKEN\"]\nfs_read = [\"./\"]\n",
+        )
+        .unwrap();
+        let set = PolicySet::merge(
+            vec![(sepp_policy::Source::File(PathBuf::from("/p")), plugin_only)],
+            &builtin,
+            None,
+            &ctx(),
+        );
+        let out = render_policy_table(&set, &caps(true), &[], "/proj", true);
+        assert!(!out.contains("Host-Filter für net-Listen"), "{out}");
+        assert!(
+            out.contains("Host-Allowlist je Anfrage (host_http)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Secret-Broker ($NAME in host_http-Headern"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Pfadprüfung je Aufruf (host_fs_read)"),
+            "{out}"
+        );
+        assert!(!out.contains("Stub"), "{out}");
+
+        let agent = PolicyFile::parse("[agent]\nnet = [\"api.example.com\"]\n").unwrap();
+        let set = PolicySet::merge(
+            vec![(sepp_policy::Source::File(PathBuf::from("/p")), agent)],
+            &builtin,
+            None,
+            &ctx(),
+        );
+        let out = render_policy_table(&set, &caps(true), &[], "/proj", true);
+        assert!(
+            out.contains("Host-Filter für net-Listen bei agent/mcp"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -1798,9 +1798,13 @@ fn build_tree(store: &dyn SessionStore) -> (Vec<TreeLine>, usize) {
     }
     while let Some((idx, depth)) = stack.pop() {
         let e = &entries[idx];
-        // Guard-Entscheidungen sind Audit-Beiwerk: sie stehen zwar auf dem Pfad, würden den
-        // Baum aber zumüllen und wären als Branch-Ziel sinnlos. Ihre Kinder rücken auf.
-        let skip = matches!(&e.payload, sepp_session::EntryPayload::Custom { kind, .. } if kind == "guard");
+        // Guard-Entscheidungen und Plugin-HTTP-Spuren sind Audit-Beiwerk: sie stehen zwar auf
+        // dem Pfad, würden den Baum aber zumüllen und wären als Branch-Ziel sinnlos. Ihre Kinder
+        // rücken auf.
+        let skip = matches!(
+            &e.payload,
+            sepp_session::EntryPayload::Custom { kind, .. } if kind == "guard" || kind == "plugin_http"
+        );
         let child_depth = if skip {
             depth
         } else {

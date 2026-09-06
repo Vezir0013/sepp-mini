@@ -291,10 +291,59 @@ fn entry_lines(payload: &EntryPayload, tally: &mut Tally) -> Vec<(String, String
             let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
             vec![("Abbruch".into(), preview(reason))]
         }
+        // Die HTTP-Anfragen eines Plugin-Aufrufs (`host_http`): eine Zeile je Versuch, auch
+        // für abgelehnte — die Verweigerung zählt in der Fußzeile wie eine des Guards.
+        EntryPayload::Custom { kind, data } if kind == "plugin_http" => {
+            tally.denied += data.get("denied").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let plugin = data.get("plugin").and_then(|v| v.as_str()).unwrap_or("?");
+            data.get("requests")
+                .and_then(|v| v.as_array())
+                .map(|reqs| reqs.iter().map(|r| http_line(plugin, r)).collect())
+                .unwrap_or_else(|| vec![("HTTP".into(), preview(&format!("{plugin} · ?")))])
+        }
         EntryPayload::Custom { kind, data } => {
             vec![(format!("[{kind}]"), preview(&data.to_string()))]
         }
     }
+}
+
+/// `GET api.example.com/x · 200 · 1,2 KB · 83 ms` — bzw. `DENY GET evil.example/x — <grund>`.
+fn http_line(plugin: &str, r: &serde_json::Value) -> (String, String) {
+    let method = r.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+    let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+    let denied = r.get("denied").and_then(|v| v.as_bool()).unwrap_or(false);
+    let text = match (r.get("status").and_then(|v| v.as_u64()), r.get("error")) {
+        (Some(status), _) => {
+            let bytes = r.get("bytes_in").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ms = r.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "{plugin} · {method} {url} · {status} · {} · {ms} ms",
+                fmt_bytes(bytes)
+            )
+        }
+        (None, Some(err)) => {
+            let prefix = if denied { "DENY " } else { "" };
+            format!(
+                "{plugin} · {prefix}{method} {url} — {}",
+                err.as_str().unwrap_or("?")
+            )
+        }
+        (None, None) => format!("{plugin} · {method} {url}"),
+    };
+    ("HTTP".into(), preview(&text))
+}
+
+/// Bytes für Menschen: `512 B`, `1,2 KB`, `3,4 MB` — deutsches Dezimalkomma, Basis 1024.
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let (value, unit) = if n < 1024 * 1024 {
+        (n as f64 / 1024.0, "KB")
+    } else {
+        (n as f64 / (1024.0 * 1024.0), "MB")
+    };
+    format!("{value:.1} {unit}").replace('.', ",")
 }
 
 fn render_json(view: &SessionView) -> String {
@@ -514,6 +563,22 @@ mod tests {
                     replaced_until: "x".into(),
                 },
                 EntryPayload::Custom {
+                    kind: "plugin_http".into(),
+                    data: json!({
+                        "kind": "plugin_http",
+                        "plugin": "datev",
+                        "tool": "datev",
+                        "denied": 1,
+                        "requests": [
+                            { "method": "GET", "host": "api.example.com", "url": "api.example.com/belege/1",
+                              "status": 200, "bytes_in": 1234, "ms": 83, "secrets": ["DATEV_TOKEN"] },
+                            { "method": "POST", "host": "evil.example", "url": "evil.example/x",
+                              "error": "host_http: evil.example ist nicht gewährt — `sepp policy allow plugin.datev net evil.example`",
+                              "denied": true, "secrets": [] }
+                        ]
+                    }),
+                },
+                EntryPayload::Custom {
                     kind: "unbekannt".into(),
                     data: json!({ "x": 1 }),
                 },
@@ -548,19 +613,42 @@ mod tests {
         assert!(body[8].starts_with("  ") && body[8].contains("alles grün"));
         assert!(body[9].contains("Abbruch") && body[9].contains("missing_api_key"));
         assert!(body[10].contains("Kompakt"));
-        assert!(body[11].contains("[unbekannt]"));
-
+        // Ein plugin_http-Eintrag, zwei Zeilen: eine je Anfrage.
         assert!(
-            text.contains("2 Prompts · 1 Tool-Aufrufe · 1 verweigert · 1 Sub-Agenten"),
+            body[11].contains("HTTP")
+                && body[11].contains("datev · GET api.example.com/belege/1 · 200 · 1,2 KB · 83 ms"),
+            "{}",
+            body[11]
+        );
+        assert!(
+            body[12].contains("HTTP")
+                && body[12].contains(
+                    "DENY POST evil.example/x — host_http: evil.example ist nicht gewährt"
+                ),
+            "{}",
+            body[12]
+        );
+        assert!(body[13].contains("[unbekannt]"));
+
+        // Die verweigerte HTTP-Anfrage zählt in der Fußzeile mit.
+        assert!(
+            text.contains("2 Prompts · 1 Tool-Aufrufe · 2 verweigert · 1 Sub-Agenten"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn fmt_bytes_is_readable() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1234), "1,2 KB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 + 400 * 1024), "3,4 MB");
     }
 
     #[test]
     fn json_output_is_one_object_per_entry() {
         let out = render_json(&full_view());
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 9 + 2, "Wurzel- plus Kind-Einträge");
+        assert_eq!(lines.len(), 10 + 2, "Wurzel- plus Kind-Einträge");
         for l in &lines {
             let v: serde_json::Value = serde_json::from_str(l).expect("gültiges JSON");
             assert!(v["session"].is_string());

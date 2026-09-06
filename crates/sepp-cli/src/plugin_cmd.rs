@@ -381,17 +381,26 @@ description = "Beschreibt, was das Werkzeug tut."
 # Rechte, die das Plugin braucht. Jeder Eintrag braucht das passende Cargo-Feature am SDK
 # (fs_read → "fs-read", net → "net"), sonst importiert das Modul die Funktion nicht und das
 # Recht bleibt wirkungslos. Umgekehrt lädt ein Modul mit Feature, aber ohne Gewährung, nicht.
+# `env` nennt die Variablen, die als `$NAME` in HTTP-Header-Werten eingesetzt werden dürfen —
+# der Host ersetzt sie, das Modul sieht den Wert nie; nur zusammen mit `net`.
 # [capabilities]
 # fs_read = ["./daten"]
 # net = ["api.example.com"]
+# env = ["EXAMPLE_TOKEN"]
 
 [limits]
 max_memory_pages = 64        # à 64 KiB → 4 MiB
 # wasmi ist ein Interpreter, grob 10- bis 20-mal langsamer als nativ. Wer Dokumente verarbeitet,
 # testet an einer zweiseitigen Rechnung, setzt 5000 — und der erste 90-seitige Sammelbeleg
-# bricht ab. Großzügig wählen; 0 = unbegrenzt (bleibt per Ctrl+C abbrechbar).
+# bricht ab. Großzügig wählen; 0 = unbegrenzt (bleibt per Ctrl+C abbrechbar). Die Uhr läuft
+# auch, während eine HTTP-Anfrage wartet.
 max_wall_time_ms = 10000
 fuel_slice       = 1000000   # Instruktionen je Zeitscheibe; danach prüft der Host auf Abbruch
+# Deckel für host_http (nur mit net): Anfragen je Werkzeugaufruf, größte Antwort in Bytes,
+# Zeitbudget je Anfrage in ms (wird auf die Rest-Wanduhr gekappt).
+# max_http_requests       = 16
+# max_http_response_bytes = 4194304
+# http_timeout_ms         = 10000
 "#;
 
 const README_TEMPLATE: &str = r#"# {{name}} — ein Plugin für sepp mini
@@ -643,5 +652,110 @@ mod tests {
             .unwrap();
         assert!(!res.is_error, "{res:?}");
         assert_eq!(res.details["words"], 2);
+    }
+
+    /// Ein Gerüst mit Feature `net` spricht über `host_http` mit einem lokalen Listener — der
+    /// ganze Weg: SDK-Builder → Modul → Host-Allowlist → Leitung → Antwort → `details`. Ebenfalls
+    /// `#[ignore]` (wasm32-Target).
+    #[test]
+    #[ignore = "braucht das Target wasm32-unknown-unknown"]
+    fn scaffold_with_net_talks_to_a_local_listener() {
+        use std::io::{Read, Write};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("netdemo");
+        let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sepp-plugin");
+        new_plugin("netdemo", Some(dir.clone()), Some(sdk)).expect("Gerüst");
+
+        // Feature `net` am SDK, ein Werkzeug, das die URL aus den Argumenten holt, und ein
+        // Manifest, das 127.0.0.1 anfordert.
+        let cargo = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        let cargo = cargo.replace(
+            "sepp-plugin = { path",
+            "sepp-plugin = { features = [\"net\"], path",
+        );
+        assert!(cargo.contains("features = [\"net\"]"), "{cargo}");
+        std::fs::write(dir.join("Cargo.toml"), cargo).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r##"use sepp_plugin::prelude::*;
+
+#[derive(Deserialize, JsonSchema)]
+struct Args { url: String }
+
+#[sepp_plugin::tool(desc = "Holt eine URL über den Host.")]
+fn netdemo(args: Args, host: &Host) -> Result<ToolResult> {
+    let resp = host.http().get(&args.url).header("X-Von", "netdemo").send()?;
+    Ok(ToolResult::text(resp.text()?).with_details(json!({ "status": resp.status })))
+}
+"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("netdemo.toml"),
+            "name = \"netdemo\"\nabi = 1\n[capabilities]\nnet = [\"127.0.0.1\"]\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new("cargo")
+            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+            .current_dir(&dir)
+            .output()
+            .expect("cargo startbar");
+        assert!(
+            out.status.success(),
+            "Netz-Gerüst baut nicht:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Ein Listener, der genau eine Anfrage beantwortet und den Kopf festhält.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while sock.read(&mut b).map(|n| n == 1).unwrap_or(false) {
+                head.push(b[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nservus");
+            String::from_utf8_lossy(&head).to_lowercase()
+        });
+
+        use sepp_tools::Tool as _;
+        let grant = sepp_policy::Policy::new(vec![sepp_policy::Capability::Net {
+            host: "127.0.0.1".into(),
+        }]);
+        let plugin = sepp_wasm::WasmHost::new()
+            .load_file_with_grant(
+                &dir.join("target/wasm32-unknown-unknown/release/netdemo.wasm"),
+                Some(&dir.join("netdemo.toml")),
+                Some(&grant),
+            )
+            .expect("Netz-Gerüst lädt mit Gewährung");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt
+            .block_on(plugin.execute(
+                serde_json::json!({ "url": format!("http://{addr}/hallo") }),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ))
+            .unwrap();
+        assert!(!res.is_error, "{res:?}");
+        assert_eq!(res.details["status"], 200);
+        let sepp_core::ContentBlock::Text { text } = &res.content[0] else {
+            panic!("{res:?}")
+        };
+        assert_eq!(text, "servus");
+        assert_eq!(res.details["audit"]["kind"], "plugin_http");
+        assert_eq!(res.details["audit"]["requests"][0]["status"], 200);
+        let head = seen.join().unwrap();
+        assert!(head.contains("get /hallo http/1.1"), "{head}");
+        assert!(head.contains("x-von: netdemo"), "{head}");
     }
 }
