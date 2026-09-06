@@ -7,6 +7,18 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geplant
+- Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern
+  nur Ports; für WASM-Plugins gilt der Filter seit `host_http` exakt)
+- Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
+- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
+  als Zustimmung bei der Installation
+- OpenTelemetry-Export (optional aktivierbar)
+- OAuth-Login für Subscription-Provider
+- Google-Provider-Adapter
+
+## [0.3.0] - 2026-09-06
+
 Der Autor eines Plugins schreibt eine Funktion, kein Protokoll. Das Beispiel-Plugin hatte 163
 Zeilen, davon rund 107 Zeiger, Exports und JSON-Hüllen — und genau 13 Zeilen Arbeit. Das ist der
 Grund, warum es keine Fremdplugins gab: nicht mangelndes Interesse, sondern ein Aufrufprotokoll,
@@ -121,16 +133,6 @@ damit strukturell: Das Modul kennt deinen Schlüssel nicht. Es kann ihn nicht ke
   inklusive `i32::MIN`, Fehlerobjekte). Gerüst: Parser, Namensregel, Vorlagen ohne Platzhalter,
   Manifest parst ohne unbekannte Schlüssel, nie überschreiben; `#[ignore]`-Test baut und testet
   das Gerüst nativ, baut es für wasm32 und lädt es im Host.
-
-### Geplant
-- Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern
-  nur Ports; für WASM-Plugins gilt der Filter seit `host_http` exakt)
-- Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
-- Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
-  als Zustimmung bei der Installation
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
 
 ## [0.2.1] - 2026-09-05
 
@@ -1014,7 +1016,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...v0.2.0
 [0.1.22]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.21...v0.1.22
