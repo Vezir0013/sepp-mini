@@ -172,7 +172,8 @@ Direkt aus der installierten Binary:
 
 ```bash
 sepp uninstall            # entfernt die Binary; alle .sepp-Daten bleiben erhalten
-sepp uninstall --purge    # entfernt zusätzlich config- und state-Root + projektlokale .sepp (Trust-Registry)
+sepp uninstall --purge    # zusätzlich config- und state-Root + projektlokale .sepp (Trust-Registry);
+                          # zeigt vorher, was verschwindet, und fragt nach (--yes für Skripte)
 ```
 
 Alternativ über den Installer (z. B. wenn die Binary schon weg ist) — `install.sh` liegt nach

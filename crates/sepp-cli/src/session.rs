@@ -39,7 +39,9 @@ pub enum InitScope {
     System,
 }
 
-fn home() -> Result<PathBuf> {
+/// Home-Verzeichnis des Nutzers. `pub(crate)`, weil `uninstall --purge` es als Schutzgrenze
+/// braucht: Was `$HOME` selbst ist, wird nie gelöscht.
+pub(crate) fn home() -> Result<PathBuf> {
     directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))

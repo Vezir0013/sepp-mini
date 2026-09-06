@@ -54,10 +54,12 @@ enum Cmd {
     Init {
         scope: session::InitScope,
     },
-    /// `sepp uninstall [--purge]` — entfernt die Binary (mit `--purge` zusätzlich config- und
-    /// state-Root sowie alle projektlokalen `.sepp` aus der Trust-Registry).
+    /// `sepp uninstall [--purge] [--yes]` — entfernt die Binary (mit `--purge` zusätzlich config-
+    /// und state-Root sowie alle projektlokalen `.sepp` aus der Trust-Registry). `--purge` fragt
+    /// vorher nach; `--yes` beantwortet die Frage für Skripte.
     Uninstall {
         purge: bool,
+        yes: bool,
     },
     /// `sepp policy [show | allow …]` — effektives Regelwerk von Sepp Guard anzeigen.
     Policy(policy_cmd::PolicyCmd),
@@ -109,7 +111,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Cmd::Init { scope }) => run_init(scope),
-        Ok(Cmd::Uninstall { purge }) => run_uninstall(purge),
+        Ok(Cmd::Uninstall { purge, yes }) => run_uninstall(purge, yes),
         Ok(Cmd::Policy(cmd)) => policy_cmd::run_policy(cmd),
         // Lesen einer Session ist reines fs+serde — kein Tokio-Runtime, kein Provider, kein Guard.
         Ok(Cmd::Audit(a)) => audit_cmd::run_audit(a),
@@ -146,13 +148,18 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         }
         Some("uninstall") => {
             let mut purge = false;
+            let mut yes = false;
             for a in &args[1..] {
                 match a.as_str() {
                     "--purge" => purge = true,
+                    "--yes" | "-y" => yes = true,
                     other => return Err(format!("uninstall: unbekannte Option: {other}")),
                 }
             }
-            return Ok(Cmd::Uninstall { purge });
+            if yes && !purge {
+                return Err("uninstall: --yes gilt nur zusammen mit --purge".into());
+            }
+            return Ok(Cmd::Uninstall { purge, yes });
         }
         Some("policy") => {
             return policy_cmd::parse_policy_args(&args[1..]).map(Cmd::Policy);
@@ -351,7 +358,8 @@ fn print_help() {
          \x20 sepp pkg list | remove <n> | untrust <herausgeber>  Pakete zeigen, entfernen, Vertrauen zurücknehmen\n\
          \x20 sepp pkg keygen | pack <dir>  Paket bauen: Schlüssel anlegen, Verzeichnis signieren und packen\n\
          \x20 sepp pkg keygen --registry | index <dir>  Registry betreiben: Betreiber-Schlüssel, signierten Index bauen\n\
-         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
+         \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root +\n\
+         \x20                           projektlokale .sepp; fragt vorher nach, --yes für Skripte)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
          \x20     --mode <m>            Sepp Guard: ask (TUI-Default) | auto (Default bei -p/--rpc)\n\
@@ -602,8 +610,8 @@ fn ensure_dir(p: &Path) -> anyhow::Result<()> {
 /// der Inode bleibt bis Prozessende). Mit `--purge` zusätzlich **beide** globalen Wurzeln
 /// (config_root und state_root, z. B. `/etc/sepp` und `/var/lib/sepp`) **und** alle projektlokalen
 /// `.sepp` aus der Trust-Registry.
-fn run_uninstall(purge: bool) -> ExitCode {
-    match uninstall(purge) {
+fn run_uninstall(purge: bool, yes: bool) -> ExitCode {
+    match uninstall(purge, yes) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Fehler: {e}");
@@ -643,16 +651,77 @@ fn purge_targets(
     out
 }
 
-fn uninstall(purge: bool) -> anyhow::Result<()> {
-    // Hinweis: Unter `cargo run` zeigt current_exe() auf die Dev-Binary in target/ — die würde dann
-    // entfernt. Für den Distributions-Fall (~/.local/bin/sepp) ist genau das gewollt.
-    let exe = std::env::current_exe()?;
-    std::fs::remove_file(&exe)?;
-    println!("Entfernt: {}", exe.display());
+/// Warum ein Löschziel verdächtig ist — der Text geht so in die Meldung.
+#[derive(Debug, PartialEq, Eq)]
+enum PurgeVerdict {
+    Ok,
+    Suspicious(String),
+}
 
-    // Ziele VOR dem Löschen bestimmen: `trust.json` liegt im state_root und muss vorher gelesen
-    // werden (deshalb stehen die globalen Roots in `purge_targets` zuletzt). cwd kanonisieren, damit
-    // es sauber gegen die kanonischen Trust-Keys dedupliziert.
+/// Prüft ein Ziel von `--purge`, bevor `remove_dir_all` darauf losgeht. Rein — ohne Env und ohne
+/// Dateisystem, damit sie wie [`purge_targets`] testbar ist; ob das Ziel wie eine sepp-Wurzel
+/// aussieht, entscheidet der Aufrufer (`looks_like_root`).
+///
+/// Der Grund: `SEPP_HOME` **ist** die Wurzel, nicht ihr Elternverzeichnis. `SEPP_HOME=$HOME`
+/// (die Variable heißt nun mal „HOME") oder `SEPP_CONFIG_DIR=/etc` genügte, und `--purge`
+/// löschte genau das — ohne Rückfrage. Ein Ziel, das hier auffällt, wird übersprungen, nicht
+/// gelöscht; der Rest der Deinstallation läuft weiter.
+fn judge_purge_target(
+    target: &Path,
+    home: &Path,
+    cwd: Option<&Path>,
+    looks_like_root: bool,
+) -> PurgeVerdict {
+    let depth = target.components().count();
+    // `/` hat eine Komponente (RootDir), `/etc` zwei — beides ist nie eine sepp-Wurzel.
+    if depth < 3 {
+        return PurgeVerdict::Suspicious(format!(
+            "{} liegt zu weit oben im Dateisystem",
+            target.display()
+        ));
+    }
+    if target == home {
+        return PurgeVerdict::Suspicious(format!("{} ist das Home-Verzeichnis", target.display()));
+    }
+    if let Some(cwd) = cwd {
+        if cwd.starts_with(target) {
+            return PurgeVerdict::Suspicious(format!(
+                "{} enthält das aktuelle Verzeichnis",
+                target.display()
+            ));
+        }
+    }
+    if !looks_like_root {
+        return PurgeVerdict::Suspicious(format!(
+            "{} sieht nicht wie eine sepp-Wurzel aus (weder `.sepp` noch settings.toml, \
+             policy.toml, trust.json, sessions/ oder pkg/ darin)",
+            target.display()
+        ));
+    }
+    PurgeVerdict::Ok
+}
+
+/// Sieht das Verzeichnis aus wie etwas, das sepp angelegt hat? Entweder heißt es `.sepp`, oder
+/// es enthält eine der Dateien, die nur sepp dort ablegt.
+fn looks_like_sepp_root(dir: &Path) -> bool {
+    if dir.file_name().is_some_and(|n| n == ".sepp") {
+        return true;
+    }
+    [
+        "settings.toml",
+        "policy.toml",
+        "trust.json",
+        "sessions",
+        "pkg",
+    ]
+    .iter()
+    .any(|marker| dir.join(marker).exists())
+}
+
+fn uninstall(purge: bool, yes: bool) -> anyhow::Result<()> {
+    // Ziele ZUERST bestimmen: `trust.json` liegt im state_root und muss vor dem Löschen gelesen
+    // werden (deshalb stehen die globalen Roots in `purge_targets` zuletzt). cwd kanonisieren,
+    // damit es sauber gegen die kanonischen Trust-Keys dedupliziert.
     let config = session::config_root()?;
     let state = session::state_root()?;
     let trusted = session::trusted_projects().unwrap_or_default();
@@ -661,19 +730,7 @@ fn uninstall(purge: bool) -> anyhow::Result<()> {
         .map(|c| std::fs::canonicalize(&c).unwrap_or(c));
     let targets = purge_targets(&config, &state, &trusted, cwd.as_deref());
 
-    if purge {
-        for target in &targets {
-            if target.is_dir() {
-                // Fehler je Ziel tolerieren — ein nicht löschbares Verzeichnis bricht nicht alles ab.
-                match std::fs::remove_dir_all(target) {
-                    Ok(()) => println!("Entfernt (--purge): {}", target.display()),
-                    Err(e) => eprintln!("Konnte {} nicht entfernen: {e}", target.display()),
-                }
-            } else {
-                println!("Nicht gefunden (übersprungen): {}", target.display());
-            }
-        }
-    } else {
+    if !purge {
         let existing: Vec<&PathBuf> = targets.iter().filter(|t| t.is_dir()).collect();
         if !existing.is_empty() {
             println!("Hinweis: folgende Nutzerdaten bleiben erhalten:");
@@ -682,7 +739,89 @@ fn uninstall(purge: bool) -> anyhow::Result<()> {
             }
             println!("         Zum vollständigen Entfernen: sepp uninstall --purge");
         }
+        return remove_binary();
     }
+
+    // Jedes Ziel prüfen, bevor irgendetwas verschwindet. Kanonisch vergleichen, damit ein
+    // symlinktes `SEPP_HOME` nicht an der Home-Prüfung vorbeikommt.
+    let home = sepp_policy::canonicalize_lenient(&session::home()?);
+    let cwd_canon = cwd.as_deref().map(sepp_policy::canonicalize_lenient);
+    let mut doomed: Vec<&PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut missing = 0usize;
+    for target in &targets {
+        if !target.is_dir() {
+            missing += 1;
+            continue;
+        }
+        let canon = sepp_policy::canonicalize_lenient(target);
+        match judge_purge_target(
+            &canon,
+            &home,
+            cwd_canon.as_deref(),
+            looks_like_sepp_root(target),
+        ) {
+            PurgeVerdict::Ok => doomed.push(target),
+            PurgeVerdict::Suspicious(grund) => skipped.push(grund),
+        }
+    }
+
+    // Vorschau auf stderr — stdout bleibt der Datenkanal.
+    eprintln!("sepp uninstall --purge entfernt unwiderruflich:");
+    for t in &doomed {
+        eprintln!("  {}", t.display());
+    }
+    if doomed.is_empty() {
+        eprintln!("  (nichts)");
+    }
+    for grund in &skipped {
+        eprintln!("Übersprungen: {grund}");
+    }
+    if missing > 0 {
+        eprintln!("({missing} Ziel(e) existieren nicht mehr)");
+    }
+    eprintln!("Die Binary {} wird danach entfernt.", current_exe_display());
+
+    let approved = if yes {
+        true
+    } else if pkg_cmd::interactive() {
+        pkg_cmd::confirm("Wirklich löschen?")?
+    } else {
+        anyhow::bail!(
+            "nicht-interaktiv: `--yes` angeben, um dem oben Gezeigten zuzustimmen (es gibt kein \
+             Zurück)"
+        );
+    };
+    if !approved {
+        println!("Abgebrochen — nichts entfernt, die Binary bleibt.");
+        return Ok(());
+    }
+
+    for target in doomed {
+        // Fehler je Ziel tolerieren — ein nicht löschbares Verzeichnis bricht nicht alles ab.
+        match std::fs::remove_dir_all(target) {
+            Ok(()) => println!("Entfernt (--purge): {}", target.display()),
+            Err(e) => eprintln!("Konnte {} nicht entfernen: {e}", target.display()),
+        }
+    }
+    // Die Binary ZULETZT: Wer bei der Rückfrage „nein" sagt oder abbricht, soll sein sepp
+    // behalten. Bis 0.5.1 war sie als Erstes weg, noch vor jeder Prüfung.
+    remove_binary()
+}
+
+fn current_exe_display() -> String {
+    std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unbekannt)".into())
+}
+
+/// Entfernt die laufende Binary. Unix erlaubt die Selbstlöschung; der Inode bleibt bis
+/// Prozessende gültig. Hinweis: Unter `cargo run` zeigt `current_exe()` auf die Dev-Binary in
+/// `target/` — die würde dann entfernt. Für den Distributions-Fall ist genau das gewollt.
+fn remove_binary() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::fs::remove_file(&exe)?;
+    println!("Entfernt: {}", exe.display());
     println!("Deinstallation abgeschlossen.");
     Ok(())
 }
@@ -1750,13 +1889,110 @@ mod tests {
     fn parse_uninstall_flags() {
         assert!(matches!(
             parse(&args(&["uninstall"])).unwrap(),
-            Cmd::Uninstall { purge: false }
+            Cmd::Uninstall {
+                purge: false,
+                yes: false
+            }
         ));
         assert!(matches!(
             parse(&args(&["uninstall", "--purge"])).unwrap(),
-            Cmd::Uninstall { purge: true }
+            Cmd::Uninstall {
+                purge: true,
+                yes: false
+            }
         ));
+        for flag in ["--yes", "-y"] {
+            assert!(matches!(
+                parse(&args(&["uninstall", "--purge", flag])).unwrap(),
+                Cmd::Uninstall {
+                    purge: true,
+                    yes: true
+                }
+            ));
+        }
+        // `--yes` ohne `--purge` beantwortet eine Frage, die niemand stellt.
+        assert!(parse(&args(&["uninstall", "--yes"])).is_err());
         assert!(parse(&args(&["uninstall", "--bogus"])).is_err());
+    }
+
+    /// D1 (0.5.2): `SEPP_HOME` **ist** die Wurzel, nicht ihr Elternverzeichnis — `SEPP_HOME=$HOME`
+    /// oder `SEPP_CONFIG_DIR=/etc` genügte, und `--purge` löschte genau das, ohne Rückfrage.
+    #[test]
+    fn judge_purge_target_refuses_home_root_and_shallow_paths() {
+        let home = Path::new("/home/u");
+        let cwd = Some(Path::new("/home/u/projekt"));
+        for (ziel, wort) in [
+            ("/", "zu weit oben"),
+            ("/etc", "zu weit oben"),
+            ("/home/u", "Home-Verzeichnis"),
+            ("/home", "zu weit oben"),
+        ] {
+            match judge_purge_target(Path::new(ziel), home, cwd, true) {
+                PurgeVerdict::Suspicious(grund) => {
+                    assert!(grund.contains(wort), "{ziel}: {grund}")
+                }
+                PurgeVerdict::Ok => panic!("{ziel} hätte auffallen müssen"),
+            }
+        }
+    }
+
+    /// Ein Ziel, das das aktuelle Verzeichnis enthält, ist nie eine sepp-Wurzel — und ein
+    /// Verzeichnis ohne sepp-Merkmale auch nicht.
+    #[test]
+    fn judge_purge_target_refuses_parents_of_cwd_and_unmarked_dirs() {
+        let home = Path::new("/home/u");
+        let cwd = Some(Path::new("/srv/daten/projekt"));
+        assert!(matches!(
+            judge_purge_target(Path::new("/srv/daten"), home, cwd, true),
+            PurgeVerdict::Suspicious(g) if g.contains("aktuelle Verzeichnis")
+        ));
+        assert!(matches!(
+            judge_purge_target(Path::new("/opt/fremd/daten"), home, cwd, false),
+            PurgeVerdict::Suspicious(g) if g.contains("sepp-Wurzel")
+        ));
+    }
+
+    /// Die echten Wurzeln müssen durchkommen, sonst wäre `--purge` wertlos.
+    #[test]
+    fn judge_purge_target_accepts_real_sepp_roots() {
+        let home = Path::new("/home/u");
+        let cwd = Some(Path::new("/home/u/projekt"));
+        for ziel in [
+            "/etc/sepp",
+            "/var/lib/sepp",
+            "/home/u/.sepp",
+            "/home/u/projekt/.sepp",
+        ] {
+            assert_eq!(
+                judge_purge_target(Path::new(ziel), home, cwd, true),
+                PurgeVerdict::Ok,
+                "{ziel}"
+            );
+        }
+    }
+
+    /// Der Marker-Test greift auf echten Verzeichnissen: `.sepp` heißt es, oder es enthält
+    /// etwas, das nur sepp dort ablegt.
+    #[test]
+    fn looks_like_sepp_root_needs_a_name_or_a_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leer = tmp.path().join("leer");
+        std::fs::create_dir_all(&leer).unwrap();
+        assert!(!looks_like_sepp_root(&leer));
+
+        let dot = tmp.path().join(".sepp");
+        std::fs::create_dir_all(&dot).unwrap();
+        assert!(looks_like_sepp_root(&dot), "der Name genügt");
+
+        for marker in ["settings.toml", "policy.toml", "trust.json"] {
+            let d = tmp.path().join(marker);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(marker), "x").unwrap();
+            assert!(looks_like_sepp_root(&d), "{marker}");
+        }
+        let mit_sessions = tmp.path().join("wurzel");
+        std::fs::create_dir_all(mit_sessions.join("sessions")).unwrap();
+        assert!(looks_like_sepp_root(&mit_sessions));
     }
 
     #[test]

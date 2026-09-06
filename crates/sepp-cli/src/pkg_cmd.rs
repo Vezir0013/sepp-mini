@@ -388,12 +388,34 @@ fn roots() -> Result<Roots> {
     })
 }
 
-/// Fragen gibt es nur, wenn jemand antworten kann.
-fn interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+/// Fragen gibt es nur, wenn jemand antworten kann — stdin **oder** das Terminal selbst.
+///
+/// `/dev/tty` ist der Grund für das „oder": `curl … | sh -s -- --uninstall --purge` ist ein
+/// dokumentierter Weg, und dort ist stdin die Pipe. Ein Installer, der deshalb nicht fragt,
+/// löscht ungefragt; einer, der abbricht, ist unbenutzbar. Also fragen wir das Terminal direkt.
+pub(crate) fn interactive() -> bool {
+    (std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) || tty().is_some()
 }
 
-fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
+/// Das steuernde Terminal, falls es eins gibt (nicht auf Windows).
+fn tty() -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/tty")
+            .ok()
+            .filter(|f| f.is_terminal())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Stellt die Frage auf stderr und liest die Antwort — von stdin, wenn das ein Terminal ist,
+/// sonst vom steuernden Terminal.
+pub(crate) fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
     let mut err = std::io::stderr();
     match default {
         Some(d) => write!(err, "{prompt} [{d}]: ")?,
@@ -401,7 +423,12 @@ fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
     }
     err.flush()?;
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
+    if std::io::stdin().is_terminal() {
+        std::io::stdin().read_line(&mut line)?;
+    } else {
+        let tty = tty().ok_or_else(|| anyhow!("kein Terminal für die Rückfrage"))?;
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(tty), &mut line)?;
+    }
     let line = line.trim();
     if line.is_empty() {
         return Ok(default.unwrap_or("").to_string());
@@ -409,7 +436,8 @@ fn ask(prompt: &str, default: Option<&str>) -> Result<String> {
     Ok(line.to_string())
 }
 
-fn confirm(question: &str) -> Result<bool> {
+/// Ja/Nein-Frage; alles außer einer ausdrücklichen Zustimmung ist Nein.
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     let a = ask(&format!("{question} [j/N]"), None)?;
     Ok(matches!(
         a.to_lowercase().as_str(),

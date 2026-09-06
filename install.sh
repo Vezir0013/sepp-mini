@@ -11,6 +11,7 @@
 #                                       # (FHS: /etc/sepp config + /var/lib/sepp state)
 #   sh install.sh --uninstall          # Binary entfernen (Nutzerdaten bleiben)
 #   sh install.sh --uninstall --purge  # zusätzlich config+state-Root + projektlokale .sepp löschen
+#                                     # (fragt vorher nach; --yes beantwortet die Frage)
 #   curl -fsSL <raw-url>/install.sh | sh -s -- --uninstall --purge   # via Pipe
 #
 # Umgebung:
@@ -33,7 +34,8 @@ usage() {
     log "  --system          Systemweit: Binary nach /usr/local/bin + 'sepp init --system' (FHS-Layout)"
     log "  --from-source     Via 'cargo install' aus dem Quellcode bauen (braucht Rust)"
     log "  --uninstall       Binary entfernen (Nutzerdaten bleiben erhalten)"
-    log "  --uninstall --purge   zusätzlich config+state-Root + projektlokale .sepp löschen"
+    log "  --uninstall --purge   zusätzlich config+state-Root + projektlokale .sepp löschen (fragt nach)"
+    log "  --yes, -y         Rückfrage beim Löschen mit Ja beantworten (für Skripte)"
     log "  -h, --help        Diese Hilfe"
 }
 
@@ -45,13 +47,56 @@ from_source() {
     exit 0
 }
 
+# Sieht das Verzeichnis aus wie etwas, das sepp angelegt hat? Gleiche Regel wie in der Binary:
+# `/` und `/etc` sind es nie, `$HOME` selbst auch nicht, und irgendein sepp-Merkmal muss da sein.
+looks_like_sepp_root() {
+    d="$1"
+    [ "$d" = "/" ] && return 1
+    [ "$d" = "$HOME" ] && return 1
+    # Weniger als zwei Verzeichnisebenen (z. B. /etc) ist nie eine Wurzel.
+    case "${d#/}" in
+        */*) : ;;
+        *) return 1 ;;
+    esac
+    case "$(basename "$d")" in
+        .sepp) return 0 ;;
+    esac
+    for marker in settings.toml policy.toml trust.json sessions pkg; do
+        [ -e "$d/$marker" ] && return 0
+    done
+    return 1
+}
+
+# Rückfrage vor einer unwiderruflichen Löschung. Liest `/dev/tty`, weil der dokumentierte Weg
+# `curl … | sh -s -- --uninstall --purge` stdin als Pipe belegt. Kein Terminal und kein --yes:
+# nicht löschen.
+confirm_purge() {
+    [ "$do_yes" = 1 ] && return 0
+    if [ ! -r /dev/tty ]; then
+        log "Nicht-interaktiv und ohne --yes: $1 bleibt stehen."
+        return 1
+    fi
+    printf 'Unwiderruflich löschen: %s [j/N] ' "$1" >&2
+    read -r answer < /dev/tty || return 1
+    case "$answer" in
+        j|ja|J|Ja|y|yes|Y|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 uninstall() {
     target="${BIN_DIR}/sepp"
     # Ist die Binary noch da, übernimmt sie das vollständige Entfernen selbst — beide Wurzeln
     # (config_root + state_root) und projektlokale .sepp via Trust-Registry, konsistent mit `sepp`.
     if [ -x "$target" ]; then
         if [ "$do_purge" = 1 ]; then
-            "$target" uninstall --purge
+            # Die Binary fragt selbst nach (auch über /dev/tty, wenn stdin eine Pipe ist);
+            # `--yes` reichen wir nur durch, wenn der Aufrufer es gesetzt hat.
+            if [ "$do_yes" = 1 ]; then
+                "$target" uninstall --purge --yes
+            else
+                "$target" uninstall --purge
+            fi
         else
             "$target" uninstall
         fi
@@ -63,7 +108,18 @@ uninstall() {
     log "Nicht gefunden (übersprungen): $target"
     if [ "$do_purge" = 1 ]; then
         for d in "$config_dir" "$state_dir"; do
-            [ -d "$d" ] && rm -rf "$d" && log "Entfernt (--purge): $d"
+            [ -d "$d" ] || continue
+            # Dieselben Grenzen wie in der Binary: SEPP_HOME *ist* die Wurzel, nicht ihr
+            # Elternverzeichnis — `SEPP_HOME=$HOME` würde hier sonst das Home löschen.
+            if ! looks_like_sepp_root "$d"; then
+                log "Übersprungen: $d sieht nicht wie eine sepp-Wurzel aus"
+                continue
+            fi
+            if ! confirm_purge "$d"; then
+                log "Übersprungen: $d (nicht bestätigt)"
+                continue
+            fi
+            rm -rf "$d" && log "Entfernt (--purge): $d"
         done
     else
         log "Hinweis: Nutzerdaten ($config_dir, $state_dir) bleiben erhalten."
@@ -101,6 +157,7 @@ ensure_path() {
 # Argumente einsammeln (echte Schleife, damit --uninstall --purge in beliebiger Reihenfolge geht).
 mode=install
 do_purge=0
+do_yes=0
 do_from_source=0
 do_system=0
 while [ $# -gt 0 ]; do
@@ -109,6 +166,7 @@ while [ $# -gt 0 ]; do
         --system)      do_system=1 ;;
         --uninstall)   mode=uninstall ;;
         --purge)       do_purge=1 ;;
+        --yes|-y)      do_yes=1 ;;
         -h|--help)     usage; exit 0 ;;
         *) die "unbekannte Option: $1 (erlaubt: --system, --from-source, --uninstall, --purge, --help)" ;;
     esac
@@ -116,6 +174,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$do_purge" = 1 ] && [ "$mode" != uninstall ] && die "--purge ist nur zusammen mit --uninstall gültig"
+[ "$do_yes" = 1 ] && [ "$do_purge" != 1 ] && die "--yes ist nur zusammen mit --purge gültig"
 
 # Binary-Zielverzeichnis: --system installiert systemweit (sofern SEPP_BIN_DIR nicht explizit gesetzt).
 if [ -n "${SEPP_BIN_DIR:-}" ]; then

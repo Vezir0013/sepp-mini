@@ -8,6 +8,22 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 ## [Unreleased]
 
 ### Behoben
+- **`sepp uninstall --purge` löschte ungefragt, was die Wurzeln gerade bedeuten.** `SEPP_HOME`
+  **ist** die Wurzel, nicht ihr Elternverzeichnis: `SEPP_HOME=$HOME` (die Variable heißt nun mal
+  „HOME") oder `SEPP_CONFIG_DIR=/etc` genügte, und `--purge` ließ `remove_dir_all` darauf los —
+  ohne Rückfrage, ohne Plausibilitätsprüfung. Und die Binary war zu dem Zeitpunkt schon weg: Sie
+  wurde als Allererstes entfernt, noch vor jeder Prüfung. Jetzt ist die Reihenfolge umgedreht —
+  Ziele bestimmen, prüfen, Vorschau zeigen, fragen, löschen, **Binary zuletzt**. Wer „nein" sagt,
+  behält sein sepp. Verdächtige Ziele werden übersprungen und mit Grund genannt, der Rest läuft
+  durch: `/`, flache Pfade wie `/etc`, das Home-Verzeichnis selbst, alles, was das aktuelle
+  Verzeichnis enthält, und jedes Verzeichnis ohne sepp-Merkmal (weder `.sepp` noch
+  `settings.toml`, `policy.toml`, `trust.json`, `sessions/`, `pkg/` darin). Verglichen wird
+  kanonisch, damit ein symlinktes `SEPP_HOME` nicht daran vorbeikommt.
+  Die Rückfrage liest `/dev/tty`, wenn stdin keine Terminal ist — sonst bliebe der dokumentierte
+  Weg `curl … | sh -s -- --uninstall --purge` ungefragt. Ohne jedes Terminal bricht der Vorgang
+  ab und nennt `--yes`, das neue Flag für Skripte. Der Fallback in `install.sh` (Binary schon
+  weg) löschte bisher selbst mit `rm -rf` und umging jede Prüfung; er hat jetzt dieselben Grenzen
+  und dieselbe Rückfrage.
 - **Ein Plugin bestimmte seine Verbrauchsgrenzen selbst.** `[limits]` im Manifest kam ungeprüft
   beim Host an. Das trifft die einzige Stelle, an der der WASM-Host Abbruch und Wanduhr prüft:
   den Yield-Punkt des Fuel-Slicings. Mit `fuel_slice = u64::MAX` gibt es ihn nie — Ctrl+C wirkte
@@ -105,6 +121,10 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   Platzhalter statt ein leeres Ergebnis zu liefern. Das Session-Format bleibt unverändert.
 
 ### Tests
+- `sepp-cli`: verdächtige Löschziele (`/`, `/etc`, `$HOME`, Elternteil des aktuellen
+  Verzeichnisses, Verzeichnis ohne Merkmal) fallen auf, echte Wurzeln kommen durch, der
+  Merkmal-Test greift auf echten Verzeichnissen; `--yes`/`-y` im Parser, `--yes` ohne `--purge`
+  ist ein Fehler.
 - `sepp-policy`: `clamped_to_host` kappt genau die Felder über den Decken und meldet jedes im
   Klartext, lässt Defaults und `max_wall_time_ms = 0` in Ruhe; die Decken liegen nie unter den
   Defaults (sonst bekäme jedes Plugin eine Startmeldung); ein Manifest über der Decke parst
