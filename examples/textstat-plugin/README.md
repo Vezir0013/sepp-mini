@@ -90,7 +90,7 @@ importiert, nichts. Prüfen lässt sich die Lage jederzeit mit `sepp policy`.
 |---|---|---|---|
 | — | `host.log(..)` | `host_log` | immer |
 | `fs-read` | `host.fs().read(..)`, `read_to_string(..)` | `host_fs_read_bytes` (+ Abholweg `host_result_read`) | `fs_read` oder `fs_write` |
-| `net` | `host.http().get(..).send()` | `host_http` (+ Abholweg) | `net` — **provisorisch**, der Host antwortet heute mit einem Fehler; Stufe 3 setzt es um |
+| `net` | `host.http().get(..).send()` | `host_http` (+ Abholweg) | `net` — Host-Allowlist je Anfrage; `$NAME` in Header-Werten zusätzlich `env`; keine Redirects; jede Anfrage in `sepp audit` |
 
 `host.fs().read` liefert die Datei **roh** (`Vec<u8>`) — ein PDF kommt als PDF an. Der Pfad wird
 wie bei den eingebauten Tools aufgelöst und gegen dieselbe Policy geprüft; ein Plugin kommt nicht
@@ -100,7 +100,7 @@ weiter als der Agent selbst. Höchstens 16 MiB.
 
 **Es gibt keinen Zustand zwischen zwei Aufrufen.** Der Host verwirft die Instanz nach jedem
 Werkzeugaufruf. Ein `static` ist beim nächsten Aufruf wieder leer; Sitzungen, Tokens oder Caches
-müssen im Host leben (das ist Gegenstand von Stufe 3).
+müssen im Host leben (Cookie-Jar und OAuth-Refresh dort sind geplant).
 
 **Die Standardbibliothek trägt nur zur Hälfte.** Rust lässt sich für `wasm32-unknown-unknown` mit
 `std` bauen, aber alles darin, was das Betriebssystem braucht, ist eine Attrappe: Eine Zeitmessung

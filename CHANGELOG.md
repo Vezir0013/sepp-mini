@@ -15,7 +15,48 @@ Funktion das Werkzeug, und die Schnittstelle steht als Vertrag in einer Datei, g
 den Host prüft. Alles davon ist **additiv**: Das ABI bleibt bei Version 1, ein bestehendes Modul
 merkt nichts.
 
+Und `host_http` ist keine Attrappe mehr. Ein Plugin hat keine Sockets, nur diese eine Funktion —
+sepp **ist** der Netzwerkstack des Moduls. Deshalb kann der Host an der Grenze durchsetzen, was für
+`bash` und MCP-Kindprozesse erst der Egress-Proxy bringt: die Host-Allowlist exakt je Anfrage,
+Secrets erst im Host eingesetzt, jede Anfrage in der Audit-Spur. Der Satz aus dem Paket-Plan gilt
+damit strukturell: Das Modul kennt deinen Schlüssel nicht. Es kann ihn nicht kennen.
+
 ### Hinzugefügt
+- **`host_http` als durchsetzender Proxy.** Je Anfrage prüft der Host in dieser Reihenfolge und
+  fail-closed: Zähler (`max_http_requests` je Werkzeugaufruf) → http(s)-URL → keine
+  `$NAME`-Platzhalter in der URL (sie stünde in jeder Fehlermeldung) → der Host der URL ist
+  gewährt (exakt, `*.suffix` oder `*` — dieselbe `Policy::allows`, die überall gilt) → je
+  Platzhalter in einem Header-Wert das **Doppel-Gate** wie bei http-MCP-Servern (Host gewährt,
+  Variable per `env` gewährt, Variable gesetzt), erst dann wird ersetzt → Body und Methode →
+  Abbruch und Zeitbudget (`http_timeout_ms`, auf die Rest-Wanduhr gekappt) → Anfrage. Vor der
+  Allowlist geht kein Byte auf die Leitung; jeder Fehler nennt den passenden `sepp policy allow
+  plugin.<name> …`-Befehl und nie einen Wert. **Keine automatischen Redirects**: Ein 3xx auf einen
+  anderen Host wäre eine Anfrage, die die Allowlist nie gesehen hat — es geht als Antwort ans
+  Modul, das selbst neu anfragen darf, und jeder Hop läuft durch dieselbe Prüfung. Die Antwort
+  wird **gestreamt und vor dem Puffern gedeckelt** (`max_http_response_bytes`: Content-Length
+  vorab, beim Lesen gezählt). Die Ausführung liegt in einem eigenen Thread `sepp-http` mit eigener
+  Runtime, weil die Host-Funktion synchron in der wasmi-Closure läuft — beim Werkzeugaufruf im
+  Blocking-Pool, beim Laden auf dem Reactor-Thread, wo `Handle::block_on` panicken würde. Der
+  Thread startet beim ersten Auftrag, bedient parallele Aufrufe nebenläufig, wartet je Anfrage mit
+  `select!` auf Antwort, Abbruch oder Timeout und endet mit dem Host. Textantworten bleiben Text;
+  was kein UTF-8 ist, kommt als `body_base64` (Anfragen entsprechend mit `body_base64`).
+- **Die Audit-Spur kennt HTTP.** Jeder Versuch eines Plugins — auch ein abgelehnter — landet als
+  Eintrag `kind = "plugin_http"` in der Sitzung (`details.audit` des Werkzeugergebnisses, ein
+  Objekt je Aufruf mit allen Anfragen: Methode, Host, URL ohne Query, Status oder Fehler, Bytes,
+  Dauer, **Namen** ersetzter Secrets, nie Werte). `sepp audit` zeigt je Anfrage eine Zeile
+  (`HTTP  datev · GET api.example.com/belege/1 · 200 · 1,2 KB · 83 ms`, abgelehnte als `DENY …`)
+  und zählt Verweigerungen in der Fußzeile mit; `/tree` blendet die Einträge wie `guard` aus.
+  Der Schlüssel `audit` in `details` gehört dem Host — ein Test in `sepp-cli` hält ihn mit
+  `sepp_agent::AUDIT_DETAIL_KEY` gleich, weil sich die beiden Crates nicht kennen.
+- **Neue `[limits]`-Felder im Manifest**, additiv mit Defaults: `max_http_requests` (16),
+  `max_http_response_bytes` (4 MiB, höchstens 16 MiB — der Ergebnisdeckel des Hosts, ein Test hält
+  beide gleich), `http_timeout_ms` (10 000). Die Gerüst-Vorlage von `sepp plugin new` nennt sie
+  auskommentiert und erklärt `env = [...]`.
+- **SDK: Binär-Bodies.** `RequestBuilder::body_bytes`, `Response::bytes()`/`text()`/`header()`/
+  `is_success()`; `base64` kommt nur mit dem Feature `net` ins Modul — ein Plugin ohne Netz wächst
+  nicht. `sepp policy` nennt für Plugins jetzt die echten Vollstrecker („Host-Allowlist je Anfrage
+  (host_http); Secrets: Broker", „Pfadprüfung je Aufruf (host_fs_read)") statt „Stub", und die
+  Zeile „Host-Filter nicht durchsetzbar" gilt nur noch für `agent`/`mcp` — für Plugins ist er es.
 - **Guest-SDK `sepp-plugin` und Attribut `#[sepp_plugin::tool]`** (`sepp-plugin-macros`). Aus
   `fn name(args: Args, host: &Host) -> Result<ToolResult>` werden Exports, Zeigerarithmetik,
   Abholweg und Fehlerhülle erzeugt; das Parameter-Schema entsteht aus `Args` (`schemars`), ein
@@ -31,8 +72,7 @@ merkt nichts.
   `cdylib` ist ein Implementierungsdetail von rustc, kein Vertrag.
 - **`wit/sepp.wit` als Vertragstext der Plugin-Schnittstelle.** Die logische Schnittstelle als
   WIT (`fs-read` typisiert als `result<list<u8>, string>` — genau daran war der Lossy-Fehler
-  aufgefallen; `http` provisorisch mit Request-/Response-Records für Stufe 3) und darunter die
-  Kodierung für Core-WASM. Kein Generator, kein Component Model: WIT ist Bauzeit, wasmi bleibt
+  aufgefallen; `http` mit Request-/Response-Records) und darunter die Kodierung für Core-WASM. Kein Generator, kein Component Model: WIT ist Bauzeit, wasmi bleibt
   Laufzeit. Der Host trägt seine Importe jetzt in einer Tabelle (`HOST_IMPORTS` mit `Gate`,
   `EXPORTS`), aus der `build_linker` und `check_exports` lesen, und ein Test hält Tabelle und
   WIT synchron — eine Funktion, die die eine Seite kennt und die andere nicht, fällt sofort auf.
@@ -54,8 +94,26 @@ merkt nichts.
   Die README des Beispiels erklärt jetzt den SDK-Weg zuerst und nennt korrekt **fünf**
   Host-Importe (`host_fs_read_bytes` fehlte seit 0.2.1).
 - `sepp-core` zieht optional `schemars` (Feature `schema`); bleibt I/O-frei und synchron.
+- **`url_host` und der Kern des Doppel-Gates liegen in `sepp-policy`** (`SecretBroker::gate`,
+  `from_env_for`, `GateRefusal::explain`, `Actor::cli_name`), damit MCP-Client und WASM-Host
+  dieselbe Kette prüfen und dieselben Sätze sagen; `sepp_mcp::url_host` bleibt als Re-Export, die
+  MCP-Meldungen sind wortgleich.
+- `sepp-wasm` zieht `reqwest` (Workspace-Version, Redirects aus, Connect-Timeout, User-Agent
+  `sepp/<version>`) und `base64`; `WasmPlugin` hält seinen unveränderlichen Kern in einem `Arc`,
+  und der Abschnittsname `[plugin.<name>]` wird getrennt vom exponierten Werkzeugnamen geführt —
+  `rename` (Kollisionspräfix `wasm__`) verfälscht so keinen `sepp policy allow`-Hinweis mehr.
 
 ### Tests
+- `host_http` gegen lokale Listener: erlaubter Host geht auf die Leitung (User-Agent, Status,
+  Body, Header, Audit); nicht gewährter Host → kein Connect, Fehlertext nennt den Befehl;
+  Secret-Header nur mit beiden Gewährungen auf der Leitung, Wert in keinem Text, Name in der Spur;
+  ohne `env`-Gewährung geht nichts raus; 302 wird übergeben, nicht gefolgt; binäre Antwort als
+  base64; Übergröße, stummer Server (Timeout in der Zeit), Abbruch während einer hängenden
+  Anfrage → `Aborted`; Regelkette ohne Modul (URL-Platzhalter, Schema, Zähler, Deadline,
+  Redaktion, Audit-Bündelung); Worker allein (lazy Start, Deckel vor und beim Lesen, Timeout,
+  Cancel, kein Redirect, abgelehnte Verbindung ohne Panik). `#[ignore]`-Test: ein Gerüst von
+  `sepp plugin new` mit Feature `net` baut für wasm32, lädt mit Gewährung und spricht über
+  `host_http` mit einem lokalen Listener.
 - Sync-Test WIT ↔ `HOST_IMPORTS`/`EXPORTS`; unter voller Gewährung lädt ein Modul mit allen
   Importen, ohne Gewährung fehlt jeder gegatete Import einzeln. Makro-Fehlerpfade gegen `expand`
   (fehlendes `desc`, ungültiger Name, falsche Signatur, `async`, Generics); Makro-Erfolgspfad
@@ -65,9 +123,9 @@ merkt nichts.
   das Gerüst nativ, baut es für wasm32 und lädt es im Host.
 
 ### Geplant
-- Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
-- `host_http` für WASM-Plugins als durchsetzender Proxy (Signatur und SDK-Seite stehen, Umsetzung
-  im Host folgt)
+- Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern
+  nur Ports; für WASM-Plugins gilt der Filter seit `host_http` exakt)
+- Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
 - Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
   als Zustimmung bei der Installation
 - OpenTelemetry-Export (optional aktivierbar)

@@ -501,9 +501,12 @@ Kind-Sessions zu; `--json` gibt ein Objekt je Eintrag aus, etwa für
 
 **Grenzen, ehrlich benannt:** Landlock kennt keine Verbote unterhalb einer Gewährung (ein Deny
 unter `fs_read = ["~"]` gilt für `bash` nicht, für `read`/`write`/`edit` schon; `sepp policy`
-meldet solche Überlappungen). Netz ist für Kindprozesse „ganz oder gar nicht"; der Host-Filter
-kommt mit dem Egress-Proxy, und deshalb sperrt auch ein `[deny] net` mit Hostliste alles, mit
-Hinweis. Verbieten lassen sich nur Pfade und Netz; `exec` und `env` kann `[deny]` nicht, weil
+meldet solche Überlappungen). Netz ist für Kindprozesse (`bash`, MCP-stdio) „ganz oder gar
+nicht"; der Host-Filter kommt dort mit dem Egress-Proxy, und deshalb sperrt auch ein `[deny] net`
+mit Hostliste alles, mit Hinweis. Für WASM-Plugins gilt der Host-Filter dagegen **exakt je
+Anfrage**: Ein Plugin hat keine Sockets, nur `host_http`, und sepp ist sein Netzwerkstack —
+Allowlist, Secrets (`$NAME` in Header-Werten, Doppel-Gate `net` + `env`), keine Redirects, jede
+Anfrage in der Audit-Spur. Verbieten lassen sich nur Pfade und Netz; `exec` und `env` kann `[deny]` nicht, weil
 Landlock für beides nur Erlaubnislisten kennt. Das TCP-Verbot braucht Landlock ABI 4 (Kernel ≥ 6.7). Exec-Listen sind
 auf macOS wegen Apples Shims fragil. Unter Guard verliert die Shell alle nicht freigegebenen
 Umgebungsvariablen (`[agent].env` ist der Schalter). Im Audit stehen Entscheidungen aus einem
@@ -555,7 +558,8 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
 - [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
 - [x] Plugin-ABI Version 1 festgezurrt, `host_fs_read` und `host_fs_read_bytes` gebaut
-- [ ] `host_http` für WASM-Plugins (Signatur und SDK-Seite stehen, Umsetzung im Host folgt)
+- [x] `host_http` für WASM-Plugins als durchsetzender Proxy: Host-Allowlist je Anfrage, Secret-Broker, Audit, keine Redirects
+- [ ] Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
 - [x] Plugin-SDK `sepp-plugin`, das Speicher und Zeiger kapselt; Vertrag `wit/sepp.wit`; `sepp plugin new`
 - [ ] Paketformat und `sepp pkg install`
 
