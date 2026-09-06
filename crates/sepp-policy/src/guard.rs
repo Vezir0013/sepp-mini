@@ -335,6 +335,18 @@ pub enum Actor {
     Plugin(String),
 }
 
+impl Actor {
+    /// Die Schreibweise, die `sepp policy allow` versteht: `agent`, `mcp.<name>`, `plugin.<name>`
+    /// (Gegenstück zu `policy_edit::parse_actor`). Für Fehlertexte, die den passenden Befehl nennen.
+    pub fn cli_name(&self) -> String {
+        match self {
+            Actor::Agent => "agent".to_string(),
+            Actor::Mcp(n) => format!("mcp.{n}"),
+            Actor::Plugin(n) => format!("plugin.{n}"),
+        }
+    }
+}
+
 impl fmt::Display for Actor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1192,6 +1204,17 @@ pub fn path_under(path: &Path, prefixes: &[PathBuf]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_name_round_trips_through_parse_actor() {
+        for a in [
+            Actor::Agent,
+            Actor::Mcp("gh".into()),
+            Actor::Plugin("datev".into()),
+        ] {
+            assert_eq!(crate::policy_edit::parse_actor(&a.cli_name()), Some(a));
+        }
+    }
     use crate::NullSandbox;
 
     const EXAMPLE: &str = r#"

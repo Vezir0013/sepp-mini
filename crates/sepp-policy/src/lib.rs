@@ -32,7 +32,7 @@ pub use sandbox::{
     default_sandbox, kernel_capabilities, probe_sandbox, resolve_program, NullSandbox, Sandbox,
     SandboxCapabilities,
 };
-pub use secrets::{placeholder_names, SecretBroker};
+pub use secrets::{placeholder_names, GateRefusal, SecretBroker};
 
 /// Ein atomares Recht.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +305,27 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
+/// Host einer http(s)-URL — ohne Schema, Userinfo, Port und Pfad.
+///
+/// Reicht für das Net-Gate: [`Capability::Net`] kennt nur Hostnamen (exakt oder `*.suffix`).
+/// Andere Schemata liefern `None` — der Aufrufer lehnt sie ab. Genutzt vom MCP-Client
+/// (Secret-Header) und vom WASM-Host (`host_http`), deshalb hier und nicht in einem von beiden.
+pub fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo abschneiden (`user:pass@host`).
+    let authority = authority.rsplit('@').next()?;
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        // IPv6-Literal: alles bis zur schließenden Klammer.
+        v6.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
+}
+
 /// Vorgabe für [`Manifest::abi`]: ein Manifest ohne Angabe meint Version 1.
 fn abi_v1() -> u32 {
     1
@@ -415,7 +436,23 @@ pub struct Limits {
     pub max_wall_time_ms: u64,
     /// Instruktionen pro Zeitscheibe — das Yield-Intervall des Fuel-Slicings (Default: 1 000 000).
     pub fuel_slice: u64,
+    /// HTTP-Anfragen über `host_http` je Werkzeugaufruf (Default: 16). Die Instanz lebt nur einen
+    /// Aufruf lang; mehr Anfragen sind fast immer eine Schleife, die außer Kontrolle geraten ist.
+    pub max_http_requests: u32,
+    /// Größte Antwort, die `host_http` ans Modul reicht, in Bytes (Default: 4 MiB, höchstens
+    /// [`MAX_HTTP_RESPONSE_BYTES`]). Wird **vor** dem Puffern geprüft (Content-Length) und beim
+    /// Streamen gezählt. Binäre Antworten kommen base64-kodiert an und wachsen um 4/3 — nahe der
+    /// Obergrenze laufen sie in den Ergebnisdeckel des Hosts („Ergebnis zu groß").
+    pub max_http_response_bytes: u64,
+    /// Zeitbudget je HTTP-Anfrage in Millisekunden (Default: 10 000). Wird zusätzlich auf die
+    /// verbleibende Wanduhr des Aufrufs (`max_wall_time_ms`) gekappt; während eine Anfrage
+    /// läuft, tickt die Wanduhr weiter.
+    pub http_timeout_ms: u64,
 }
+
+/// Obergrenze für [`Limits::max_http_response_bytes`] — entspricht dem Ergebnisdeckel des
+/// WASM-Hosts (`MAX_PLUGIN_BYTES`, 16 MiB); ein Test in `sepp-wasm` hält beide gleich.
+pub const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -423,6 +460,9 @@ impl Default for Limits {
             max_memory_pages: 256,
             max_wall_time_ms: 30_000,
             fuel_slice: 1_000_000,
+            max_http_requests: 16,
+            max_http_response_bytes: 4 * 1024 * 1024,
+            http_timeout_ms: 10_000,
         }
     }
 }
@@ -445,6 +485,27 @@ impl Limits {
                 "manifest [limits]: max_memory_pages muss in 1..=65536 liegen (ist {})",
                 self.max_memory_pages
             )));
+        }
+        if self.max_http_requests == 0 {
+            return Err(SeppError::Config(
+                "manifest [limits]: max_http_requests muss > 0 sein (ohne Netz: kein net-Recht \
+                 anfordern)"
+                    .into(),
+            ));
+        }
+        if self.max_http_response_bytes == 0
+            || self.max_http_response_bytes > MAX_HTTP_RESPONSE_BYTES
+        {
+            return Err(SeppError::Config(format!(
+                "manifest [limits]: max_http_response_bytes muss in 1..={MAX_HTTP_RESPONSE_BYTES} \
+                 liegen (ist {})",
+                self.max_http_response_bytes
+            )));
+        }
+        if self.http_timeout_ms == 0 {
+            return Err(SeppError::Config(
+                "manifest [limits]: http_timeout_ms muss > 0 sein".into(),
+            ));
         }
         Ok(())
     }
@@ -590,6 +651,22 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn url_host_strips_scheme_userinfo_port_and_path() {
+        assert_eq!(
+            url_host("https://api.example.com/mcp"),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            url_host("http://u:p@api.example.com:8443/x?y"),
+            Some("api.example.com")
+        );
+        assert_eq!(url_host("https://[::1]:8080/mcp"), Some("::1"));
+        assert_eq!(url_host("api.example.com/mcp"), None, "ohne Schema");
+        assert_eq!(url_host("ftp://api.example.com/x"), None, "fremdes Schema");
+        assert_eq!(url_host("https:///mcp"), None, "leerer Host");
     }
 
     #[test]
@@ -747,6 +824,25 @@ mod tests {
         assert_eq!(m.limits.max_wall_time_ms, 30_000);
         assert_eq!(m.limits.fuel_slice, 1_000_000);
         assert_eq!(m.limits.max_memory_bytes(), 16 * 1024 * 1024);
+        assert_eq!(m.limits.max_http_requests, 16);
+        assert_eq!(m.limits.max_http_response_bytes, 4 * 1024 * 1024);
+        assert_eq!(m.limits.http_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn manifest_parses_http_limits_and_keeps_the_rest_at_default() {
+        let toml = r#"
+            name = "konnektor"
+            [limits]
+            max_http_requests = 3
+            max_http_response_bytes = 1024
+            http_timeout_ms = 500
+        "#;
+        let m = Manifest::parse(toml).unwrap();
+        assert_eq!(m.limits.max_http_requests, 3);
+        assert_eq!(m.limits.max_http_response_bytes, 1024);
+        assert_eq!(m.limits.http_timeout_ms, 500);
+        assert_eq!(m.limits.max_memory_pages, 256);
     }
 
     #[test]
@@ -993,5 +1089,16 @@ mod tests {
             Manifest::parse(zero_mem).is_err(),
             "max_memory_pages=0 muss scheitern"
         );
+
+        for bad in [
+            "max_http_requests = 0",
+            "max_http_response_bytes = 0",
+            "max_http_response_bytes = 17825792", // 17 MiB > MAX_HTTP_RESPONSE_BYTES
+            "http_timeout_ms = 0",
+        ] {
+            let toml = format!("name=\"x\"\n[limits]\n{bad}");
+            let e = Manifest::parse(&toml).unwrap_err().to_string();
+            assert!(e.contains("[limits]"), "{bad}: {e}");
+        }
     }
 }

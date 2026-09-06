@@ -200,43 +200,15 @@ pub fn policy_from_config(cfg: &McpServerConfig) -> Policy {
     cfg.capabilities.to_policy()
 }
 
-/// Host einer http(s)-URL — ohne Schema, Userinfo, Port und Pfad.
-///
-/// Reicht für das Net-Gate: `Capability::Net` kennt nur Hostnamen (exakt oder `*.suffix`).
-pub fn url_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    // Userinfo abschneiden (`user:pass@host`).
-    let authority = authority.rsplit('@').next()?;
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        // IPv6-Literal: alles bis zur schließenden Klammer.
-        v6.split(']').next()?
-    } else {
-        authority.split(':').next()?
-    };
-    (!host.is_empty()).then_some(host)
-}
+/// Host einer http(s)-URL — lebt in `sepp-policy`, weil auch der WASM-Host (`host_http`) ihn
+/// braucht; hier nur re-exportiert.
+pub use sepp_policy::url_host;
 
 /// Baut den Broker für einen Server: genau die Secrets, die seine Header **verlangen** und die
-/// ihm per `Env`-Recht **gewährt** sind.
-///
-/// Der einzige Ort, der Secret-Werte aus der Umgebung liest. Ohne das Env-Gate entschiede allein
-/// die `settings.toml`, welche Variable rausgeht — die nach Trust auch projektlokal sein kann,
-/// und `[deny]` kann `env` nicht einschränken.
+/// ihm per `Env`-Recht **gewährt** sind (`SecretBroker::from_env_for` — der einzige Ort, der
+/// Secret-Werte aus der Umgebung liest).
 fn broker_for(cfg: &McpServerConfig, policy: &Policy) -> SecretBroker {
-    let wanted: Vec<&str> = cfg
-        .headers
-        .values()
-        .flat_map(|v| sepp_policy::placeholder_names(v))
-        .filter(|n| {
-            policy.allows(&sepp_policy::Capability::Env {
-                name: (*n).to_string(),
-            })
-        })
-        .collect();
-    SecretBroker::from_env(&wanted)
+    SecretBroker::from_env_for(cfg.headers.values().map(String::as_str), policy)
 }
 
 /// Löst `cfg.headers` zu fertigen HTTP-Headern auf: Platzhalter ersetzt, Gates geprüft, Werte
@@ -268,32 +240,14 @@ pub fn resolve_headers(
                 cfg.name
             )));
         }
+        // Das Doppel-Gate (Net → Env → gesetzt) teilt sich der Client mit dem WASM-Host; die
+        // Meldung nennt den passenden `sepp policy allow`-Befehl und nie den Wert.
         for want in sepp_policy::placeholder_names(raw) {
-            if !policy.allows(&sepp_policy::Capability::Net {
-                host: host.to_string(),
-            }) {
+            if let Err(refusal) = broker.gate(want, host, policy) {
                 return Err(SeppError::Config(format!(
-                    "mcp '{}': Header '{name}' nutzt ${want}, aber {host} ist nicht gewährt — \
-                     `sepp policy allow mcp.{} net {host}`",
-                    cfg.name, cfg.name
-                )));
-            }
-            if !policy.allows(&sepp_policy::Capability::Env {
-                name: want.to_string(),
-            }) {
-                return Err(SeppError::Config(format!(
-                    "mcp '{}': Header '{name}' nutzt ${want}, aber diese Variable ist nicht \
-                     gewährt — `sepp policy allow mcp.{} env {want}`",
-                    cfg.name, cfg.name
-                )));
-            }
-            // Der Broker hält genau die gewährten und verlangten Variablen; fehlt sie hier,
-            // ist sie in der Umgebung nicht gesetzt.
-            if !broker.knows(want) {
-                return Err(SeppError::Config(format!(
-                    "mcp '{}': Header '{name}' nutzt ${want} — gewährt, aber in der Umgebung \
-                     nicht gesetzt",
-                    cfg.name
+                    "mcp '{}': Header '{name}' {}",
+                    cfg.name,
+                    refusal.explain(&sepp_policy::Actor::Mcp(cfg.name.clone()), want)
                 )));
             }
         }
@@ -568,21 +522,6 @@ mod tests {
 
     fn broker() -> SecretBroker {
         SecretBroker::new().with_secret("TOKEN", "sk-geheim")
-    }
-
-    #[test]
-    fn url_host_strips_scheme_userinfo_port_and_path() {
-        assert_eq!(
-            url_host("https://api.example.com/mcp"),
-            Some("api.example.com")
-        );
-        assert_eq!(
-            url_host("http://u:p@api.example.com:8443/x?y"),
-            Some("api.example.com")
-        );
-        assert_eq!(url_host("https://[::1]:8080/mcp"), Some("::1"));
-        assert_eq!(url_host("api.example.com/mcp"), None, "ohne Schema");
-        assert_eq!(url_host("https:///mcp"), None, "leerer Host");
     }
 
     #[test]
