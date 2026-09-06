@@ -1855,6 +1855,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1863,6 +1864,7 @@ dependencies = [
 name = "sepp-core"
 version = "0.2.1"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1898,6 +1900,26 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "sepp-plugin"
+version = "0.2.1"
+dependencies = [
+ "schemars",
+ "sepp-core",
+ "sepp-plugin-macros",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sepp-plugin-macros"
+version = "0.2.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
