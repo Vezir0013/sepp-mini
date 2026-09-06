@@ -7,6 +7,8 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-06
+
 Ein Paket bringt keine Rechte mit — es bittet um sie. Bis jetzt hieß „eine Erweiterung
 installieren": Dateien an vier Orte kopieren, ein Manifest lesen, die passenden Zeilen in die
 `policy.toml` schreiben und hoffen, dass Loader und Guard denselben Namen meinen. Ab jetzt ist das
@@ -76,7 +78,7 @@ Nutzers gehören dem Nutzer (Pakete leben unter `pkg/`), Content in `config_root
 - Die Krypto kommt aus `ring` (SHA-256, Ed25519, `SystemRandom`), das über `rustls` ohnehin im
   Baum liegt — keine neue Krypto-Dependency. Neu sind `tar`, `zstd` (ohne Default-Features) und
   `semver`; `toml` ist in `sepp-cli` jetzt eine echte Dependency.
-- Dreizehn Crates im Gleichschritt (`sepp-pkg` mit 0.3.0).
+- Dreizehn Crates im Gleichschritt (`sepp-pkg` ist neu).
 
 ### Tests
 - `policy_edit`: Paketblock schreiben → parsen → erwartete Gewährungen; Upgrade ersetzt an Ort;
@@ -1097,7 +1099,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.1.22...v0.2.0

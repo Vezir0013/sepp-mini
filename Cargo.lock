@@ -1826,7 +1826,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sepp-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars",
  "serde",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-hooks"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rhai",
  "sepp-core",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-pkg"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ring",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-plugin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "schemars",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-plugin-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "landlock",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-provider"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-session"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-tools"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "sepp-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
