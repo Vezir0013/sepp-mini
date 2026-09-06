@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use sepp_core::sanitize_display_multiline;
 use sepp_policy::{
     kernel_capabilities, load_policy_set, Actor, BuiltinDefaults, Capability, Manifest, Mode,
     Policy, PolicySet, ResolveCtx, SandboxCapabilities, Source,
@@ -89,17 +90,17 @@ pub fn run_policy(cmd: PolicyCmd) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("Fehler: {e}");
+                eprintln!("Fehler: {}", sanitize_display_multiline(&e.to_string()));
                 ExitCode::from(2)
             }
         },
         PolicyCmd::Show => match show() {
             Ok(s) => {
-                println!("{s}");
+                println!("{}", sanitize_display_multiline(&s));
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("Fehler: {e}");
+                eprintln!("Fehler: {}", sanitize_display_multiline(&e.to_string()));
                 ExitCode::FAILURE
             }
         },

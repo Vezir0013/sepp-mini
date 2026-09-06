@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use sepp_core::is_display_safe;
 use sepp_core::{Result, SeppError};
 use sepp_policy::fsutil::ensure_private_dir;
 use sepp_policy::url_host;
@@ -335,7 +336,19 @@ pub fn is_loopback(host: &str) -> bool {
 }
 
 /// Die Schema-Regel: `https://` immer, `http://` nur für Loopback, alles andere nie.
+///
+/// Vorgeschaltet die Zeichenprüfung. Sie ist zum Teil Verteidigung in der Tiefe —
+/// [`url_host`] lehnt Whitespace und Steuerzeichen schon ab, aber das ist eine *geerbte*
+/// Zusage, die still wegfiele, wenn jemand dort etwas umbaut; hier steht sie ausgesprochen.
+/// Zum anderen Teil schließt sie eine echte Lücke: `is_control()` kennt nur die
+/// Steuerzeichen, nicht die Formatzeichen. Ein Hostname mit einem Rechts-nach-links-Zeichen
+/// käme durch und erschiene im Zustimmungsdialog als ein ganz anderer.
 pub fn check_url_scheme(url: &str) -> Result<()> {
+    if !is_display_safe(url) || url.chars().any(char::is_whitespace) {
+        return Err(SeppError::Config(format!(
+            "pkg: {url:?}: URL mit Whitespace, Steuer- oder Formatzeichen"
+        )));
+    }
     if url.starts_with("https://") {
         if url_host(url).is_some() {
             return Ok(());
@@ -952,6 +965,16 @@ mod tests {
             "HTTPS://pkg.example/x",
             "https://",
             "pkg.example/index.toml",
+            // Zeichen, die im Terminal etwas anderes tun, als sie aussehen: Die URL steht in
+            // jeder Fehlermeldung und in der Zustimmungszeile „Quelle".
+            "https://pkg.example/\u{1b}[2Kx",
+            "https://pkg.example/a b",
+            "https://pkg.\nexample/x",
+            "https://pkg.example/\u{7f}",
+            // Rechts-nach-links: erschiene als ein ganz anderer Host. `url_host` allein ließe
+            // das durch — `is_control()` kennt nur Steuer-, nicht Formatzeichen.
+            "https://\u{202E}gro.esiob/x",
+            "https://pkg.exa\u{200B}mple/x",
         ] {
             assert!(check_url_scheme(bad).is_err(), "{bad}");
         }

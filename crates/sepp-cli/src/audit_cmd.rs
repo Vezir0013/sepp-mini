@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
-use sepp_core::{ContentBlock, Role};
+use sepp_core::{sanitize_display_multiline, ContentBlock, Role};
 use sepp_session::{Entry, EntryPayload, JsonlSessionStore, SessionInfo, SessionStore};
 
 use crate::session;
@@ -136,6 +136,16 @@ struct Tally {
     subagents: usize,
 }
 
+/// Die lesbare Spur einer Sitzung.
+///
+/// **Die fertige Ausgabe wird einmal bereinigt.** Fast jede Zeile enthält fremden Text:
+/// Werkzeug-Ergebnisse (bash-Ausgabe, Antworten von MCP-Servern, Ausgaben von Plugins), die
+/// Argumente eines Aufrufs, die URLs aus `host_http`. Ein Ergebnis mit ANSI-Sequenzen könnte
+/// sonst seine eigene Zeile im Protokoll überschreiben — ein Prüfwerkzeug, dessen Einträge sich
+/// selbst unsichtbar machen können, ist keines. Am Ende statt je Feld, damit keine der elf
+/// `preview`-Aufrufstellen vergessen werden kann. Die Zeilenstruktur bleibt erhalten
+/// (`sanitize_display_multiline`); die JSON-Ausgabe geht bewusst **nicht** hier durch, denn
+/// `serde_json` escapt bereits und eine zweite Behandlung würde die Daten verfälschen.
 pub fn render_audit(view: &SessionView) -> String {
     let mut out = String::new();
     let mut tally = Tally::default();
@@ -145,7 +155,7 @@ pub fn render_audit(view: &SessionView) -> String {
         "{} Prompts · {} Tool-Aufrufe · {} verweigert · {} Sub-Agenten\n",
         tally.prompts, tally.tool_calls, tally.denied, tally.subagents
     ));
-    out
+    sanitize_display_multiline(&out)
 }
 
 fn render_session(view: &SessionView, depth: usize, out: &mut String, tally: &mut Tally) {
@@ -586,6 +596,57 @@ mod tests {
         );
         root.children.insert(child.id.clone(), child);
         root
+    }
+
+    #[test]
+    fn no_entry_can_smuggle_control_characters_into_the_trail() {
+        // `sepp audit` ist das Prüfwerkzeug — ein Werkzeug-Ergebnis, das seine eigene Zeile
+        // überschreiben oder färben kann, macht die Spur wertlos. Geprüft über **jede**
+        // Eintragsart, damit keine der elf `preview`-Aufrufstellen vergessen wird.
+        let boese = "Ergebnis\u{1b}[2K\r  ok  \u{202e}gro.esiob\u{200b}";
+        let v = view(
+            "aaaa0000-0000-0000-0000-000000000000",
+            None,
+            vec![
+                msg(Role::User, vec![ContentBlock::text(boese)]),
+                msg(
+                    Role::User,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: vec![ContentBlock::text(boese)],
+                        is_error: false,
+                    }],
+                ),
+                EntryPayload::Compaction {
+                    summary: boese.into(),
+                    replaced_until: "x".into(),
+                },
+                EntryPayload::Custom {
+                    kind: "guard".into(),
+                    data: serde_json::json!({
+                        "decision": "allow",
+                        "actor": boese,
+                        "action": boese,
+                    }),
+                },
+                EntryPayload::Custom {
+                    kind: boese.into(),
+                    data: serde_json::json!({ "x": boese }),
+                },
+            ],
+        );
+
+        let text = render_audit(&v);
+        for (zeichen, name) in [
+            ('\u{1b}', "ESC"),
+            ('\r', "Wagenrücklauf"),
+            ('\u{202e}', "Rechts-nach-links"),
+            ('\u{200b}', "Nullbreite"),
+        ] {
+            assert!(!text.contains(zeichen), "{name} steht noch in der Spur");
+        }
+        // Der lesbare Teil bleibt lesbar, sonst wäre die Spur nicht mehr auswertbar.
+        assert!(text.contains("Ergebnis"), "{text}");
     }
 
     #[test]

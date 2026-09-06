@@ -7,11 +7,15 @@
 pub mod error;
 pub mod message;
 pub mod model;
+pub mod text;
 pub mod tool;
 
 pub use error::{Result, SeppError};
 pub use message::{ContentBlock, ImageSource, Message, Role, Usage};
 pub use model::{Model, ThinkingLevel};
+pub use text::{
+    is_display_safe, sanitize_display, sanitize_display_multiline, DISPLAY_REPLACEMENT,
+};
 #[cfg(feature = "schema")]
 pub use tool::schema_for;
 pub use tool::{

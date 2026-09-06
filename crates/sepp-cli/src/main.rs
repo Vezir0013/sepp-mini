@@ -945,7 +945,13 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     // verpufft hinter dem Alternate-Screen; bei -p/--rpc bleibt stderr der sichtbare Kanal.
     let interactive = opts.prompt.is_none() && !opts.rpc;
     let mut startup_notices: Vec<String> = Vec::new();
+    // Der eine Trichter für alle Startmeldungen — und deshalb die richtige Stelle zum
+    // Bereinigen: Hier laufen Fehlertexte fremder MCP-Server und die Hinweise zu übersprungenen
+    // WASM-Plugins durch (Pfad plus wasmi-Meldung aus einer fremden Datei). Im TUI-Zweig ist es
+    // unnötig (ratatui filtert Steuerzeichen selbst), schadet aber nicht und hält beide Wege
+    // gleich.
     let mut startup_notice = |msg: String| {
+        let msg = sepp_core::sanitize_display_multiline(&msg);
         if interactive {
             startup_notices.push(msg);
         } else {
@@ -1490,11 +1496,17 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                     eprintln!("\x1b[2m· {name} …\x1b[0m");
                 }
                 // Nach stderr, nicht stdout: stdout bleibt der Datenkanal (nur TextDelta).
+                // Beide Texte können fremd sein (Fehler eines MCP-Servers, Meldung eines Hooks)
+                // und stehen hier zwischen eigenen ANSI-Sequenzen — ein `ESC` darin würde die
+                // Formatierung übernehmen.
                 AgentEvent::Notice(msg) => {
-                    eprintln!("\x1b[2m⟳ {msg}\x1b[0m");
+                    eprintln!("\x1b[2m⟳ {}\x1b[0m", sepp_core::sanitize_display(&msg));
                 }
                 AgentEvent::Error(msg) => {
-                    eprintln!("\n\x1b[31m[Fehler]\x1b[0m {msg}");
+                    eprintln!(
+                        "\n\x1b[31m[Fehler]\x1b[0m {}",
+                        sepp_core::sanitize_display_multiline(&msg)
+                    );
                 }
                 _ => {}
             };

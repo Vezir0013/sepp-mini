@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use sepp_core::{sanitize_display, sanitize_display_multiline};
 use sepp_pkg::crypto::decode_pubkey;
 use sepp_pkg::registry::{INDEX_FILE, SIG_FILE};
 use sepp_pkg::{
@@ -40,8 +41,10 @@ use crate::session;
 /// Fehlertext ohne die Präfixe `config error: ` und `pkg: `, mit dem Registry-Namen genau einmal —
 /// `fetch_index` nennt ihn schon, `resolve` nicht.
 fn plain(name: &str, e: &sepp_core::SeppError) -> String {
-    let s = e.to_string();
-    let s = s.strip_prefix("config error: ").unwrap_or(&s);
+    // Der Text stammt aus einer fremden Antwort (HTTP-Fehler, Index-Inhalt) und geht direkt
+    // ans Terminal — Steuerzeichen darin würden Zeilen überschreiben oder färben.
+    let s = sanitize_display(&e.to_string());
+    let s = s.strip_prefix("config error: ").unwrap_or(s.as_str());
     let s = s.strip_prefix("pkg: ").unwrap_or(s);
     if s.starts_with("Registry »") {
         s.to_string()
@@ -369,13 +372,16 @@ pub fn run_pkg(cmd: PkgCmd) -> ExitCode {
             key.as_deref(),
         ),
     };
+    // Beide Ausgänge bereinigt: Der Erfolgstext trägt Tabellen mit Beschreibungen aus einem
+    // Registry-Index, der Fehlertext die Antwort eines fremden Servers. Mehrzeilig, deshalb
+    // bleiben echte Umbrüche erhalten.
     match result {
         Ok(text) => {
-            print!("{text}");
+            print!("{}", sanitize_display_multiline(&text));
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("Fehler: {e}");
+            eprintln!("Fehler: {}", sanitize_display_multiline(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -648,7 +654,7 @@ pub(crate) fn install_from_registry(
             eprintln!(
                 "Hinweis: unbekannte Felder im Index von »{}«, ohne Wirkung: {}",
                 cfg.name,
-                unknown.join(", ")
+                sanitize_display(&unknown.join(", "))
             );
         }
         match index.resolve(&spec.name, spec.version.as_deref()) {
@@ -702,7 +708,7 @@ fn install_file(roots: &Roots, file: &Path, origin: &Origin, answers: &Answers) 
     if !unknown.is_empty() {
         eprintln!(
             "Hinweis: unbekannte Felder im Paket-Manifest, ohne Wirkung: {}",
-            unknown.join(", ")
+            sanitize_display(&unknown.join(", "))
         );
     }
 
@@ -864,7 +870,10 @@ pub(crate) fn search(
         match fetch_index(fetcher, cfg) {
             Ok(index) => {
                 for e in index.matching(text) {
-                    let mut desc = e.description.clone().unwrap_or_default();
+                    // Die Beschreibung kommt aus dem Index und wird von dessen `validate` nicht
+                    // angefasst; hier an der Quelle bereinigt, damit auch ein Aufrufer geschützt
+                    // ist, der `search` nicht über den gemeinsamen Ausgang druckt.
+                    let mut desc = sanitize_display(e.description.as_deref().unwrap_or_default());
                     if let Some(i) = installed.packages.get(&e.name) {
                         if !desc.is_empty() {
                             desc.push_str(" · ");

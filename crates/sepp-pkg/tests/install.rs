@@ -494,3 +494,112 @@ fn untrust_removes_key_names_installed_and_trust_starts_over() {
         Some("registry:test")
     );
 }
+
+/// Fremder Text im Zustimmungsdialog darf das Terminal nicht steuern.
+///
+/// Der Angriff aus Befund D2: Ein Wagenrücklauf springt an den Zeilenanfang, Leerzeichen
+/// löschen die Zeile, und an ihrer Stelle steht eine harmlose Behauptung — direkt über der
+/// Frage „Rechte gewähren?". Dazu ANSI-Farben für ein gefälschtes Siegel und ein
+/// Rechts-nach-links-Zeichen, das einen Hostnamen umkehrt.
+#[test]
+fn consent_lines_neutralise_control_characters_from_the_package() {
+    let fx = fixture();
+    let (key, _) = SigningKey::generate().unwrap();
+    let src = fx.home.join("src-angriff");
+    source_dir(&src, "demo", "1.0.0", RIGHTS);
+
+    // Die Steuerzeichen stehen als TOML-Escapes in der Datei; beim Parsen werden echte daraus.
+    let angriff = concat!(
+        "Harmlos",
+        "\\r",
+        "                                        ",
+        "\\r",
+        "  Hook log.rhai: tut nichts  ",
+        "\\u001B[32mGEPRUEFT\\u001B[0m ",
+        "\\u202Egro.esiob"
+    );
+    std::fs::write(
+        src.join("manifest.toml"),
+        format!(
+            "format = 1\nname = \"demo\"\nversion = \"1.0.0\"\ndescription = \"{angriff}\"\n\n\
+             [publisher]\nname = \"acme\"\n\n\
+             [vars.BELEGE_DIR]\ndescription = \"Ordner\\u001B[31m rot\"\nkind = \"path\"\n\n\
+             [vars.MANDANT]\ndescription = \"Mandant\"\ndefault = \"nord\"\n\n{RIGHTS}"
+        ),
+    )
+    .unwrap();
+
+    let pkg = fx.home.join("angriff.seppkg");
+    pack_dir(&src, &key, &pkg).unwrap();
+    let archive = PkgArchive::open(&pkg).unwrap();
+    let plan = plan_install(&fx.roots, &archive).unwrap();
+    trust_publisher(&fx.roots, &plan.manifest().publisher, "test").unwrap();
+    let resolved = resolve_vars(plan.manifest(), &vars("~/belege"), None).unwrap();
+    let rights = resolve_rights(plan.manifest(), &resolved.values, &fx.ctx).unwrap();
+    let warnings = check_rights(&plan, &rights, &fx.ctx).unwrap();
+
+    let text = consent_lines(&plan, &rights, &resolved.values, &warnings).join("\n");
+
+    for (zeichen, name) in [
+        ('\u{1b}', "ESC"),
+        ('\r', "Wagenrücklauf"),
+        ('\u{202e}', "Rechts-nach-links"),
+    ] {
+        assert!(
+            !text.contains(zeichen),
+            "{name} steht noch im Zustimmungstext: {text:?}"
+        );
+    }
+    // Der lesbare Teil bleibt lesbar — der Mensch soll sehen, was das Paket behauptet.
+    assert!(text.contains("Harmlos"), "{text}");
+    assert!(text.contains("GEPRUEFT"), "{text}");
+    // Und die Zeile, die der Angriff verstecken wollte, steht unversehrt da.
+    assert!(
+        text.contains("Hook log.rhai: läuft im Agent-Loop"),
+        "{text}"
+    );
+    // Jede Zeile ist eine Zeile: Kein eingeschmuggelter Umbruch fälscht einen Eintrag.
+    assert_eq!(
+        text.lines().count(),
+        consent_lines(&plan, &rights, &resolved.values, &warnings).len(),
+        "{text}"
+    );
+}
+
+/// Eine sehr lange Beschreibung schiebt die Rechteliste aus dem Bild — ohne ein einziges
+/// Steuerzeichen. Deshalb wird gekürzt.
+#[test]
+fn a_very_long_description_is_shortened() {
+    let fx = fixture();
+    let (key, _) = SigningKey::generate().unwrap();
+    let src = fx.home.join("src-lang");
+    source_dir(&src, "demo", "1.0.0", RIGHTS);
+    let lang = "z".repeat(5_000);
+    std::fs::write(
+        src.join("manifest.toml"),
+        format!(
+            "format = 1\nname = \"demo\"\nversion = \"1.0.0\"\ndescription = \"{lang}\"\n\n\
+             [publisher]\nname = \"acme\"\n\n\
+             [vars.BELEGE_DIR]\ndescription = \"Ordner\"\nkind = \"path\"\n\n\
+             [vars.MANDANT]\ndescription = \"Mandant\"\ndefault = \"nord\"\n\n{RIGHTS}"
+        ),
+    )
+    .unwrap();
+
+    let pkg = fx.home.join("lang.seppkg");
+    pack_dir(&src, &key, &pkg).unwrap();
+    let archive = PkgArchive::open(&pkg).unwrap();
+    let plan = plan_install(&fx.roots, &archive).unwrap();
+    trust_publisher(&fx.roots, &plan.manifest().publisher, "test").unwrap();
+    let resolved = resolve_vars(plan.manifest(), &vars("~/belege"), None).unwrap();
+    let rights = resolve_rights(plan.manifest(), &resolved.values, &fx.ctx).unwrap();
+    let warnings = check_rights(&plan, &rights, &fx.ctx).unwrap();
+
+    let lines = consent_lines(&plan, &rights, &resolved.values, &warnings);
+    assert!(lines[0].chars().count() < 300, "{}", lines[0].len());
+    assert!(lines[0].ends_with('…'), "{}", lines[0]);
+    assert!(
+        lines.iter().any(|l| l.contains("Hook log.rhai")),
+        "die Rechteliste bleibt sichtbar: {lines:?}"
+    );
+}

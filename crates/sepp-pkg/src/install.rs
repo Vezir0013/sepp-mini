@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use sepp_core::{Result, SeppError};
+use sepp_core::{sanitize_display, Result, SeppError};
 use sepp_policy::fsutil::{ensure_private_dir, write_atomic};
 use sepp_policy::policy_edit::{remove_package_section, write_package_section};
 use sepp_policy::{Actor, Capability, Grants, Manifest, NetGrant, Policy, ResolveCtx};
@@ -448,6 +448,14 @@ pub fn check_rights(
 }
 
 /// Der Text, dem der Nutzer zustimmt — rein, damit Dialog und Fehlerfall denselben zeigen.
+///
+/// **Jede Zeile geht durch [`sanitize_display`].** Fast alles hier stammt aus einer fremden
+/// Datei: Beschreibung, Variablenwerte, Rechte-Pfade, Hostnamen, Env-Namen und die Datei-Stämme
+/// aus `[files]` — `validate_rel_path` verbietet Backslash und Nullbyte, aber kein `ESC`. Ein
+/// Wagenrücklauf in der Beschreibung löscht sonst die Zeile, in der die Rechte eines Plugins
+/// stehen, und schreibt eine harmlose an ihre Stelle; darunter steht „Rechte gewähren?".
+/// Bereinigt wird am **Ende, über alle Zeilen** statt je Feld: So kann keine Stelle vergessen
+/// werden, auch keine, die später dazukommt.
 pub fn consent_lines(
     plan: &InstallPlan,
     rights: &[(String, Grants)],
@@ -456,10 +464,12 @@ pub fn consent_lines(
 ) -> Vec<String> {
     let m = plan.manifest();
     let mut out = Vec::new();
+    // Auch die Länge ist ein Angriff: Eine Beschreibung über hundert Zeilen schiebt die
+    // Rechteliste aus dem Bild, ohne ein einziges Steuerzeichen zu brauchen.
     let desc = m
         .description
         .as_deref()
-        .map(|d| format!(" — {d}"))
+        .map(|d| format!(" — {}", ellipsize(d, MAX_DESCRIPTION_CHARS)))
         .unwrap_or_default();
     out.push(format!("Paket {} {}{desc}", m.name, m.version));
     if let Some(prev) = &plan.previous {
@@ -526,7 +536,19 @@ pub fn consent_lines(
     for w in warnings {
         out.push(format!("  Hinweis: {w}"));
     }
-    out
+    out.iter().map(|l| sanitize_display(l)).collect()
+}
+
+/// So viele Zeichen einer Paketbeschreibung werden gezeigt.
+const MAX_DESCRIPTION_CHARS: usize = 200;
+
+/// Kürzt an einer Zeichengrenze und macht die Kürzung sichtbar.
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// Ergebnis von [`apply_install`].
