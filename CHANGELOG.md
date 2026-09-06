@@ -7,6 +7,25 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-06
+
+Sechs Fehler, die eines gemeinsam hatten: Sie schwiegen. Ein Hook mit einem Tippfehler schaltete
+sich stumm ab, statt sich zu beschweren — das Modell antwortete normal weiter, und niemand erfuhr,
+dass die Regel gar nicht lief. Ein überlasteter Anbieter beendete den Turn mit einer Fehlermeldung,
+wo ein zweiter Versuch nach einer Sekunde gereicht hätte. Ctrl+C tat nichts, solange der Anbieter
+noch kein Byte gesendet hatte — genau in der Minute, in der ein Reasoning-Modell schweigt und man
+am ehesten abbrechen will. Ein Wagenrücklauf in einer Paketbeschreibung überschrieb im
+Zustimmungsdialog die Zeile darüber, direkt neben der Frage „Rechte gewähren?". Und das
+Supply-Chain-Gate meldete transitive Befunde nicht, weil `cargo-deny` seinen Standardwert geändert
+hatte: `cargo audit` zeigte vier Warnungen, CI blieb grün. Wer etwas zusagt, muss auch sagen, wenn
+er sie nicht hält; das ist die ganze Klammer um dieses Release.
+
+Nichts davon ändert ein Format: Session-JSONL, Paketformat, Plugin-ABI und `manifest.toml` bleiben,
+wie sie sind. Das RPC-Protokoll bekommt ein Ereignis mehr (`notice`), rein additiv — ein Client,
+der es nicht kennt, ignoriert die Zeile. Die Oberfläche läuft auf ratatui 0.30, ohne eine Zeile
+geänderten Code; damit fallen drei Advisories aus dem Abhängigkeitsbaum statt in eine
+Ignore-Liste.
+
 ### Behoben
 - **Ein Fehler im Hook sah aus wie „kein Hook".** Rhai meldet „Funktion nicht gefunden" für zwei
   sehr verschiedene Dinge: Das Skript definiert den Handler nicht — dann ist Überspringen
@@ -1496,7 +1515,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.4.0...v0.5.0
