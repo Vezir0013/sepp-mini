@@ -7,11 +7,67 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Der Autor eines Plugins schreibt eine Funktion, kein Protokoll. Das Beispiel-Plugin hatte 163
+Zeilen, davon rund 107 Zeiger, Exports und JSON-Hüllen — und genau 13 Zeilen Arbeit. Das ist der
+Grund, warum es keine Fremdplugins gab: nicht mangelndes Interesse, sondern ein Aufrufprotokoll,
+das man erst abschreiben muss. Ab jetzt kapselt ein SDK das Protokoll, ein Attribut macht aus der
+Funktion das Werkzeug, und die Schnittstelle steht als Vertrag in einer Datei, gegen die ein Test
+den Host prüft. Alles davon ist **additiv**: Das ABI bleibt bei Version 1, ein bestehendes Modul
+merkt nichts.
+
+### Hinzugefügt
+- **Guest-SDK `sepp-plugin` und Attribut `#[sepp_plugin::tool]`** (`sepp-plugin-macros`). Aus
+  `fn name(args: Args, host: &Host) -> Result<ToolResult>` werden Exports, Zeigerarithmetik,
+  Abholweg und Fehlerhülle erzeugt; das Parameter-Schema entsteht aus `Args` (`schemars`), ein
+  `Err` wird zum Ergebnis mit `is_error = true`. Fähigkeiten sind **Cargo-Features und damit
+  Compile-Gates**: `host.fs()` nur mit `fs-read`, `host.http()` nur mit `net` — ein Feature
+  schaltet zugleich den Host-Import frei, das Modul importiert nur, was es benutzt, und das
+  Linker-Gate des Hosts bleibt konsistent. Dateien liest das SDK roh (`host_fs_read_bytes`), ein
+  PDF kommt als PDF an. Das SDK kompiliert auch nativ (Exports nur unter `wasm32`, Fähigkeiten
+  liefern nativ einen Fehler), sodass ein Autor sein Werkzeug mit `cargo test` ohne wasm32-Target
+  prüft und die Crates durch Clippy, Tests und CI laufen. Ein `#[tool]` je Crate — ABI 1 kennt ein
+  Werkzeug je Modul; ein zweites ist ein Compiler-Fehler. Die Exports entstehen im Crate des
+  Autors, nicht im SDK: Der Export von `#[no_mangle]`-Symbolen aus einer Bibliothek in die
+  `cdylib` ist ein Implementierungsdetail von rustc, kein Vertrag.
+- **`wit/sepp.wit` als Vertragstext der Plugin-Schnittstelle.** Die logische Schnittstelle als
+  WIT (`fs-read` typisiert als `result<list<u8>, string>` — genau daran war der Lossy-Fehler
+  aufgefallen; `http` provisorisch mit Request-/Response-Records für Stufe 3) und darunter die
+  Kodierung für Core-WASM. Kein Generator, kein Component Model: WIT ist Bauzeit, wasmi bleibt
+  Laufzeit. Der Host trägt seine Importe jetzt in einer Tabelle (`HOST_IMPORTS` mit `Gate`,
+  `EXPORTS`), aus der `build_linker` und `check_exports` lesen, und ein Test hält Tabelle und
+  WIT synchron — eine Funktion, die die eine Seite kennt und die andere nicht, fällt sofort auf.
+- **`sepp plugin new <name>`** legt ein Plugin-Gerüst an (`Cargo.toml`, `src/lib.rs` mit
+  nativem Test, `<name>.toml`, `README.md`): Der Name ist zugleich Paket-, Datei-, Funktions- und
+  Werkzeugname, deshalb enger geprüft als beim Host. Die SDK-Dependency zeigt per Git-Tag auf die
+  Version des laufenden `sepp` (die Crates liegen nicht auf crates.io); `--sdk-path` schreibt
+  stattdessen eine `path`-Dependency für die Entwicklung. Das Manifest nennt beim Wanduhr-Budget
+  den Fehler, den man einmal macht: an einer zweiseitigen Rechnung testen, 5000 ms setzen, und der
+  erste 90-seitige Sammelbeleg bricht ab.
+- **`schema_for` in `sepp-core`** (Feature `schema`), damit die eingebauten Tools und das SDK
+  dasselbe bereinigte Schema erzeugen; `sepp_tools::schema_for` bleibt als Re-Export.
+
+### Geändert
+- **Das Beispiel-Plugin `textstat` ist mit dem SDK geschrieben**: 44 Zeilen inklusive Doku statt
+  163, nichts davon Protokoll; Ausgabe und Verhalten unverändert (der `#[ignore]`-Test
+  `example_plugin_builds_and_runs` prüft das). Das Modul wächst von 70 KB auf 106 KB, weil das
+  Schema zur Laufzeit aus dem Typ entsteht — Ladezeit einmalig beim Start, kein Thema je Aufruf.
+  Die README des Beispiels erklärt jetzt den SDK-Weg zuerst und nennt korrekt **fünf**
+  Host-Importe (`host_fs_read_bytes` fehlte seit 0.2.1).
+- `sepp-core` zieht optional `schemars` (Feature `schema`); bleibt I/O-frei und synchron.
+
+### Tests
+- Sync-Test WIT ↔ `HOST_IMPORTS`/`EXPORTS`; unter voller Gewährung lädt ein Modul mit allen
+  Importen, ohne Gewährung fehlt jeder gegatete Import einzeln. Makro-Fehlerpfade gegen `expand`
+  (fehlendes `desc`, ungültiger Name, falsche Signatur, `async`, Generics); Makro-Erfolgspfad
+  nativ über `__sepp_plugin_export`; SDK-Kodierung (`pack` mit hohem Bit, Vorzeichen-Konvention
+  inklusive `i32::MIN`, Fehlerobjekte). Gerüst: Parser, Namensregel, Vorlagen ohne Platzhalter,
+  Manifest parst ohne unbekannte Schlüssel, nie überschreiben; `#[ignore]`-Test baut und testet
+  das Gerüst nativ, baut es für wasm32 und lädt es im Host.
+
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter (Landlock/Seatbelt filtern nur Ports)
-- `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
-- Plugin-SDK aus einer WIT-Schnittstellenbeschreibung: der Autor schreibt eine Funktion,
-  kein Protokoll
+- `host_http` für WASM-Plugins als durchsetzender Proxy (Signatur und SDK-Seite stehen, Umsetzung
+  im Host folgt)
 - Paketformat und `sepp pkg install`: mehrere Erweiterungsstufen gebündelt, signiert, Rechte
   als Zustimmung bei der Installation
 - OpenTelemetry-Export (optional aktivierbar)

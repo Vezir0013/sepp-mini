@@ -268,7 +268,7 @@ Verzeichnisse bleiben unangetastet.
 |------|-----|-----|
 | **Resources** | Skills (→ System-Prompt), Prompt-Templates (→ `/commands`), Themes | Dateien unter `~/.sepp/skills` · `~/.sepp/prompts` |
 | **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
-| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/) |
+| **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]`; Rust-SDK `sepp-plugin` + `sepp plugin new` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/), Vertrag [`wit/sepp.wit`](./wit/sepp.wit) |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
 
 Beispiel `settings.toml` (MCP-Server mit deklarierten Capabilities):
@@ -327,29 +327,51 @@ fuel_slice       = 1000000  # Instruktionen pro Zeitscheibe (Yield-Intervall)
 
 ### Ein Plugin schreiben
 
-Ein lauffähiges Beispiel samt Anleitung liegt unter
-[`examples/textstat-plugin/`](./examples/textstat-plugin/). Das Protokoll ist klein und seit
-**ABI Version 1** festgezurrt; das Manifest deklariert sie über `abi`. Dein Modul exportiert
-`memory`, `sepp_spec`, `sepp_alloc` und `sepp_call`, alle vier werden beim Laden geprüft. Der
-Rückgabewert `i64` trägt im oberen Wort die Adresse und im unteren die Länge. `sepp_spec` liefert
-die Werkzeugbeschreibung als JSON, `sepp_call` bekommt die Argumente als JSON und gibt das
-Ergebnis als JSON zurück.
+Der Autor schreibt eine Funktion, kein Protokoll. Das SDK `sepp-plugin` (Rust, Ziel
+`wasm32-unknown-unknown`) kapselt Exports, Zeiger und Abholweg; das Attribut `#[sepp_plugin::tool]`
+macht aus einer Funktion das Werkzeug, und das Parameter-Schema fürs Modell entsteht aus dem
+`Args`-Typ:
 
-Aus dem Modul `env` bekommt ein Plugin vier Funktionen: `host_log` und `host_result_read` immer,
-`host_fs_read` mit dem Recht `fs_read`, `host_http` mit `net`. Eine Fähigkeit führt aus, legt ihr
-Ergebnis beim Host ab und meldet dessen Größe; abgeholt wird es mit `host_result_read` in einen
-Puffer, den das Plugin stellt.
+```rust
+use sepp_plugin::prelude::*;
 
-```bash
-just plugin-example                     # baut das Beispiel
-cp examples/textstat-plugin/target/wasm32-unknown-unknown/release/textstat.wasm ~/.sepp/plugins/
-cp examples/textstat-plugin/textstat.toml ~/.sepp/plugins/
+#[derive(Deserialize, JsonSchema)]
+struct Args {
+    /// Der zu vermessende Text.
+    text: String,
+}
+
+#[sepp_plugin::tool(desc = "Zählt die Wörter eines Textes.")]
+fn woerter(args: Args, host: &Host) -> Result<ToolResult> {
+    host.log("los");
+    let n = args.text.split_whitespace().count();
+    Ok(ToolResult::text(format!("{n} Wörter")).with_details(json!({ "n": n })))
+}
 ```
 
-Es gibt bewusst kein Freigeben im Protokoll: Der Host verwirft nach jedem Aufruf die ganze
-Instanz, ein Plugin hält also keinen Zustand zwischen zwei Aufrufen. Und die Standardbibliothek
-trägt für `wasm32-unknown-unknown` nur zur Hälfte, denn ein Modul hat weder Uhr noch Zufall noch
-Dateizugriff außer über die Importe. Die weiteren Fallstricke stehen in der Anleitung.
+```bash
+sepp plugin new woerter                 # Gerüst: Cargo.toml, src/lib.rs, Manifest, README
+cd woerter && cargo test                # nativ, ohne wasm32-Target
+cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/woerter.wasm woerter.toml ~/.sepp/plugins/
+```
+
+Fähigkeiten sind **Cargo-Features und damit Compile-Gates**: `host.fs().read(..)` gibt es nur mit
+dem Feature `fs-read`, `host.http()` nur mit `net`. Ein Feature schaltet zugleich den Host-Import
+frei — das Modul importiert nur, was es benutzt, und der Host registriert eine gegatete Funktion
+nur, wenn Manifest **und** `policy.toml` sie gewähren. Fehler sind ein `Err(..)`; das SDK macht
+daraus ein Ergebnis mit `is_error = true`, ein Plugin trappt nie. Ein lauffähiges Beispiel samt
+Anleitung liegt unter [`examples/textstat-plugin/`](./examples/textstat-plugin/).
+
+Darunter liegt ein kleines Protokoll, seit **ABI Version 1** festgezurrt und in
+[`wit/sepp.wit`](./wit/sepp.wit) als Vertrag aufgeschrieben (logische Schnittstelle als WIT, darunter
+die Kodierung für Core-WASM; ein Test hält Vertrag und Host synchron). Wer ohne SDK baut — etwa in
+einer anderen Sprache — exportiert `memory`, `sepp_spec`, `sepp_alloc` und `sepp_call` und bekommt
+aus dem Modul `env` fünf Funktionen: `host_log` und `host_result_read` immer, `host_fs_read` und
+`host_fs_read_bytes` mit dem Recht `fs_read`, `host_http` mit `net`. Es gibt bewusst kein Freigeben:
+Der Host verwirft nach jedem Aufruf die ganze Instanz, ein Plugin hält keinen Zustand zwischen zwei
+Aufrufen. Und die Standardbibliothek trägt für `wasm32-unknown-unknown` nur zur Hälfte — ein Modul
+hat weder Uhr noch Zufall noch Dateizugriff außer über den Host.
 
 ## Sicherheitsmodell
 
@@ -499,12 +521,13 @@ sepp-core      Typen + reine Logik (kein I/O, kein tokio)
   ├── sepp-provider   Provider-Trait + Anthropic/OpenAI (HTTP/SSE)
   ├── sepp-tools      built-in Tools read/write/edit/bash (unter Sepp Guard) + Truncation
   ├── sepp-session    Baum-Sessions (JSONL, optional SQLite)
+  ├── sepp-plugin     Guest-SDK für WASM-Plugins (Ziel wasm32; + sepp-plugin-macros für #[tool])
   └── sepp-policy     Capabilities / Policy / Sepp Guard / Sandbox (Landlock, Seatbelt) / Secret-Broker
         ├── sepp-hooks  Rhai-Hook-Bus
-        ├── sepp-wasm   WASM-Plugin-Host (wasmi)
+        ├── sepp-wasm   WASM-Plugin-Host (wasmi); Vertrag: wit/sepp.wit
         └── sepp-mcp    MCP-Client als Tool-Quelle
 sepp-agent     Agent-Loop, Tool-Dispatch, Budget, Sub-Agenten (bindet alle sepp-*)
-sepp-cli       Frontends: TUI / One-shot / RPC
+sepp-cli       Frontends: TUI / One-shot / RPC; sepp init / policy / audit / plugin new
 ```
 
 ## Entwicklung
@@ -531,9 +554,10 @@ Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskip
 - [ ] Google-Provider-Adapter
 - [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
 - [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
-- [x] Plugin-ABI Version 1 festgezurrt, `host_fs_read` gebaut
-- [ ] `host_http` für WASM-Plugins (Signatur steht, Umsetzung folgt)
-- [ ] Plugin-SDK, das Speicher und Zeiger kapselt — erst wenn Plugins ankommen
+- [x] Plugin-ABI Version 1 festgezurrt, `host_fs_read` und `host_fs_read_bytes` gebaut
+- [ ] `host_http` für WASM-Plugins (Signatur und SDK-Seite stehen, Umsetzung im Host folgt)
+- [x] Plugin-SDK `sepp-plugin`, das Speicher und Zeiger kapselt; Vertrag `wit/sepp.wit`; `sepp plugin new`
+- [ ] Paketformat und `sepp pkg install`
 
 ## Mitwirken
 
