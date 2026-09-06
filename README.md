@@ -268,7 +268,7 @@ Verzeichnisse bleiben unangetastet.
 | Tier | Was | Wie |
 |------|-----|-----|
 | **Resources** | Skills (→ System-Prompt), Prompt-Templates (→ `/commands`), Themes | Dateien unter `~/.sepp/skills` · `~/.sepp/prompts` |
-| **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können | `~/.sepp/hooks/*.rhai` |
+| **Hooks** | In-process Rhai-Skripte, die den Loop unterbrechen können; ein Skript, das scheitert, meldet sich mit Datei, Handler und Zeile statt still übersprungen zu werden | `~/.sepp/hooks/*.rhai` |
 | **WASM** | Capability-gegatete Plugins (jede Sprache → `*.wasm`), Ressourcen-Limits via `[limits]`; Rust-SDK `sepp-plugin` + `sepp plugin new` | `~/.sepp/plugins/*.wasm` + `manifest.toml`; [Beispiel und Anleitung](./examples/textstat-plugin/), Vertrag [`wit/sepp.wit`](./wit/sepp.wit) |
 | **MCP** | Out-of-process-Server als Tool-Quelle (OS-sandboxed) | `~/.sepp/settings.toml` → `[[mcp.servers]]` |
 | **Pakete** | Skills, Prompts, Hooks und Plugins gebündelt, signiert; Rechte als Zustimmung bei der Installation | `sepp pkg install <datei.seppkg>` oder `sepp pkg install <name>` aus einer Registry (`[[registries]]` in `settings.toml`) → `~/.sepp/pkg/<name>/`; Rechte als markierter Block in `policy.toml` |
@@ -491,6 +491,12 @@ bestätigt — und der Kern erzwingt sie an der jeweiligen Grenze:
   Kein `[limits]`-Abschnitt im Manifest heißt konservative Defaults, nicht „unbegrenzt".
 - **Secrets:** API-Keys kommen aus Env-Vars, werden nie geloggt/persistiert; das `bash`-Tool
   reicht sie nicht an Shell-Kommandos durch.
+- **Fremder Text am Terminal ist Text, kein Befehl.** Was aus einem Paket-Manifest, einem
+  Registry-Index, einem MCP-Server, einem Plugin oder einem Werkzeug-Ergebnis kommt, wird vor der
+  Ausgabe bereinigt: Steuer-, Bidi- und breitenlose Zeichen werden durch ein **sichtbares**
+  Ersatzzeichen ersetzt, nicht gelöscht — wer sie löscht, macht einen manipulierten Namen von
+  einem harmlosen ununterscheidbar. Ohne das überschreibt ein Wagenrücklauf in einer
+  Paketbeschreibung die Zeile über der Frage „Rechte gewähren?".
 - **Tool-Output** ist immer getrunkt, bevor er ins Kontextfenster geht.
 
 ### Sepp Guard: der Agent selbst ist eingesperrt
