@@ -231,47 +231,181 @@ pub fn builtin_deny_roots() -> Result<Vec<PathBuf>> {
     Ok(vec![config_root()?, state_root()?])
 }
 
-// ---- Trust (Vorstufe zu sepp-policy, Phase 4) ---------------------------
+// ---- Trust ------------------------------------------------------------------
+
+/// Stand des Vertrauens ins aktuelle Projekt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustState {
+    /// Nie vertraut (oder zurückgenommen).
+    Untrusted,
+    /// Vertraut, und die projektlokale Konfiguration ist die, die beim Vertrauen galt.
+    Trusted,
+    /// Vertraut, aber `.sepp/{policy.toml,settings.toml,hooks/,plugins/}` haben sich seither
+    /// geändert — sie werden nicht geladen, bis ein Mensch erneut `/trust` sagt.
+    Changed { expected: String, actual: String },
+}
+
+/// Welche Dateien der projektlokalen Konfiguration das Vertrauen binden: die Rechtequelle
+/// (`policy.toml`), die Werkzeugquellen (`settings.toml`) und Code (`hooks/`, `plugins/`).
+/// Skills und Prompts gehören nicht dazu — sie ändern den System-Prompt, keine Rechte.
+const TRUST_BOUND: &[&str] = &["policy.toml", "settings.toml", "hooks", "plugins"];
 
 fn trust_file() -> Result<PathBuf> {
     Ok(state_root()?.join("trust.json"))
 }
 
-fn read_trust() -> Result<HashMap<String, bool>> {
+/// Die Trust-Registry: Pfad → `true` (Format bis 0.5.0) oder `{"config": "<sha256>"}` (seit
+/// 0.5.1: Fingerprint der projektlokalen Konfiguration beim Vertrauen). Additiv — ein älteres
+/// `sepp` liest das Objekt als „vertraut", ein neueres bindet einen `true`-Eintrag beim ersten
+/// Lesen an den dann vorliegenden Stand.
+fn read_trust() -> Result<HashMap<String, serde_json::Value>> {
     match std::fs::read_to_string(trust_file()?) {
         Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
         Err(_) => Ok(HashMap::new()),
     }
 }
 
-/// Ist das aktuelle Projekt (cwd) vertraut?
-pub fn is_project_trusted() -> Result<bool> {
-    let key = cwd_canon()?.display().to_string();
-    Ok(read_trust()?.get(&key).copied().unwrap_or(false))
-}
-
-/// Alle als vertraut markierten Projektpfade (kanonische cwd, in denen `sepp init` projektlokal
-/// lief). Dient `uninstall --purge` als Anker, um projektlokale `.sepp`-Verzeichnisse
-/// standortunabhängig zu finden. Leere/fehlende `trust.json` ⇒ leere Liste.
-pub fn trusted_projects() -> Result<Vec<PathBuf>> {
-    Ok(read_trust()?
-        .into_iter()
-        .filter(|(_, trusted)| *trusted)
-        .map(|(path, _)| PathBuf::from(path))
-        .collect())
-}
-
-/// Markiert das aktuelle Projekt als vertraut (persistiert in `state_root()/trust.json`).
-pub fn trust_current_project() -> Result<()> {
-    let key = cwd_canon()?.display().to_string();
-    let mut map = read_trust()?;
-    map.insert(key, true);
+fn write_trust(map: &HashMap<String, serde_json::Value>) -> Result<()> {
     let path = trust_file()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
+    sepp_policy::fsutil::write_atomic(&path, serde_json::to_string_pretty(map)?.as_bytes(), None)?;
     Ok(())
+}
+
+fn trust_entry(fingerprint: &str) -> serde_json::Value {
+    serde_json::json!({ "config": fingerprint })
+}
+
+/// SHA-256 über die vertrauensrelevanten Dateien eines `.sepp`-Verzeichnisses: je Datei
+/// relativer Pfad, Länge und Inhalt, in sortierter Reihenfolge. Fehlende Dateien und ein
+/// fehlendes Verzeichnis sind schlicht nicht dabei. Rein — testbar ohne Umgebung.
+pub fn config_fingerprint(dot_sepp: &Path) -> Result<String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for name in TRUST_BOUND {
+        let p = dot_sepp.join(name);
+        if p.is_file() {
+            files.push(p);
+        } else if p.is_dir() {
+            collect_files(&p, &mut files)?;
+        }
+    }
+    files.sort();
+    let mut h = sepp_pkg::crypto::Hasher::new();
+    for f in &files {
+        let rel = f.strip_prefix(dot_sepp).unwrap_or(f);
+        let bytes = std::fs::read(f)?;
+        h.update(rel.to_string_lossy().as_bytes());
+        h.update(b"\0");
+        h.update(bytes.len().to_string().as_bytes());
+        h.update(b"\0");
+        h.update(&bytes);
+    }
+    Ok(h.finish_hex())
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Kurzform eines Fingerprints für Meldungen.
+pub fn short_fingerprint(fingerprint: &str) -> &str {
+    &fingerprint[..fingerprint.len().min(12)]
+}
+
+/// Entscheidet aus dem Registry-Eintrag und dem aktuellen Fingerprint. Rein.
+fn evaluate_trust(entry: Option<&serde_json::Value>, current: &str) -> TrustState {
+    match entry {
+        // Format bis 0.5.0: vertraut ohne Bindung — wird beim Lesen gebunden.
+        Some(serde_json::Value::Bool(true)) => TrustState::Trusted,
+        Some(serde_json::Value::Object(m)) => match m.get("config").and_then(|v| v.as_str()) {
+            Some(expected) if expected == current => TrustState::Trusted,
+            Some(expected) => TrustState::Changed {
+                expected: expected.to_string(),
+                actual: current.to_string(),
+            },
+            None => TrustState::Trusted,
+        },
+        _ => TrustState::Untrusted,
+    }
+}
+
+/// Stand des Vertrauens ins aktuelle Projekt (cwd). Ein Eintrag im Format bis 0.5.0 (`true`)
+/// wird dabei einmalig an den jetzt vorliegenden Stand gebunden; ein Schreibfehler dabei ist
+/// kein Grund, das Vertrauen zu verweigern.
+pub fn project_trust_state() -> Result<TrustState> {
+    let key = cwd_canon()?.display().to_string();
+    let mut map = read_trust()?;
+    let current = config_fingerprint(&project_root()?)?;
+    let state = evaluate_trust(map.get(&key), &current);
+    let unbound = matches!(map.get(&key), Some(v) if !v.is_object());
+    if state == TrustState::Trusted && unbound {
+        map.insert(key, trust_entry(&current));
+        let _ = write_trust(&map);
+    }
+    Ok(state)
+}
+
+/// Ist das aktuelle Projekt (cwd) vertraut — und seine Konfiguration unverändert seit dem
+/// Vertrauen? Nur dann laden die Loader `<cwd>/.sepp/…`.
+pub fn is_project_trusted() -> Result<bool> {
+    Ok(project_trust_state()? == TrustState::Trusted)
+}
+
+/// Alle als vertraut markierten Projektpfade (kanonische cwd, in denen `sepp init` projektlokal
+/// lief oder `/trust` gesagt wurde) — auch die mit inzwischen geänderter Konfiguration. Dient
+/// `uninstall --purge` als Anker, um projektlokale `.sepp`-Verzeichnisse standortunabhängig zu
+/// finden. Leere/fehlende `trust.json` ⇒ leere Liste.
+pub fn trusted_projects() -> Result<Vec<PathBuf>> {
+    Ok(read_trust()?
+        .into_iter()
+        .filter(|(_, v)| {
+            matches!(
+                v,
+                serde_json::Value::Bool(true) | serde_json::Value::Object(_)
+            )
+        })
+        .map(|(path, _)| PathBuf::from(path))
+        .collect())
+}
+
+/// Markiert das aktuelle Projekt als vertraut und bindet das Vertrauen an den Inhalt seiner
+/// Konfiguration (persistiert in `state_root()/trust.json`). Liefert den Fingerprint.
+pub fn trust_current_project() -> Result<String> {
+    let key = cwd_canon()?.display().to_string();
+    let fingerprint = config_fingerprint(&project_root()?)?;
+    let mut map = read_trust()?;
+    map.insert(key, trust_entry(&fingerprint));
+    write_trust(&map)?;
+    Ok(fingerprint)
+}
+
+/// Nach einem Schreiben in die projektlokale Policy **durch sepp selbst** (`sepp policy allow`,
+/// „dauerhaft erlauben" in der TUI): das Vertrauen an den neuen Stand binden — aber nur, wenn
+/// die Konfiguration **vor** diesem Schreiben noch die bestätigte war (`before`). War sie schon
+/// verändert, bleibt das Vertrauen ausgesetzt: Sonst segnete die Handlung des Menschen nebenbei
+/// eine fremde Änderung mit ab. Liefert, ob neu gebunden wurde.
+pub fn rebind_trust_after_own_write(before: &TrustState) -> Result<bool> {
+    if *before != TrustState::Trusted {
+        return Ok(false);
+    }
+    trust_current_project()?;
+    Ok(true)
+}
+
+/// Die projektlokale Konfiguration, kanonisch — für das eingebaute Schreibverbot des Guards und
+/// um dessen „für bash nicht durchsetzbar"-Meldung zu erkennen (dort greift die Inhaltsbindung).
+pub fn project_config_root_canon() -> Result<PathBuf> {
+    Ok(sepp_policy::canonicalize_lenient(&project_root()?))
 }
 
 // ---- Session-Stores -----------------------------------------------------
@@ -477,5 +611,66 @@ mod tests {
         assert_eq!(hash.len(), 16, "16-stelliger Hex-Hash");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(dir.parent().unwrap().ends_with("sessions"));
+    }
+
+    #[test]
+    fn config_fingerprint_follows_rights_and_code_not_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".sepp");
+        std::fs::create_dir_all(root.join("skills")).unwrap();
+        let empty = config_fingerprint(&root).unwrap();
+        assert_eq!(empty.len(), 64);
+        assert_eq!(
+            config_fingerprint(&tmp.path().join("nicht-da")).unwrap(),
+            empty,
+            "fehlendes Verzeichnis = leer"
+        );
+        std::fs::write(root.join("skills/x.md"), "# x").unwrap();
+        assert_eq!(
+            config_fingerprint(&root).unwrap(),
+            empty,
+            "Skills binden nicht"
+        );
+        std::fs::write(root.join("policy.toml"), "[agent]\nnet = true\n").unwrap();
+        let with_policy = config_fingerprint(&root).unwrap();
+        assert_ne!(with_policy, empty);
+        std::fs::create_dir_all(root.join("hooks")).unwrap();
+        std::fs::write(root.join("hooks/a.rhai"), "fn on_input(t) { t }").unwrap();
+        let with_hook = config_fingerprint(&root).unwrap();
+        assert_ne!(with_hook, with_policy);
+        assert_eq!(
+            config_fingerprint(&root).unwrap(),
+            with_hook,
+            "deterministisch"
+        );
+        std::fs::write(root.join("policy.toml"), "[agent]\nnet = false\n").unwrap();
+        assert_ne!(config_fingerprint(&root).unwrap(), with_hook);
+    }
+
+    #[test]
+    fn trust_entries_old_and_new_format() {
+        use serde_json::json;
+        assert_eq!(evaluate_trust(None, "a"), TrustState::Untrusted);
+        assert_eq!(
+            evaluate_trust(Some(&json!(false)), "a"),
+            TrustState::Untrusted
+        );
+        assert_eq!(
+            evaluate_trust(Some(&json!(true)), "a"),
+            TrustState::Trusted,
+            "Format bis 0.5.0"
+        );
+        assert_eq!(
+            evaluate_trust(Some(&json!({ "config": "a" })), "a"),
+            TrustState::Trusted
+        );
+        assert_eq!(
+            evaluate_trust(Some(&json!({ "config": "a" })), "b"),
+            TrustState::Changed {
+                expected: "a".into(),
+                actual: "b".into()
+            }
+        );
+        assert_eq!(short_fingerprint("0123456789abcdef"), "0123456789ab");
     }
 }

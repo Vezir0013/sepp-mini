@@ -25,7 +25,7 @@ pub use guard::{
     builtin_agent_grants, load_policy_set, Action, Actor, AgentSection, AskRules, AuditEvent,
     Authorization, BuiltinDefaults, Decision, ExecGrant, GrantEntry, Grants, Guard, Mode, NetGrant,
     PermissionAnswer, PermissionPrompter, PermissionRequest, PolicyFile, PolicySet, PolicySource,
-    Source, SourceKind, BUILTIN_DENY,
+    PolicyWrite, Source, SourceKind, BUILTIN_DENY,
 };
 #[cfg(target_os = "linux")]
 pub use sandbox::LandlockSandbox;

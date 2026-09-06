@@ -382,12 +382,31 @@ pub struct PolicySource {
     pub kind: SourceKind,
 }
 
-/// Vom Frontend beigesteuerte Defaults: zusätzliche Verbote (config_root, state_root) und der
-/// Modus, wenn keine Quelle einen setzt (TUI: `ask`, `-p`/`--rpc`: `auto`).
+/// Vom Frontend beigesteuerte Defaults: zusätzliche Verbote (config_root, state_root), ein
+/// Schreibverbot für die projektlokale Konfiguration (`<cwd>/.sepp`) und der Modus, wenn keine
+/// Quelle einen setzt (TUI: `ask`, `-p`/`--rpc`: `auto`).
 #[derive(Debug, Clone, Default)]
 pub struct BuiltinDefaults {
+    /// Lesen und Schreiben verboten (Keys, Sessions, Trust). Wird kanonisiert wie der geprüfte
+    /// Zugriffspfad — ein symlinktes oder relatives `SEPP_HOME` träfe sonst nie.
     pub extra_deny: Vec<PathBuf>,
+    /// Nur Schreiben verboten — gedacht für die Rechtequelle des Projekts: Der Agent darf seine
+    /// eigene `.sepp/policy.toml` (und `settings.toml`, Hooks, Plugins) nicht anlegen oder
+    /// ändern; sonst hätte er nach dem nächsten Start eines vertrauten Projekts genau die
+    /// Rechte, die er sich selbst geschrieben hat. Für `bash` (Landlock ist additiv) fängt das
+    /// die Bindung des Vertrauens an den Inhalt dieser Dateien auf (`sepp-cli`,
+    /// `session::project_trust_state`).
+    pub extra_deny_write: Vec<PathBuf>,
     pub default_mode: Mode,
+}
+
+/// Phase eines Schreibens in die Policy-Datei („dauerhaft erlauben"), für den Rückruf des
+/// Frontends: `Before` unmittelbar vor dem Schreiben (das Frontend hält fest, ob das Vertrauen
+/// ins Projekt bis dahin galt), `After` nach einem erfolgreichen Schreiben (dann bindet es neu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyWrite {
+    Before,
+    After,
 }
 
 /// Das zusammengeführte Regelwerk: Vereinigung aller Gewährungen mit Herkunft, alle Verbote,
@@ -461,7 +480,13 @@ impl PolicySet {
                 .push((DenyRule::read(resolve_path_with(d, ctx)), Source::Builtin));
         }
         for d in &defaults.extra_deny {
-            let rule = DenyRule::read(d.clone());
+            let rule = DenyRule::read(canonicalize_lenient(d));
+            if !set.deny.iter().any(|(r, _)| *r == rule) {
+                set.deny.push((rule, Source::Builtin));
+            }
+        }
+        for d in &defaults.extra_deny_write {
+            let rule = DenyRule::write(canonicalize_lenient(d));
             if !set.deny.iter().any(|(r, _)| *r == rule) {
                 set.deny.push((rule, Source::Builtin));
             }
@@ -829,6 +854,9 @@ pub struct Guard {
     notices: Mutex<Vec<String>>,
     /// Policy-Datei für Hinweise und für „dauerhaft erlauben".
     policy_file: Option<PathBuf>,
+    /// Läuft nach jedem erfolgreichen „dauerhaft erlauben" — das Frontend bindet dort das
+    /// Vertrauen ins Projekt an den geänderten Inhalt der Policy-Datei neu.
+    policy_written: Option<Arc<dyn Fn(PolicyWrite) + Send + Sync>>,
 }
 
 impl fmt::Debug for Guard {
@@ -857,6 +885,7 @@ impl Guard {
             audit: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             policy_file: None,
+            policy_written: None,
         }
     }
 
@@ -881,6 +910,14 @@ impl Guard {
     /// beschrieben.
     pub fn with_policy_file(mut self, path: PathBuf) -> Self {
         self.policy_file = Some(path);
+        self
+    }
+
+    /// Rückruf um jedes Schreiben in die Policy-Datei („dauerhaft erlauben"): [`PolicyWrite::Before`]
+    /// vor dem Versuch, [`PolicyWrite::After`] nach einem erfolgreichen Schreiben. Der Guard kennt
+    /// kein Vertrauen — das Frontend hängt hier die Neubindung ein.
+    pub fn with_policy_written(mut self, hook: Arc<dyn Fn(PolicyWrite) + Send + Sync>) -> Self {
+        self.policy_written = Some(hook);
         self
     }
 
@@ -1145,11 +1182,19 @@ impl Guard {
             ))
             }
         };
+        if let Some(hook) = &self.policy_written {
+            hook(PolicyWrite::Before);
+        }
         match crate::policy_edit::allow(file, actor, right, &val) {
-            Ok(true) => Some(format!(
-                "Dauerhaft erlaubt: {right} = \"{val}\" in {}",
-                file.display()
-            )),
+            Ok(true) => {
+                if let Some(hook) = &self.policy_written {
+                    hook(PolicyWrite::After);
+                }
+                Some(format!(
+                    "Dauerhaft erlaubt: {right} = \"{val}\" in {}",
+                    file.display()
+                ))
+            }
             Ok(false) => Some(format!("Stand bereits in {}", file.display())),
             Err(e) => Some(format!(
                 "Für die Sitzung erlaubt, aber Schreiben in {} schlug fehl: {e}",
@@ -1281,6 +1326,7 @@ fs_read  = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.sepp"]
     fn defaults_apply_without_files() {
         let defaults = BuiltinDefaults {
             extra_deny: vec![PathBuf::from("/etc/sepp")],
+            extra_deny_write: Vec::new(),
             default_mode: Mode::Auto,
         };
         let set = PolicySet::merge(vec![], &defaults, None, &ctx());
@@ -1500,6 +1546,7 @@ fs_read = ["./"]
         let set = PolicySet::merge(
             vec![],
             &BuiltinDefaults {
+                extra_deny_write: Vec::new(),
                 default_mode: Mode::Auto,
                 ..BuiltinDefaults::default()
             },
@@ -2052,15 +2099,79 @@ command = ["uvx", "mcp-server-git"]
         assert!(!g.agent_spawn_policy(&[]).allows_path(&target, true));
     }
 
+    /// 0.5.1: Im vertrauten Projekt schrieb der Agent im Modus auto seine eigene
+    /// `.sepp/policy.toml` — und hatte beim nächsten Start die Rechte, die er sich gegeben hatte.
+    /// Das Frontend meldet die projektlokale Konfiguration als Schreibverbot; Lesen bleibt, und
+    /// das Projekt selbst bleibt beschreibbar.
+    #[test]
+    fn project_config_is_write_protected_but_readable() {
+        let env = Env::new();
+        let cfg = env.root.join("proj/.sepp");
+        let defaults = BuiltinDefaults {
+            extra_deny_write: vec![cfg.clone()],
+            ..Default::default()
+        };
+        let set = PolicySet::merge(Vec::new(), &defaults, Some(Mode::Auto), &env.ctx());
+        let g = Guard::new(set, Box::new(NullSandbox));
+        let policy = cfg.join("policy.toml");
+        match g.decide(&Actor::Agent, &Action::FsWrite(policy.clone())) {
+            Decision::Deny { reason } => assert!(reason.contains("[deny]"), "{reason}"),
+            other => panic!("Schreiben in die Projekt-Policy muss verweigert werden: {other:?}"),
+        }
+        assert!(matches!(
+            g.decide(&Actor::Agent, &Action::FsWrite(cfg.join("hooks/x.rhai"))),
+            Decision::Deny { .. }
+        ));
+        assert_eq!(
+            g.decide(&Actor::Agent, &Action::FsRead(policy)),
+            Decision::Allow
+        );
+        assert_eq!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsWrite(env.root.join("proj/src/main.rs"))
+            ),
+            Decision::Allow
+        );
+    }
+
+    /// Ein Verbot muss den kanonischen Pfad tragen, weil `decide` den Zugriffspfad kanonisiert —
+    /// sonst träfe ein symlinktes `SEPP_HOME` nie.
+    #[cfg(unix)]
+    #[test]
+    fn frontend_denies_are_canonical() {
+        let env = Env::new();
+        let real = env.root.join("state");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = env.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let defaults = BuiltinDefaults {
+            extra_deny: vec![link.clone()],
+            extra_deny_write: vec![env.root.join("proj/.sepp")],
+            ..Default::default()
+        };
+        let set = PolicySet::merge(Vec::new(), &defaults, Some(Mode::Auto), &env.ctx());
+        assert!(set.deny_rules().iter().any(|r| r.prefix == real));
+        assert!(!set.deny_rules().iter().any(|r| r.prefix == link));
+        let g = Guard::new(set, Box::new(NullSandbox));
+        assert!(matches!(
+            g.decide(&Actor::Agent, &Action::FsRead(link.join("trust.json"))),
+            Decision::Deny { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn always_writes_policy_file_and_no_denies() {
         let env = Env::new();
         let policy_file = env.root.join("proj/.sepp/policy.toml");
+        let phases: Arc<Mutex<Vec<PolicyWrite>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = phases.clone();
         let g = Guard::new(
             env.set(Mode::Ask, Env::default_grants(), &[]),
             Box::new(NullSandbox),
         )
         .with_policy_file(policy_file.clone())
+        .with_policy_written(Arc::new(move |phase| lock(&seen).push(phase)))
         .with_prompter(Arc::new(Answering(PermissionAnswer::Always)));
         let target = env.root.join("home/always.txt");
         g.authorize(&Actor::Agent, Action::FsWrite(target.clone()))
@@ -2076,6 +2187,11 @@ command = ["uvx", "mcp-server-git"]
         let notices = g.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("Dauerhaft erlaubt"), "{notices:?}");
+        assert_eq!(
+            *lock(&phases),
+            vec![PolicyWrite::Before, PolicyWrite::After],
+            "Rückruf vor dem Versuch und nach dem erfolgreichen Schreiben"
+        );
         assert_eq!(
             g.decide(&Actor::Agent, &Action::FsWrite(target.clone())),
             Decision::Allow

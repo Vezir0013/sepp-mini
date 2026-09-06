@@ -839,12 +839,15 @@ impl App {
                 Err(e) => self.notify_error(format!("/resume: {e}")),
             },
             "trust" => match session::trust_current_project() {
-                Ok(()) => {
+                Ok(fingerprint) => {
                     // Genau EINE Meldung aus der Rückgabe bauen — self.status zurückzulesen
                     // erzeugte bei /hide zwei fast identische Transcript-Zeilen. Bei None steht
                     // der Reload-Fehler bereits rot da (das Projekt ist trotzdem vertraut).
                     if let Some(summary) = self.reload_resources().await {
-                        self.notify(format!("Projekt vertraut · {summary}"));
+                        self.notify(format!(
+                            "Projekt vertraut (Konfig-Stand {}) · {summary}",
+                            session::short_fingerprint(&fingerprint)
+                        ));
                     }
                 }
                 Err(e) => self.notify_error(format!("/trust: {e}")),

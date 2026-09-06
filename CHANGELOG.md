@@ -7,6 +7,75 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+Drei Löcher im Zaun, alle an der Release-Binary nachgestellt, alle geschlossen. Gemeinsam ist
+ihnen: Der Guard entschied über etwas anderes, als danach wirkte — über einen Systempfad, der im
+eigenen Prozess mehr preisgab als in der Sandbox; über ein Verzeichnis, das die Rechte des
+nächsten Starts bestimmt und im Schreib-Grant des Projekts lag; über einen Host, den ein
+Handparser anders las als der HTTP-Client. Die Regel, die aus allen dreien folgt und jetzt im
+Code steht: **Was der Guard prüft, muss exakt das sein, was danach passiert.** Nichts davon
+ändert ein Format oder eine Schnittstelle, die ein Paket, Plugin oder Skript benutzt.
+
+### Behoben
+- **`read /proc/self/environ` lieferte die API-Keys ins Modell.** Der eingebaute Agent-Grant
+  `fs_read = ["system"]` enthielt `/proc`. Für Kindprozesse ist das nötig und ungefährlich —
+  Landlocks Ptrace-Schranke lässt `bash` nicht an die Umgebung von sepp. Im eigenen Prozess gibt
+  es diese Schranke nicht: `read` las die eigene Umgebung samt Schlüsseln ins Kontextfenster und
+  in die Session-Datei. `"system"` bedeutet für `read`/`write`/`edit` und `host_fs_read` jetzt
+  die Systempfade **ohne** `/proc`; die Sandbox gibt Kindprozessen `/proc` weiterhin selbst dazu.
+  Wer `/proc` im Werkzeug wirklich braucht, gewährt den Pfad ausdrücklich. Dazu ist sepp selbst
+  nicht mehr dumpbar (`PR_SET_DUMPABLE = 0`, vor allem anderen in `main`): kein Core-Dump mit
+  Schlüsseln, und auch ohne Sandbox (`--mode yolo`, Plattformen ohne Adapter) kommt ein Kind
+  derselben UID nicht über procfs an die Umgebung. Kinder selbst bleiben dumpbar (`execve` setzt
+  das Flag zurück) — `ps`, Debugger und `/proc/self` in Skripten laufen wie zuvor.
+- **Der Agent konnte seine eigene Projekt-Policy schreiben.** `<cwd>/.sepp/` liegt im
+  Schreib-Grant `./`; im Modus `auto` schrieb `write` ohne Rückfrage eine `.sepp/policy.toml` mit
+  `fs_read = ["/root"]` und `net = true`, und beim nächsten Start eines vertrauten Projekts galt
+  sie — persistente Selbst-Eskalation, für `settings.toml` (MCP-Server), Hooks und Plugins
+  ebenso. Zwei Schichten dagegen: Das Frontend meldet `<cwd>/.sepp` als **eingebautes
+  Schreibverbot** (`read` bleibt erlaubt, das Projekt bleibt beschreibbar); und weil Landlock ein
+  Verbot unter einer Gewährung für `bash` nicht ausdrücken kann, ist das **Vertrauen jetzt an den
+  Inhalt** von `policy.toml`, `settings.toml`, `hooks/` und `plugins/` gebunden (SHA-256, in
+  `trust.json`). Ändert sich dort etwas — durch den Agenten über `bash` oder durch den Menschen
+  von Hand —, lädt sepp die projektlokale Konfiguration nicht mehr, meldet es beim Start und in
+  `sepp policy`, und ein neues `/trust` bestätigt den Stand. Was sepp selbst im Auftrag des
+  Menschen schreibt (`sepp policy allow`, „dauerhaft erlauben" in der TUI, `sepp init`), bindet
+  das Vertrauen sofort neu — sofern die Konfiguration bis dahin die bestätigte war; sonst
+  bleibt es ausgesetzt, bis `/trust` den gesamten Stand bestätigt. Skills und Prompts binden nicht: Sie ändern den System-Prompt, keine
+  Rechte.
+- **Host-Allowlist umgehbar über eine URL mit Backslash.** `url_host` zerlegte die URL von Hand
+  (`rsplit('@')`), reqwest nach WHATWG: Für `https://evil.example\@api.example.com/x` sah das
+  Net-Gate `api.example.com`, verbunden wurde mit `evil.example` — samt eingesetztem
+  Secret-Header, und die Spur nannte den falschen Host. Ein Plugin mit `net = ["api.example.com"]`
+  und `env = ["TOKEN"]` konnte so das Secret an einen beliebigen Host schicken. Jetzt entscheidet
+  die `url`-Crate, die auch reqwest benutzt; eine URL mit Backslash vor dem Pfad, mit
+  Whitespace/Steuerzeichen (der Parser entfernte sie still) oder ohne Authority wird gar nicht
+  erst akzeptiert. Betrifft `host_http` (WASM), Secret-Header für http-MCP-Server und die
+  Schema-Regel der Registry.
+
+### Geändert
+- `trust.json` trägt je Projekt statt `true` ein Objekt `{"config": "<sha256>"}` — additiv: ein
+  älteres `sepp` liest es weiter als „vertraut", ein neueres bindet einen alten `true`-Eintrag
+  beim ersten Lesen an den dann vorliegenden Stand. `/trust` nennt den Konfig-Stand
+  (Kurz-Fingerprint); `sepp policy` und der Start melden eine seither geänderte Konfiguration.
+- Hostnamen in `net`-Listen werden case-insensitiv verglichen (`Api.Example.com` trifft
+  `api.example.com`); Domains kommen aus dem Parser in Kleinschreibung.
+- Eingebaute Verbote des Frontends (config_root, state_root) werden kanonisiert wie der geprüfte
+  Zugriffspfad — ein symlinktes oder relatives `SEPP_HOME` traf bisher nie.
+- `sepp policy` führt das Schreibverbot auf `<cwd>/.sepp` mit eigener Erklärung statt als
+  „für Kindprozesse nicht durchsetzbar"; der Start meldet es nicht bei jedem Aufruf.
+
+### Tests
+- `sepp-policy`: `url_host` differenziell gegen `url::Url` (Backslash, Tab, Newline,
+  Großschreibung, `%5C`, IPv6, IDN) und die Ablehnungen; case-insensitives `Net`-Matching;
+  `"system"` ohne `/proc`; `read /proc/self/environ` und `/proc/meminfo` verweigert, `/etc`
+  erlaubt, ausdrücklich gewährtes `/proc/meminfo` erlaubt (Linux); Prozess nach
+  `harden_process` nicht dumpbar (Linux); Schreibverbot auf `<cwd>/.sepp` bei erlaubtem Lesen
+  und beschreibbarem Projekt; kanonisierte Frontend-Verbote über einen Symlink; Rückruf nach
+  „dauerhaft erlauben" genau einmal.
+- `sepp-cli`: Fingerprint folgt `policy.toml`, Hooks und Plugins, nicht Skills, ist
+  deterministisch und für ein fehlendes Verzeichnis leer; Trust-Einträge in altem (`true`) und
+  neuem Format, `Changed` bei abweichendem Stand.
+
 ## [0.5.0] - 2026-09-06
 
 Ein Index nennt Pakete, er gewährt nichts. Bis jetzt kam ein Paket als Datei — per Mail, Download,

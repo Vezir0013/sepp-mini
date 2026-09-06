@@ -493,7 +493,7 @@ fn run_init(scope: session::InitScope) -> ExitCode {
     let mut trusted = false;
     if scope == session::InitScope::Project {
         match session::trust_current_project() {
-            Ok(()) => trusted = true,
+            Ok(_) => trusted = true,
             Err(e) => {
                 eprintln!("Warnung: Projekt konnte nicht automatisch vertraut werden: {e}");
                 eprintln!("In der TUI nachholen mit: /trust");
@@ -965,13 +965,28 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         .unwrap_or_else(|| default_max_tokens(&model));
     // `store` wurde bereits vor den Key-Checks gebaut (Audit jeden Start).
 
-    let trusted = session::is_project_trusted().unwrap_or(false);
+    // Trust ist an den Inhalt der projektlokalen Konfiguration gebunden: Hat sich dort etwas
+    // geändert — durch den Menschen von Hand oder durch den Agenten über bash —, lädt nichts
+    // davon, bis ein Mensch es erneut bestätigt.
+    let trust = session::project_trust_state().unwrap_or(session::TrustState::Untrusted);
+    if let session::TrustState::Changed { expected, actual } = &trust {
+        startup_notice(format!(
+            "Hinweis: Vertrauen ins Projekt ausgesetzt — die Konfiguration (.sepp/: policy.toml, settings.toml, hooks, \
+             plugins) hat sich seit /trust geändert (Stand {} → {}) — sie wird nicht geladen, bis \
+             du sie mit /trust erneut bestätigst.",
+            session::short_fingerprint(expected),
+            session::short_fingerprint(actual)
+        ));
+    }
+    let trusted = trust == session::TrustState::Trusted;
 
     // Sepp Guard: Regelwerk laden, Sandbox prüfen (fail-closed), Entscheider bauen. Die
     // Policy-Menge wird auch ohne Guard gebraucht (MCP-/Plugin-Gewährungen gelten immer).
     let policy_sources = session::policy_paths(trusted)?;
     let guard_defaults = BuiltinDefaults {
         extra_deny: session::builtin_deny_roots()?,
+        // Der Agent schreibt seine Rechtequelle nicht selbst (0.5.1).
+        extra_deny_write: vec![session::project_root()?],
         default_mode: if interactive { Mode::Ask } else { Mode::Auto },
     };
     let mode_override = resolve_mode_override(opts.mode, env_nonempty("SEPP_MODE").as_deref());
@@ -1037,7 +1052,13 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                 sandbox_caps.detail
             ));
         }
+        let project_cfg = session::project_config_root_canon()?;
         for o in policy_set.deny_overlaps(&Actor::Agent) {
+            // Das Schreibverbot auf <cwd>/.sepp liegt immer unter der Gewährung ./ — für bash
+            // fängt das die Inhaltsbindung des Vertrauens auf; kein Hinweis bei jedem Start.
+            if o.deny == project_cfg {
+                continue;
+            }
             startup_notice(format!(
                 "Hinweis: Verbot {} liegt unter der Gewährung {} — für bash nicht durchsetzbar \
                  (Landlock ist additiv); read/write/edit halten es ein.",
@@ -1054,7 +1075,27 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
         }
         Some(Arc::new(
             Guard::new(policy_set.clone(), sandbox)
-                .with_policy_file(session::project_policy_path()?),
+                .with_policy_file(session::project_policy_path()?)
+                // „dauerhaft erlauben" schreibt in die projektlokale Policy — eine Handlung
+                // des Menschen. Neu gebunden wird nur, wenn die Konfiguration bis dahin die
+                // bestätigte war; sonst bliebe eine fremde Änderung mitgesegnet.
+                .with_policy_written({
+                    let before = std::sync::Mutex::new(session::TrustState::Untrusted);
+                    Arc::new(move |phase| match phase {
+                        sepp_policy::PolicyWrite::Before => {
+                            let state = session::project_trust_state()
+                                .unwrap_or(session::TrustState::Untrusted);
+                            *before.lock().unwrap_or_else(|e| e.into_inner()) = state;
+                        }
+                        sepp_policy::PolicyWrite::After => {
+                            let state = std::mem::replace(
+                                &mut *before.lock().unwrap_or_else(|e| e.into_inner()),
+                                session::TrustState::Untrusted,
+                            );
+                            let _ = session::rebind_trust_after_own_write(&state);
+                        }
+                    })
+                }),
         ))
     };
 
@@ -2005,6 +2046,7 @@ mod tests {
             &[],
             &BuiltinDefaults {
                 extra_deny: Vec::new(),
+                extra_deny_write: Vec::new(),
                 default_mode: Mode::Auto,
             },
             None,

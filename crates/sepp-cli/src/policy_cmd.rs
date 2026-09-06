@@ -107,10 +107,12 @@ pub fn run_policy(cmd: PolicyCmd) -> ExitCode {
 }
 
 fn show() -> anyhow::Result<String> {
-    let trusted = session::is_project_trusted().unwrap_or(false);
+    let trust = session::project_trust_state().unwrap_or(session::TrustState::Untrusted);
+    let trusted = trust == session::TrustState::Trusted;
     let sources = session::policy_paths(trusted)?;
     let defaults = BuiltinDefaults {
         extra_deny: session::builtin_deny_roots()?,
+        extra_deny_write: vec![session::project_root()?],
         default_mode: Mode::Ask,
     };
     let mode_override = std::env::var("SEPP_MODE")
@@ -123,7 +125,17 @@ fn show() -> anyhow::Result<String> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".into());
-    Ok(render_policy_table(&set, &caps, &rows, &cwd, trusted))
+    let mut out = render_policy_table(&set, &caps, &rows, &cwd, trusted);
+    if let session::TrustState::Changed { expected, actual } = &trust {
+        out.push_str(&format!(
+            "\nHinweis: Vertrauen ins Projekt ausgesetzt — seine Konfiguration (.sepp/: policy.toml, \
+             settings.toml, hooks, plugins) hat sich seit /trust geändert (Stand {} → {}). Sie \
+             wird nicht geladen, bis sie erneut bestätigt ist: /trust in der TUI.\n",
+            session::short_fingerprint(expected),
+            session::short_fingerprint(actual)
+        ));
+    }
+    Ok(out)
 }
 
 /// MCP-Server und Plugins als Zeilen der Rechteübersicht. Von `sepp policy` **und** vom
@@ -556,8 +568,19 @@ pub fn render_policy_table(
     } else if !caps.net_enforceable {
         unenforceable.push("TCP-Verbot für Kindprozesse (Kernel < 6.7 / Landlock ABI < 4)".into());
     }
+    // Das eingebaute Schreibverbot auf <cwd>/.sepp liegt immer unter der Gewährung ./ — für bash
+    // greift dort nicht Landlock, sondern die Bindung des Vertrauens an den Inhalt.
+    let project_cfg = sepp_policy::canonicalize_lenient(&std::path::Path::new(cwd).join(".sepp"));
     for actor in &actors {
         for o in set.deny_overlaps(actor) {
+            if o.deny == project_cfg {
+                unenforceable.push(format!(
+                    "Schreibverbot {} ({}): für bash nicht durchsetzbar — eine Änderung dort hebt das Vertrauen ins Projekt auf, bis /trust es neu bestätigt",
+                    o.deny.display(),
+                    actor
+                ));
+                continue;
+            }
             unenforceable.push(format!(
                 "Verbot {} unter Gewährung {} ({}): für Kindprozesse nicht durchsetzbar, In-Process-Prüfung greift",
                 o.deny.display(),
@@ -605,6 +628,13 @@ fn run_allow(args: &[String]) -> anyhow::Result<String> {
     } else {
         session::project_policy_path()?
     };
+    // Vor dem Schreiben festhalten, ob das Vertrauen bis hierher galt — danach ist der Stand
+    // durch unseren eigenen Eintrag ohnehin ein anderer.
+    let before = if global {
+        None
+    } else {
+        Some(session::project_trust_state()?)
+    };
     let written = sepp_policy::policy_edit::allow(&path, &actor, &right, &value)?;
     let mut out = if written {
         format!(
@@ -615,11 +645,25 @@ fn run_allow(args: &[String]) -> anyhow::Result<String> {
     } else {
         format!("Stand bereits in {}: {right} = \"{value}\"", path.display())
     };
-    if !global && !session::is_project_trusted().unwrap_or(false) {
-        out.push_str(
-            "\nHinweis: Das Projekt ist noch nicht vertraut — die Datei wirkt erst nach \
-             `sepp init` bzw. `/trust` in der TUI.",
-        );
+    if let Some(before) = before {
+        match before {
+            session::TrustState::Trusted => {
+                // Die Änderung hat der Mensch veranlasst — das Vertrauen folgt dem neuen Stand.
+                session::rebind_trust_after_own_write(&before)?;
+                out.push_str(
+                    "\nVertrauen ins Projekt an den neuen Stand der Konfiguration gebunden.",
+                );
+            }
+            session::TrustState::Changed { .. } => out.push_str(
+                "\nHinweis: Die Konfiguration hatte sich schon vor diesem Eintrag seit /trust \
+                 geändert — das Vertrauen bleibt ausgesetzt, bis /trust in der TUI (oder \
+                 sepp init) den gesamten Stand bestätigt.",
+            ),
+            session::TrustState::Untrusted => out.push_str(
+                "\nHinweis: Das Projekt ist noch nicht vertraut — die Datei wirkt erst nach \
+                 `sepp init` bzw. `/trust` in der TUI.",
+            ),
+        }
     }
     out.push_str("\nWirksam beim nächsten Start. Kontrolle: sepp policy");
     Ok(out)
@@ -1006,6 +1050,7 @@ mod tests {
             vec![(sepp_policy::Source::File(PathBuf::from("/p")), f)],
             &BuiltinDefaults {
                 extra_deny: Vec::new(),
+                extra_deny_write: Vec::new(),
                 default_mode: Mode::Ask,
             },
             None,
@@ -1022,6 +1067,7 @@ mod tests {
     fn plugin_host_lists_are_enforced_and_do_not_trigger_the_host_filter_note() {
         let builtin = BuiltinDefaults {
             extra_deny: Vec::new(),
+            extra_deny_write: Vec::new(),
             default_mode: Mode::Ask,
         };
         let plugin_only = PolicyFile::parse(

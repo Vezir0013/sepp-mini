@@ -249,7 +249,10 @@ Standardmäßig liegt alles unter der einen Wurzel `~/.sepp/`. Für System-Insta
 (`sessions/`, `trust.json`, `pkg/` mit Nachweisen und Schlüsseln, `trusted-keys/`; via
 `$SEPP_STATE_DIR`, Default `/var/lib/sepp`). `SEPP_HOME` setzt beide zugleich.
 Projektlokale **Config**-Erweiterungen (`<repo>/.sepp/…`, nur skills/prompts/hooks/plugins/settings)
-laden erst, nachdem das Projekt **getrustet** wurde; Sessions/Trust liegen zentral im state_root.
+laden erst, nachdem das Projekt **getrustet** wurde. Das Vertrauen ist an den Inhalt von
+`policy.toml`, `settings.toml`, `hooks/` und `plugins/` gebunden: Ändert sich dort etwas, lädt sepp
+die projektlokale Konfiguration erst nach einem neuen `/trust` wieder — und der Agent selbst darf
+diese Dateien nicht schreiben. Sessions/Trust liegen zentral im state_root.
 
 **Erstkonfiguration:** `sepp init` legt das projektlokale Config-Skelett
 `./.sepp/{skills,prompts,hooks,plugins}/` samt kommentierter Beispiel-`settings.toml` an;
