@@ -53,8 +53,11 @@
 //! Dateigröße gegen ein 16-MiB-Limit. `host_fs_read` bleibt unverändert (Text, verlustbehaftet)
 //! und ist für Textdateien weiterhin der bequemere Weg.
 
+mod http;
+
 use std::path::Path;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -65,8 +68,22 @@ use wasmi::{
 };
 
 use sepp_core::{Result, SeppError, ToolResult, ToolSpec};
-use sepp_policy::{Capability, Limits, Manifest, Policy};
+use sepp_policy::{
+    placeholder_names, url_host, Actor, Capability, GateRefusal, Limits, Manifest, Policy,
+    SecretBroker,
+};
 use sepp_tools::Tool;
+
+use crate::http::{HttpFail, HttpJob, HttpProxy};
+
+/// Der Schlüssel in `ToolResult::details`, unter dem der Host seinen Audit-Eintrag ablegt —
+/// derselbe wie `sepp_agent::AUDIT_DETAIL_KEY` (ein Test in `sepp-cli` hält beide gleich; hier
+/// kein Import, weil `sepp-agent` oberhalb dieser Crate liegt). Das Objekt darunter gehört dem
+/// Host; ein Plugin, das den Schlüssel selbst setzt, wird überschrieben.
+pub const AUDIT_DETAIL_KEY: &str = "audit";
+
+/// `kind` des Audit-Eintrags, den `host_http` je Werkzeugaufruf erzeugt.
+pub const HTTP_AUDIT_KIND: &str = "plugin_http";
 
 /// Pro-Instanz-Zustand (für Host-Funktionen und den Speicher-Limiter).
 struct HostState {
@@ -83,9 +100,33 @@ struct HostState {
     result: Vec<u8>,
     /// Effektive Rechte dieses Plugins — die Host-Funktionen prüfen damit Pfade und Hosts.
     policy: Policy,
+    /// Der Abschnittsname (`[plugin.<name>]`), nicht der exponierte Werkzeugname — für den
+    /// `sepp policy allow`-Hinweis und die Audit-Spur.
+    plugin: String,
+    /// Die Verbrauchsdeckel des Manifests (`limits` oben ist nur der Speicher-Limiter des Stores).
+    plugin_limits: Limits,
+    /// Abbruch des laufenden Werkzeugaufrufs — `host_http` wartet darauf, weil während einer
+    /// Host-Funktion kein Yield-Punkt kommt.
+    cancel: CancellationToken,
+    /// Wanduhr-Ende des Aufrufs (`None` = unbegrenzt); kappt das Timeout je Anfrage.
+    deadline: Option<Instant>,
+    http: Arc<HttpProxy>,
+    /// Anfragen in diesem Aufruf, auch abgelehnte — gegen `limits.max_http_requests`.
+    http_calls: u32,
+    /// Ein Objekt je Versuch; `run` bündelt sie nach `sepp_call` zu einem Audit-Eintrag.
+    http_audit: Vec<Value>,
+    http_denied: u32,
 }
 
-fn host_state(limits: &Limits, policy: Policy) -> HostState {
+/// Was `run` und `load` je Instanz beisteuern — gebündelt, damit `host_state` lesbar bleibt.
+struct HostCtx<'a> {
+    plugin: &'a str,
+    cancel: CancellationToken,
+    deadline: Option<Instant>,
+    http: Arc<HttpProxy>,
+}
+
+fn host_state(limits: &Limits, policy: Policy, ctx: HostCtx<'_>) -> HostState {
     HostState {
         logs: Vec::new(),
         limits: StoreLimitsBuilder::new()
@@ -93,7 +134,20 @@ fn host_state(limits: &Limits, policy: Policy) -> HostState {
             .build(),
         result: Vec::new(),
         policy,
+        plugin: ctx.plugin.to_string(),
+        plugin_limits: limits.clone(),
+        cancel: ctx.cancel,
+        deadline: ctx.deadline,
+        http: ctx.http,
+        http_calls: 0,
+        http_audit: Vec::new(),
+        http_denied: 0,
     }
+}
+
+/// Wanduhr-Ende aus `max_wall_time_ms`: `0` heißt unbegrenzt.
+fn deadline_from(ms: u64) -> Option<Instant> {
+    (ms > 0).then(|| Instant::now() + Duration::from_millis(ms))
 }
 
 /// Legt ein Ergebnis für `host_result_read` bereit und liefert dessen Größe zurück.
@@ -485,18 +539,24 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_fs_read_bytes: {e}")))?;
     }
-    // host_http: nur hinter `Gate::Net` — DAS ist das Capability-Gate. Noch eine Attrappe, aber
-    // eine ehrliche: Sie erklärt, statt eine Null zu liefern.
+    // host_http: nur hinter `Gate::Net` — DAS ist das Capability-Gate fürs Netz. Dahinter
+    // prüft `http_request` je Anfrage: Host-Allowlist, Secrets (Doppel-Gate), Zähler, Deckel.
     if Gate::Net.open(policy) {
         linker
             .func_wrap(
                 "env",
                 HOST_HTTP,
-                |mut caller: Caller<'_, HostState>, _ptr: i32, _len: i32| -> i32 {
-                    stage_err(
-                        &mut caller,
-                        "host_http ist in dieser Version noch nicht implementiert",
-                    )
+                |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                    let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) else {
+                        return -1;
+                    };
+                    let Some(raw) = read_input(&caller, &mem, ptr, len) else {
+                        return stage_err(&mut caller, "Eingabe liegt außerhalb des Speichers");
+                    };
+                    match http_request(caller.data_mut(), &raw) {
+                        Ok(v) => stage(&mut caller, v),
+                        Err(e) => stage_err(&mut caller, e),
+                    }
                 },
             )
             .map_err(|e| SeppError::Tool(format!("wasm linker host_http: {e}")))?;
@@ -612,9 +672,255 @@ fn host_fs_read(caller: &mut Caller<'_, HostState>, input: &[u8]) -> i32 {
     )
 }
 
-/// Der WASM-Host (hält die `wasmi`-Engine, Fuel-Metering aktiv).
+/// Die Anfrage, wie das Modul sie über `host_http` stellt (Kodierung in `wit/sepp.wit`).
+#[derive(Debug, serde::Deserialize)]
+struct HttpRequestIn {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    body_base64: Option<String>,
+}
+
+/// Warum eine Anfrage nicht ausgeführt wurde. `denied` unterscheidet in der Audit-Spur eine
+/// Rechte-Verweigerung (Host oder Secret nicht gewährt) von einem Fehler (Timeout, Netz, Format).
+struct Refused {
+    message: String,
+    denied: bool,
+}
+
+impl Refused {
+    fn error(message: impl Into<String>) -> Self {
+        Refused {
+            message: message.into(),
+            denied: false,
+        }
+    }
+    fn denied(message: impl Into<String>) -> Self {
+        Refused {
+            message: message.into(),
+            denied: true,
+        }
+    }
+}
+
+/// Rumpf von `host_http`: Regelkette, Auftrag an den Worker, Antwort als JSON — und **jeder**
+/// Versuch, auch ein abgelehnter, wird als Audit-Objekt vermerkt. Ohne `Caller`, damit die
+/// Regelkette ohne WASM-Modul testbar ist.
+fn http_request(state: &mut HostState, raw: &[u8]) -> std::result::Result<Value, String> {
+    let mut audit = serde_json::Map::new();
+    let outcome = http_attempt(state, raw, &mut audit);
+    match &outcome {
+        Ok(v) => {
+            audit.insert("status".into(), v["status"].clone());
+            audit.insert("bytes_in".into(), v["bytes"].clone());
+        }
+        Err(r) => {
+            audit.insert("error".into(), Value::String(r.message.clone()));
+            if r.denied {
+                audit.insert("denied".into(), Value::Bool(true));
+                state.http_denied += 1;
+            }
+        }
+    }
+    state.http_audit.push(Value::Object(audit));
+    outcome.map_err(|r| r.message)
+}
+
+/// Die Regelkette in dieser Reihenfolge — der erste Verstoß gewinnt, und vor der Allowlist geht
+/// kein Byte auf die Leitung: Zähler → JSON → URL/Schema → keine Platzhalter in der URL →
+/// Host-Allowlist → Doppel-Gate je Header-Platzhalter → Body/Methode → Abbruch/Zeitbudget →
+/// Worker. `audit` bekommt unterwegs Methode, Host, URL und die ersetzten Secret-**Namen**
+/// (nie Werte).
+fn http_attempt(
+    state: &mut HostState,
+    raw: &[u8],
+    audit: &mut serde_json::Map<String, Value>,
+) -> std::result::Result<Value, Refused> {
+    let limits = state.plugin_limits.clone();
+    state.http_calls += 1;
+    if state.http_calls > limits.max_http_requests {
+        return Err(Refused::error(format!(
+            "host_http: mehr als {} Anfragen in einem Werkzeugaufruf (limits.max_http_requests)",
+            limits.max_http_requests
+        )));
+    }
+    let req: HttpRequestIn = serde_json::from_slice(raw)
+        .map_err(|e| Refused::error(format!("host_http: ungültige Anfrage: {e}")))?;
+    audit.insert("method".into(), Value::String(req.method.clone()));
+
+    let host = url_host(&req.url)
+        .ok_or_else(|| Refused::error("host_http: die URL ist keine http(s)-URL mit Host"))?
+        .to_string();
+    audit.insert("host".into(), Value::String(host.clone()));
+    audit.insert("url".into(), Value::String(audit_url(&req.url)));
+    if !placeholder_names(&req.url).is_empty() {
+        return Err(Refused::error(
+            "host_http: Platzhalter ($NAME) in der URL sind nicht erlaubt — Secrets gehören in \
+             Header-Werte; ein literales $ wird als %24 geschrieben",
+        ));
+    }
+    // Die Allowlist: exakt je Anfrage, nicht nur „irgendein Netzrecht" wie am Linker-Gate.
+    if !state.policy.allows(&Capability::Net { host: host.clone() }) {
+        return Err(Refused::denied(format!(
+            "host_http: {host} ist nicht gewährt — `sepp policy allow plugin.{} net {host}`",
+            state.plugin
+        )));
+    }
+
+    // Secrets: Der Broker kennt nur die Variablen, die diese Header verlangen UND die Policy
+    // gewährt; das Doppel-Gate je Platzhalter erklärt jeden fehlenden Teil mit dem passenden
+    // Befehl — ohne den Wert.
+    let broker =
+        SecretBroker::from_env_for(req.headers.iter().map(|(_, v)| v.as_str()), &state.policy);
+    let actor = Actor::Plugin(state.plugin.clone());
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut secrets: Vec<String> = Vec::new();
+    for (name, raw_value) in &req.headers {
+        let wanted = placeholder_names(raw_value);
+        for want in &wanted {
+            if let Err(refusal) = broker.gate(want, &host, &state.policy) {
+                let message = format!(
+                    "host_http: Header '{name}' {}",
+                    refusal.explain(&actor, want)
+                );
+                return Err(match refusal {
+                    GateRefusal::EnvNotSet => Refused::error(message),
+                    _ => Refused::denied(message),
+                });
+            }
+        }
+        let value = broker.substitute_for_host(raw_value, &host, &state.policy);
+        let key = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| Refused::error(format!("host_http: Header-Name '{name}' ist ungültig")))?;
+        // Der Wert darf NIE in eine Meldung — ein Zeilenumbruch im Secret spiegelte es sonst.
+        let mut value = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+            Refused::error(format!(
+                "host_http: Header '{name}' ergibt keinen gültigen Header-Wert (Steuerzeichen im \
+                 Secret?)"
+            ))
+        })?;
+        if !wanted.is_empty() {
+            value.set_sensitive(true);
+            secrets.extend(wanted.iter().map(|w| w.to_string()));
+        }
+        headers.append(key, value);
+    }
+    audit.insert(
+        "secrets".into(),
+        Value::Array(secrets.iter().cloned().map(Value::String).collect()),
+    );
+
+    let body = match (req.body, req.body_base64) {
+        (Some(_), Some(_)) => {
+            return Err(Refused::error(
+                "host_http: body und body_base64 dürfen nicht zusammen gesetzt sein",
+            ))
+        }
+        (Some(text), None) => text.into_bytes(),
+        (None, Some(b64)) => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|_| Refused::error("host_http: body_base64 ist kein gültiges Base64"))?
+        }
+        (None, None) => Vec::new(),
+    };
+    let method = reqwest::Method::from_bytes(req.method.as_bytes())
+        .map_err(|_| Refused::error(format!("host_http: Methode {:?} ist ungültig", req.method)))?;
+
+    if state.cancel.is_cancelled() {
+        return Err(Refused::error("host_http: abgebrochen"));
+    }
+    // Während der Anfrage kommt kein Yield-Punkt: Timeout und Wanduhr müssen hier gelten.
+    let mut timeout = Duration::from_millis(limits.http_timeout_ms);
+    if let Some(deadline) = state.deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Refused::error(
+                "host_http: das Zeitbudget des Aufrufs ist aufgebraucht (limits.max_wall_time_ms)",
+            ));
+        }
+        timeout = timeout.min(remaining);
+    }
+
+    let job = HttpJob {
+        method,
+        url: req.url,
+        headers,
+        body,
+        timeout,
+        max_response_bytes: limits.max_http_response_bytes,
+        cancel: state.cancel.clone(),
+    };
+    match state.http.fetch(job) {
+        Ok(reply) => {
+            audit.insert("ms".into(), Value::from(reply.ms));
+            let bytes = reply.body.len();
+            let headers: Vec<Value> = reply
+                .headers
+                .into_iter()
+                .map(|(k, v)| serde_json::json!([k, v]))
+                .collect();
+            let mut out = serde_json::json!({
+                "status": reply.status,
+                "headers": headers,
+                "bytes": bytes,
+            });
+            // Text bleibt Text; nur was kein UTF-8 ist, wird base64 — die häufige JSON-Antwort
+            // kostet so nichts.
+            match String::from_utf8(reply.body) {
+                Ok(text) => out["body"] = Value::String(text),
+                Err(e) => {
+                    use base64::Engine as _;
+                    out["body_base64"] = Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(e.into_bytes()),
+                    );
+                }
+            }
+            Ok(out)
+        }
+        Err(HttpFail::Cancelled) => Err(Refused::error("host_http: abgebrochen")),
+        Err(fail) => Err(Refused::error(broker.redact(&format!("host_http: {fail}")))),
+    }
+}
+
+/// Die URL für die Audit-Spur: ohne Schema und Query (dort stehen oft Tokens), gekappt.
+fn audit_url(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let mut out: String = rest.chars().take(200).collect();
+    if rest.chars().count() > 200 {
+        out.push('…');
+    }
+    out
+}
+
+/// Hängt den Audit-Eintrag an `details` — der Schlüssel [`AUDIT_DETAIL_KEY`] gehört dem Host.
+fn attach_audit(details: &mut Value, entry: Value) {
+    if let Value::Object(map) = details {
+        map.insert(AUDIT_DETAIL_KEY.to_string(), entry);
+        return;
+    }
+    let previous = std::mem::take(details);
+    *details = if previous.is_null() {
+        serde_json::json!({ AUDIT_DETAIL_KEY: entry })
+    } else {
+        serde_json::json!({ "plugin": previous, AUDIT_DETAIL_KEY: entry })
+    };
+}
+
+/// Der WASM-Host (hält die `wasmi`-Engine, Fuel-Metering aktiv) und den HTTP-Worker, den alle
+/// seine Plugins teilen.
 pub struct WasmHost {
     engine: Engine,
+    http: Arc<HttpProxy>,
 }
 
 impl Default for WasmHost {
@@ -630,6 +936,7 @@ impl WasmHost {
         config.consume_fuel(true);
         WasmHost {
             engine: Engine::new(&config),
+            http: Arc::new(HttpProxy::new()),
         }
     }
 
@@ -638,6 +945,19 @@ impl WasmHost {
     /// Auch dieser Lade-Pfad läuft unter Budget: ein Plugin, das schon in der Start-Sektion
     /// oder in `sepp_spec` endlos rechnet, kann den Sepp-Start nicht aufhängen.
     pub fn load(&self, wasm: &[u8], policy: Policy, limits: Limits) -> Result<WasmPlugin> {
+        self.load_named(wasm, policy, limits, None)
+    }
+
+    /// Wie [`Self::load`], mit dem Abschnittsnamen aus `[plugin.<name>]` (Manifest-Name oder
+    /// Dateistamm). Ohne Angabe gilt der Werkzeugname aus `sepp_spec` — der kann durch
+    /// `rename` später ein Kollisionspräfix bekommen, der Abschnittsname nicht.
+    fn load_named(
+        &self,
+        wasm: &[u8],
+        policy: Policy,
+        limits: Limits,
+        section: Option<&str>,
+    ) -> Result<WasmPlugin> {
         let module = Module::new(&self.engine, wasm)
             .map_err(|e| SeppError::Tool(format!("wasm compile: {e}")))?;
         // Alle vier Exports schon hier prüfen, ohne Store und ohne Instanziierung. Vorher fehlten
@@ -646,7 +966,21 @@ impl WasmHost {
         // untragbar: kaputt muss beim Laden sichtbar sein.
         check_exports(&module)?;
 
-        let mut store = Store::new(&self.engine, host_state(&limits, policy.clone()));
+        // Beim Laden gibt es keinen Abbruchkanal → hartes Wanduhr-Budget, „unbegrenzt" zählt
+        // hier nicht. Es gilt auch für `host_http` aus der Start-Sektion.
+        let mut load_limits = limits.clone();
+        load_limits.max_wall_time_ms = match load_limits.max_wall_time_ms {
+            0 => LOAD_WALL_MS,
+            ms => ms.min(LOAD_WALL_MS),
+        };
+        let never = CancellationToken::new();
+        let ctx = HostCtx {
+            plugin: section.unwrap_or("plugin"),
+            cancel: never.clone(),
+            deadline: deadline_from(load_limits.max_wall_time_ms),
+            http: self.http.clone(),
+        };
+        let mut store = Store::new(&self.engine, host_state(&limits, policy.clone(), ctx));
         store.limiter(|state| &mut state.limits);
         let linker = build_linker(&self.engine, &policy)?;
         store
@@ -662,14 +996,6 @@ impl WasmHost {
             .get_typed_func::<(), i64>(&store, "sepp_spec")
             .map_err(|e| SeppError::Tool(format!("wasm: sepp_spec fehlt: {e}")))?;
 
-        // Beim Laden gibt es keinen Abbruchkanal → hartes Wanduhr-Budget, „unbegrenzt" zählt
-        // hier nicht.
-        let mut load_limits = limits.clone();
-        load_limits.max_wall_time_ms = match load_limits.max_wall_time_ms {
-            0 => LOAD_WALL_MS,
-            ms => ms.min(LOAD_WALL_MS),
-        };
-        let never = CancellationToken::new();
         let mut budget = FuelBudget::new(&load_limits, &never);
         let packed = budget.call(&mut store, &spec_fn, (), "sepp_spec")?;
         let (ptr, len) = unpack(packed);
@@ -689,11 +1015,16 @@ impl WasmHost {
             )));
         }
 
+        let name = section.unwrap_or(&spec.name).to_string();
         Ok(WasmPlugin {
-            engine: self.engine.clone(),
-            module,
-            policy,
-            limits,
+            core: Arc::new(PluginCore {
+                engine: self.engine.clone(),
+                module,
+                policy,
+                limits,
+                name,
+                http: self.http.clone(),
+            }),
             spec,
             notes: Vec::new(),
         })
@@ -713,7 +1044,8 @@ impl WasmHost {
             Some(p) => Some(Manifest::from_file(p)?),
             None => None,
         };
-        self.load_with_manifest(wasm_path, manifest, grant)
+        let name = plugin_name(wasm_path, manifest.as_ref());
+        self.load_with_manifest(wasm_path, manifest, grant, &name)
     }
 
     /// Wie [`Self::load_file_with_grant`], aber mit bereits geparstem Manifest — damit
@@ -724,6 +1056,7 @@ impl WasmHost {
         wasm_path: &Path,
         manifest: Option<Manifest>,
         grant: Option<&Policy>,
+        name: &str,
     ) -> Result<WasmPlugin> {
         let wasm = std::fs::read(wasm_path)
             .map_err(|e| SeppError::Tool(format!("wasm read {}: {e}", wasm_path.display())))?;
@@ -753,7 +1086,7 @@ impl WasmHost {
             Some(g) => g.intersect(&requested),
             None => Policy::default(),
         };
-        let mut plugin = self.load(&wasm, policy, limits)?;
+        let mut plugin = self.load_named(&wasm, policy, limits, Some(name))?;
         plugin.notes = notes;
         Ok(plugin)
     }
@@ -789,11 +1122,6 @@ impl WasmHost {
             } else {
                 None
             };
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("plugin")
-                .to_string();
             // Ein unlesbares Manifest wird NICHT auf den Dateistamm zurückgefallen: Dann wäre
             // auch `abi` unbekannt und würde stillschweigend als 1 gelesen — genau das, was
             // „kaputt muss beim Laden sichtbar sein" abgeschafft hat. Einmal parsen, und bei
@@ -813,12 +1141,9 @@ impl WasmHost {
                 .as_ref()
                 .map(|m| m.policy())
                 .unwrap_or_else(Policy::default);
-            let name = manifest
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| stem.clone());
+            let name = plugin_name(&path, manifest.as_ref());
             let grant = grant_for(&name);
-            match self.load_with_manifest(&path, manifest, grant.as_ref()) {
+            match self.load_with_manifest(&path, manifest, grant.as_ref(), &name) {
                 Ok(mut p) => {
                     for n in p.take_notes() {
                         notes.push(format!("WASM-Plugin {}: {n}", path.display()));
@@ -837,6 +1162,18 @@ impl WasmHost {
         }
         (out, notes)
     }
+}
+
+/// Der Name, unter dem Sepp Guard das Plugin führt (`[plugin.<name>]`): aus dem Manifest, sonst
+/// der Dateistamm. Dieselbe Regel für Discovery, Ladeweg und die Hinweise in `host_http`.
+fn plugin_name(wasm_path: &Path, manifest: Option<&Manifest>) -> String {
+    manifest.map(|m| m.name.clone()).unwrap_or_else(|| {
+        wasm_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin")
+            .to_string()
+    })
 }
 
 /// Erklärt, warum ein Modul an einem Import gescheitert ist.
@@ -867,12 +1204,21 @@ fn import_hint(e: &SeppError, name: &str, grant: Option<&Policy>, requested: &Po
     }
 }
 
-/// Ein geladenes WASM-Plugin, exponiert als [`Tool`].
-pub struct WasmPlugin {
+/// Alles, was ein Werkzeugaufruf braucht — unveränderlich, per `Arc` geteilt, damit `execute`
+/// nichts Großes klonen muss, um in den Blocking-Pool zu wechseln.
+struct PluginCore {
     engine: Engine,
     module: Module,
     policy: Policy,
     limits: Limits,
+    /// Abschnittsname `[plugin.<name>]` (nicht der exponierte Werkzeugname).
+    name: String,
+    http: Arc<HttpProxy>,
+}
+
+/// Ein geladenes WASM-Plugin, exponiert als [`Tool`].
+pub struct WasmPlugin {
+    core: Arc<PluginCore>,
     spec: ToolSpec,
     /// Hinweise aus dem Ladevorgang, die das Frontend zeigen soll (etwa unbekannte
     /// Manifest-Felder). Kein Fehler, aber auch nichts, das still bleiben darf.
@@ -887,28 +1233,32 @@ impl WasmPlugin {
 
     /// Effektive Policy des Plugins (Manifest-Anfrage, ggf. mit Gewährung geschnitten).
     pub fn policy(&self) -> &Policy {
-        &self.policy
+        &self.core.policy
     }
 
     /// Überschreibt den exponierten Tool-Namen (für Kollisions-Präfixe im gemeinsamen Toolset).
+    /// Der Abschnittsname für Sepp Guard bleibt davon unberührt.
     pub fn rename(&mut self, name: String) {
         self.spec.label = name.clone();
         self.spec.name = name;
     }
+}
 
-    /// Synchroner Plugin-Lauf unter [`FuelBudget`]. Assoziierte Funktion (kein `&self`), damit
-    /// `execute` sie per `spawn_blocking` in den Blocking-Pool auslagern kann (der Reactor
-    /// bleibt frei). Das `cancel`-Token wird an jedem Yield-Punkt geprüft — ein rechnendes
-    /// Plugin bricht binnen einer Fuel-Scheibe ab.
-    fn run(
-        engine: &Engine,
-        module: &Module,
-        policy: &Policy,
-        limits: &Limits,
-        input: &Value,
-        cancel: &CancellationToken,
-    ) -> Result<ToolResult> {
-        let mut store = Store::new(engine, host_state(limits, policy.clone()));
+impl PluginCore {
+    /// Synchroner Plugin-Lauf unter [`FuelBudget`]; `execute` lagert ihn per `spawn_blocking`
+    /// in den Blocking-Pool aus (der Reactor bleibt frei). Das `cancel`-Token wird an jedem
+    /// Yield-Punkt geprüft — ein rechnendes Plugin bricht binnen einer Fuel-Scheibe ab; eine
+    /// Host-Funktion, die gerade wartet (`host_http`), bekommt es direkt.
+    fn run(&self, input: &Value, cancel: &CancellationToken, tool: &str) -> Result<ToolResult> {
+        let (engine, module, policy, limits) =
+            (&self.engine, &self.module, &self.policy, &self.limits);
+        let ctx = HostCtx {
+            plugin: &self.name,
+            cancel: cancel.clone(),
+            deadline: deadline_from(limits.max_wall_time_ms),
+            http: self.http.clone(),
+        };
+        let mut store = Store::new(engine, host_state(limits, policy.clone(), ctx));
         store.limiter(|state| &mut state.limits);
         let linker = build_linker(engine, policy)?;
         let mut budget = FuelBudget::new(limits, cancel);
@@ -937,10 +1287,29 @@ impl WasmPlugin {
             .map_err(|e| SeppError::Tool(format!("wasm write input: {e}")))?;
 
         let packed = budget.call(&mut store, &call, (ptr, len), "sepp_call")?;
+        // Ein Abbruch, der während einer Host-Funktion kam, ist erst hier sichtbar — Fuel prüft
+        // nur an Yield-Punkten, und `host_http` liefert dann nur ein Fehler-Ergebnis ans Modul.
+        if cancel.is_cancelled() {
+            return Err(SeppError::Aborted);
+        }
         let (rptr, rlen) = unpack(packed);
         let out = read_mem(&memory, &store, rptr, rlen)?;
         let mut result: ToolResult = serde_json::from_slice(&out)
             .map_err(|e| SeppError::Tool(format!("wasm result-json: {e}")))?;
+        // Die Audit-Spur der Anfragen dieses Aufrufs — ein Eintrag je Werkzeugaufruf, weil der
+        // Agent genau ein Objekt unter `details["audit"]` erwartet.
+        let state = store.data_mut();
+        let requests = std::mem::take(&mut state.http_audit);
+        if !requests.is_empty() {
+            let entry = serde_json::json!({
+                "kind": HTTP_AUDIT_KIND,
+                "plugin": self.name,
+                "tool": tool,
+                "requests": requests,
+                "denied": state.http_denied,
+            });
+            attach_audit(&mut result.details, entry);
+        }
         // Tool-Output IMMER kürzen, bevor er ins Kontextfenster geht (Plugin kürzt nicht selbst).
         result.content = sepp_tools::truncate_content_blocks(result.content);
         Ok(result)
@@ -965,15 +1334,11 @@ impl Tool for WasmPlugin {
         // wasmi ist synchron → in den Blocking-Pool auslagern, damit der (Single-Thread-)Reactor
         // frei bleibt und parallele Tool-Calls nebenläufig laufen. Das Token wandert mit hinein:
         // der Refuel-Loop prüft es an jedem Yield-Punkt (Mid-Call-Abbruch via Fuel).
-        let engine = self.engine.clone();
-        let module = self.module.clone();
-        let policy = self.policy.clone();
-        let limits = self.limits.clone();
-        tokio::task::spawn_blocking(move || {
-            WasmPlugin::run(&engine, &module, &policy, &limits, &input, &cancel)
-        })
-        .await
-        .map_err(|e| SeppError::Tool(format!("wasm task: {e}")))?
+        let core = self.core.clone();
+        let tool = self.spec.name.clone();
+        tokio::task::spawn_blocking(move || core.run(&input, &cancel, &tool))
+            .await
+            .map_err(|e| SeppError::Tool(format!("wasm task: {e}")))?
     }
 }
 
@@ -1951,6 +2316,435 @@ mod tests {
             .await
             .expect("ein fehlender Pfad darf das Plugin nicht abstürzen lassen");
         assert!(res.details["error"].is_string(), "{}", res.details);
+    }
+
+    // ── host_http ──────────────────────────────────────────────────────────────────────────
+
+    /// Plugin, das `host_http` mit `request` aufruft, das Ergebnis abholt und als `details`
+    /// zurückgibt — dieselbe Form wie `fs_reader_wat`, nur der Import ist ein anderer.
+    fn http_wat(request: &str) -> Vec<u8> {
+        let spec =
+            r#"{"name":"netcall","label":"Net","description":"x","parameters":{"type":"object"}}"#;
+        let prefix = r#"{"content":[{"type":"text","text":"ok"}],"details":"#;
+        let suffix = r#"}"#;
+        let wat = format!(
+            r#"(module
+  (import "env" "host_http" (func $http (param i32 i32) (result i32)))
+  (import "env" "host_result_read" (func $read (param i32 i32) (result i32)))
+  (memory (export "memory") 4)
+  (data (i32.const 8) "{spec}")
+  (data (i32.const 2048) "{req}")
+  (data (i32.const 3072) "{prefix}")
+  (data (i32.const 3584) "{suffix}")
+  (global $bump (mut i32) (i32.const 4096))
+  (func (export "sepp_alloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {speclen})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64)
+    (local $n i32) (local $got i32) (local $out i32) (local $cur i32)
+    (local.set $n (call $http (i32.const 2048) (i32.const {reqlen})))
+    (local.set $got (call $read (i32.const 65536) (local.get $n)))
+    (local.set $out (i32.const 131072))
+    (memory.copy (local.get $out) (i32.const 3072) (i32.const {plen}))
+    (local.set $cur (i32.add (local.get $out) (i32.const {plen})))
+    (memory.copy (local.get $cur) (i32.const 65536) (local.get $got))
+    (local.set $cur (i32.add (local.get $cur) (local.get $got)))
+    (memory.copy (local.get $cur) (i32.const 3584) (i32.const {slen}))
+    (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+            (i64.extend_i32_u (i32.add (i32.add (i32.const {plen}) (local.get $got))
+                                       (i32.const {slen})))))
+)"#,
+            spec = esc(spec),
+            speclen = spec.len(),
+            req = esc(request),
+            reqlen = request.len(),
+            prefix = esc(prefix),
+            plen = prefix.len(),
+            suffix = esc(suffix),
+            slen = suffix.len(),
+        );
+        wat::parse_str(&wat).expect("http wat")
+    }
+
+    /// Ein Listener auf 127.0.0.1, der genau eine Verbindung annimmt, den Request-Kopf in
+    /// `seen` ablegt und `response` antwortet. Läuft als Tokio-Task: `execute` blockiert im
+    /// Blocking-Pool, der Test-Reactor bleibt frei, den Listener zu bedienen.
+    async fn spy(response: &'static [u8]) -> (String, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    sink.lock().await.extend_from_slice(&buf[..n]);
+                }
+                let _ = sock.write_all(response).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn net(host: &str) -> Policy {
+        Policy::new(vec![Capability::Net { host: host.into() }])
+    }
+
+    fn http_limits() -> Limits {
+        Limits {
+            max_wall_time_ms: 10_000,
+            http_timeout_ms: 2_000,
+            ..Limits::default()
+        }
+    }
+
+    async fn call_http(plugin: &WasmPlugin) -> ToolResult {
+        plugin
+            .execute(serde_json::json!({}), CancellationToken::new(), None)
+            .await
+            .expect("Aufruf liefert ein Ergebnis")
+    }
+
+    #[tokio::test]
+    async fn host_http_reaches_an_allowed_host_and_returns_status_and_body() {
+        let (base, seen) =
+            spy(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Antwort: ja\r\n\r\nhallo").await;
+        let req = format!(r#"{{"method":"GET","url":"{base}/x?y=1"}}"#);
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        assert!(!res.is_error, "{res:?}");
+        assert_eq!(res.details["status"], 200);
+        assert_eq!(res.details["body"], "hallo");
+        assert_eq!(res.details["bytes"], 5);
+        assert!(res.details.get("body_base64").is_none());
+        let headers = res.details["headers"].as_array().unwrap();
+        assert!(headers.iter().any(|h| h[0] == "x-antwort" && h[1] == "ja"));
+
+        let wire = String::from_utf8_lossy(&seen.lock().await).to_lowercase();
+        assert!(wire.starts_with("get /x?y=1 http/1.1"), "{wire}");
+        assert!(wire.contains("user-agent: sepp/"), "{wire}");
+
+        // Die Audit-Spur: ein Eintrag mit genau dieser Anfrage.
+        let audit = &res.details["audit"];
+        assert_eq!(audit["kind"], HTTP_AUDIT_KIND);
+        assert_eq!(audit["plugin"], "netcall");
+        assert_eq!(audit["denied"], 0);
+        let r = &audit["requests"][0];
+        assert_eq!(r["method"], "GET");
+        assert_eq!(r["host"], "127.0.0.1");
+        assert_eq!(r["status"], 200);
+        assert_eq!(r["bytes_in"], 5);
+        assert!(r["ms"].is_number());
+        // Die Query bleibt draußen — dort stehen oft Tokens.
+        assert!(!r["url"].as_str().unwrap().contains("y=1"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_ungranted_host_is_refused_before_any_connect() {
+        let (base, seen) = spy(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let req = format!(r#"{{"method":"GET","url":"{base}/x"}}"#);
+        // Netzrecht für einen anderen Host → Linker-Gate offen, Allowlist zu.
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("example.com"), http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        let err = res.details["error"].as_str().unwrap();
+        assert!(
+            err.contains("sepp policy allow plugin.netcall net 127.0.0.1"),
+            "{err}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().await.is_empty(),
+            "es ging etwas auf die Leitung"
+        );
+        assert_eq!(res.details["audit"]["denied"], 1);
+        assert_eq!(res.details["audit"]["requests"][0]["denied"], true);
+    }
+
+    #[tokio::test]
+    async fn a_secret_header_reaches_the_wire_only_with_both_gates() {
+        std::env::set_var("SEPP_TEST_HTTP_TOKEN_A", "sk-sehr-geheim");
+        let (base, seen) = spy(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let req = format!(
+            r#"{{"method":"POST","url":"{base}/x","headers":[["Authorization","Bearer $SEPP_TEST_HTTP_TOKEN_A"]],"body":"{{}}"}}"#
+        );
+        let policy = Policy::new(vec![
+            Capability::Net {
+                host: "127.0.0.1".into(),
+            },
+            Capability::Env {
+                name: "SEPP_TEST_HTTP_TOKEN_A".into(),
+            },
+        ]);
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), policy, http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        assert_eq!(res.details["status"], 200, "{res:?}");
+        let wire = String::from_utf8_lossy(&seen.lock().await).to_string();
+        assert!(
+            wire.contains("authorization: Bearer sk-sehr-geheim"),
+            "{wire}"
+        );
+        assert!(wire.contains("content-length: 2"), "{wire}");
+        // Die Spur nennt den Namen, nie den Wert.
+        assert_eq!(
+            res.details["audit"]["requests"][0]["secrets"],
+            serde_json::json!(["SEPP_TEST_HTTP_TOKEN_A"])
+        );
+        assert!(!res.details.to_string().contains("sk-sehr-geheim"));
+    }
+
+    #[tokio::test]
+    async fn without_an_env_grant_nothing_is_sent_and_the_value_leaks_nowhere() {
+        std::env::set_var("SEPP_TEST_HTTP_TOKEN_B", "sk-noch-geheimer");
+        let (base, seen) = spy(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let req = format!(
+            r#"{{"method":"GET","url":"{base}/x","headers":[["Authorization","Bearer $SEPP_TEST_HTTP_TOKEN_B"]]}}"#
+        );
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        let err = res.details["error"].as_str().unwrap();
+        assert!(
+            err.contains("sepp policy allow plugin.netcall env SEPP_TEST_HTTP_TOKEN_B"),
+            "{err}"
+        );
+        assert!(!res.details.to_string().contains("sk-noch-geheimer"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().await.is_empty(),
+            "es ging etwas auf die Leitung"
+        );
+        assert_eq!(res.details["audit"]["denied"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_302_is_handed_to_the_plugin_not_followed() {
+        let (base, _seen) = spy(
+            b"HTTP/1.1 302 Found\r\nLocation: http://evil.example/\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let req = format!(r#"{{"method":"GET","url":"{base}/x"}}"#);
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        assert_eq!(res.details["status"], 302, "{res:?}");
+        let headers = res.details["headers"].as_array().unwrap();
+        assert!(headers
+            .iter()
+            .any(|h| h[0] == "location" && h[1] == "http://evil.example/"));
+    }
+
+    #[tokio::test]
+    async fn a_binary_body_arrives_as_base64() {
+        let (base, _seen) = spy(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n\x00\xff\xfe").await;
+        let req = format!(r#"{{"method":"GET","url":"{base}/bin"}}"#);
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), http_limits())
+            .unwrap();
+        let res = call_http(&plugin).await;
+        assert_eq!(res.details["body_base64"], "AP/+", "{res:?}");
+        assert!(res.details.get("body").is_none());
+        assert_eq!(res.details["bytes"], 3);
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_refused() {
+        let (base, _seen) =
+            spy(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n0123456789012345678901234567890123456789")
+                .await;
+        let req = format!(r#"{{"method":"GET","url":"{base}/big"}}"#);
+        let limits = Limits {
+            max_http_response_bytes: 16,
+            ..http_limits()
+        };
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), limits)
+            .unwrap();
+        let res = call_http(&plugin).await;
+        let err = res.details["error"].as_str().unwrap();
+        assert!(err.contains("max_http_response_bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_hits_the_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _keep = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let req = format!(r#"{{"method":"GET","url":"http://{addr}/still"}}"#);
+        let limits = Limits {
+            http_timeout_ms: 200,
+            ..http_limits()
+        };
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), limits)
+            .unwrap();
+        let started = Instant::now();
+        let res = call_http(&plugin).await;
+        let err = res.details["error"].as_str().unwrap();
+        assert!(err.contains("200 ms"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_a_hanging_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _keep = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let req = format!(r#"{{"method":"GET","url":"http://{addr}/still"}}"#);
+        let plugin = WasmHost::new()
+            .load(&http_wat(&req), net("127.0.0.1"), http_limits())
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let res = plugin.execute(serde_json::json!({}), cancel, None).await;
+        assert!(matches!(res, Err(SeppError::Aborted)), "{res:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Die Regelkette ohne Modul: ein `HostState` von Hand, `http_request` direkt.
+    fn state_for(policy: Policy, limits: Limits, deadline: Option<Instant>) -> HostState {
+        host_state(
+            &limits,
+            policy,
+            HostCtx {
+                plugin: "netcall",
+                cancel: CancellationToken::new(),
+                deadline,
+                http: Arc::new(HttpProxy::new()),
+            },
+        )
+    }
+
+    #[test]
+    fn placeholders_in_the_url_and_foreign_schemes_are_refused() {
+        let mut st = state_for(net("*"), http_limits(), None);
+        let e = http_request(
+            &mut st,
+            br#"{"method":"GET","url":"https://api.example/$TOKEN"}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("Platzhalter"), "{e}");
+        let e =
+            http_request(&mut st, br#"{"method":"GET","url":"ftp://api.example/x"}"#).unwrap_err();
+        assert!(e.contains("http(s)"), "{e}");
+        let e = http_request(&mut st, b"kein json").unwrap_err();
+        assert!(e.contains("ungültige Anfrage"), "{e}");
+        // Drei Versuche, drei Audit-Objekte — keiner davon eine Rechte-Verweigerung.
+        assert_eq!(st.http_audit.len(), 3);
+        assert_eq!(st.http_denied, 0);
+        assert!(st.http_audit.iter().all(|a| a["error"].is_string()));
+    }
+
+    #[test]
+    fn the_request_counter_caps_calls_per_invocation() {
+        let limits = Limits {
+            max_http_requests: 1,
+            ..http_limits()
+        };
+        let mut st = state_for(net("example.com"), limits, None);
+        // Der erste Versuch scheitert erst an der Allowlist (nicht gewährter Host) …
+        let e = http_request(
+            &mut st,
+            br#"{"method":"GET","url":"https://evil.example/"}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("nicht gewährt"), "{e}");
+        // … der zweite schon am Zähler.
+        let e = http_request(
+            &mut st,
+            br#"{"method":"GET","url":"https://evil.example/"}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("max_http_requests"), "{e}");
+        assert_eq!(st.http_audit.len(), 2);
+        assert_eq!(st.http_denied, 1);
+    }
+
+    #[test]
+    fn an_exhausted_deadline_refuses_before_connecting() {
+        let past = Instant::now() - Duration::from_millis(1);
+        let mut st = state_for(net("127.0.0.1"), http_limits(), Some(past));
+        let e =
+            http_request(&mut st, br#"{"method":"GET","url":"http://127.0.0.1:9/x"}"#).unwrap_err();
+        assert!(e.contains("Zeitbudget"), "{e}");
+    }
+
+    #[test]
+    fn transport_errors_are_redacted() {
+        // Der Secret-Wert steht künstlich im Pfad, damit reqwest ihn in seinen Fehlertext
+        // schreibt (Port 9: dort hört niemand). Die Meldung ans Modul darf ihn nicht zeigen.
+        std::env::set_var("SEPP_TEST_HTTP_TOKEN_C", "wert-im-pfad");
+        let policy = Policy::new(vec![
+            Capability::Net {
+                host: "127.0.0.1".into(),
+            },
+            Capability::Env {
+                name: "SEPP_TEST_HTTP_TOKEN_C".into(),
+            },
+        ]);
+        let mut st = state_for(policy, http_limits(), None);
+        let req = br#"{"method":"GET","url":"http://127.0.0.1:9/wert-im-pfad","headers":[["X-Auth","$SEPP_TEST_HTTP_TOKEN_C"]]}"#;
+        let e = http_request(&mut st, req).unwrap_err();
+        assert!(e.starts_with("host_http: Verbindung:"), "{e}");
+        assert!(!e.contains("wert-im-pfad"), "{e}");
+        assert!(e.contains("[REDACTED]"), "{e}");
+    }
+
+    #[test]
+    fn attach_audit_owns_the_key_and_keeps_foreign_details() {
+        let entry = serde_json::json!({ "kind": "plugin_http" });
+        let mut null = Value::Null;
+        attach_audit(&mut null, entry.clone());
+        assert_eq!(null["audit"]["kind"], "plugin_http");
+
+        let mut obj = serde_json::json!({ "words": 3, "audit": "vom Plugin" });
+        attach_audit(&mut obj, entry.clone());
+        assert_eq!(obj["words"], 3);
+        assert_eq!(obj["audit"]["kind"], "plugin_http", "der Host gewinnt");
+
+        let mut other = serde_json::json!([1, 2]);
+        attach_audit(&mut other, entry);
+        assert_eq!(other["plugin"], serde_json::json!([1, 2]));
+        assert_eq!(other["audit"]["kind"], "plugin_http");
+    }
+
+    #[test]
+    fn response_cap_matches_the_host_cap() {
+        assert_eq!(
+            sepp_policy::MAX_HTTP_RESPONSE_BYTES,
+            MAX_PLUGIN_BYTES as u64
+        );
     }
 
     /// Baut das Beispiel-Plugin aus `examples/textstat-plugin` und führt es aus.

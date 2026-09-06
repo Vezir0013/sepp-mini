@@ -26,8 +26,8 @@ interface host {
     /// Höchstens 16 MiB. Gate: fs_read | fs_write (Schreiben schließt Lesen ein).
     fs-read: func(path: string) -> result<list<u8>, string>;
 
-    /// PROVISORISCH — Stufe 3 setzt es um. Heute liefert der Host immer
-    /// err("host_http ist in dieser Version noch nicht implementiert"); das Gate steht schon.
+    /// Header-Werte dürfen Platzhalter `$NAME` tragen; der Host setzt sie ein, das Modul sieht
+    /// den Wert nie. In der URL sind Platzhalter verboten (sie stünde in jeder Fehlermeldung).
     record http-request {
         method: string,
         url: string,
@@ -39,9 +39,15 @@ interface host {
         headers: list<tuple<string, string>>,
         body: list<u8>,
     }
-    /// Eine HTTP-Anfrage über den Host. sepp ist der Netzwerkstack des Moduls: Host-Allowlist
-    /// exakt, Secrets werden erst an der Grenze eingesetzt, jeder Request landet in der
-    /// Audit-Spur. Gate: net.
+    /// Eine HTTP-Anfrage über den Host — sepp ist der Netzwerkstack des Moduls. Je Anfrage:
+    /// der Host der URL muss gewährt sein (Allowlist exakt, `*.suffix` oder `*`); je `$NAME`
+    /// in einem Header-Wert gilt das Doppel-Gate (Host gewährt UND Variable per `env`
+    /// gewährt UND gesetzt), sonst geht kein Byte auf die Leitung; keine automatischen
+    /// Redirects (ein 3xx geht als Antwort ans Modul, das selbst neu anfragen darf — jeder Hop
+    /// läuft durch die Allowlist); Deckel aus `[limits]`: max_http_requests je Werkzeugaufruf,
+    /// max_http_response_bytes (vor dem Puffern geprüft), http_timeout_ms je Anfrage (auf die
+    /// Rest-Wanduhr gekappt). Jeder Versuch, auch ein abgelehnter, landet in der Audit-Spur —
+    /// mit den Namen ersetzter Secrets, nie mit Werten. Gate: net.
     http: func(request: http-request) -> result<http-response, string>;
 }
 
@@ -55,6 +61,8 @@ interface tool {
     /// Argument-JSON hinein, ToolResult-JSON hinaus: {"content":[…],"details"?,"is_error"?}.
     /// Trappt nie: Ungültige Argumente und Fehler sind ein Ergebnis mit is_error = true.
     /// Der Host kürzt `content` selbst (50 KiB / 2000 Zeilen), das Modul muss es nicht.
+    /// Der Schlüssel `audit` in `details` gehört dem Host (Audit-Spur der http-Anfragen dieses
+    /// Aufrufs) und wird überschrieben, falls das Modul ihn setzt.
     call: func(arguments: string) -> string;
 }
 
@@ -85,11 +93,19 @@ world plugin {
 //                  -> i32 legt JSON {"bytes","text","lossy"} bzw. {"error"} ab (Text
 //                  verlustbehaftet, from_utf8_lossy); Rückgabe = Länge des JSON.
 //   host.http    → env.host_http(ptr, len) -> i32                  Gate: net
-//                  Eingabe: Request-JSON {"method","url","headers":[["k","v"],…],"body"?}.
-//                  Legt Response-JSON {"status","headers","body"} oder {"error":"…"} ab;
-//                  Rückgabe = Länge des JSON. OFFEN (Stufe 3): Kodierung binärer Bodies —
-//                  heute UTF-8-String; Kandidaten sind ein base64-Feld oder eine rohe Variante
-//                  analog host_fs_read_bytes. Beides additiv lösbar.
+//                  Eingabe: Request-JSON {"method","url","headers":[["k","v"],…],
+//                  "body"?|"body_base64"?} — genau eines von beiden, Text bzw. Base64 (Standard,
+//                  mit Padding). Legt Response-JSON {"status","headers":[["k","v"],…],
+//                  "body"|"body_base64","bytes"} ab — `body` als Text, wenn die Antwort gültiges
+//                  UTF-8 ist, sonst `body_base64`; `bytes` ist die rohe Länge — oder
+//                  {"error":"…"} (Text beginnt mit `host_http:`, Secret-Werte sind redigiert).
+//                  Rückgabe = Länge des JSON. Header-Namen der Antwort sind kleingeschrieben.
+//                  Audit-Eintrag je Werkzeugaufruf: details.audit = {"kind":"plugin_http",
+//                  "plugin","tool","requests":[{method,host,url,status|error,bytes_in,ms,
+//                  secrets:[NAME…],denied?}],"denied":N}.
+//                  Getragene Grenzen: Die Allowlist prüft Namen, nicht Adressen (kein Schutz
+//                  vor DNS-Rebinding); http:// mit Secret-Header wird nicht verhindert;
+//                  Proxy-Variablen der Umgebung (HTTPS_PROXY) gelten.
 //
 //   Abholweg     → env.host_result_read(ptr, cap) -> i32           Gate: immer
 //                  Kopiert min(len, cap) Bytes des zuletzt abgelegten Ergebnisses in den
