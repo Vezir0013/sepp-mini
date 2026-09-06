@@ -46,7 +46,9 @@ interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in ander
   dedizierte Connector für **z.ai/Zhipu-GLM** und **Moonshot AI/Kimi** (`--provider moonshot`,
   Kimi K3 mit 1M-Kontext), lokale Endpunkte (Ollama/vLLM) über `OPENAI_BASE_URL`, plus
   **`--provider mlx`** für lokale Apple-Silicon-Inferenz via **LM Studio** (verbindet automatisch
-  zu `localhost:1234`).
+  zu `localhost:1234`). Ein überlasteter Anbieter (`429`, `503`, `529`) kostet keinen Turn: bis zu
+  drei Versuche mit wachsender Wartezeit, `Retry-After` wird beachtet, und der Grund erscheint
+  sichtbar statt nur im Log.
 - 🖥️ **Drei Modi, ein Kern:** interaktive **TUI**, **One-shot** (`-p`) und **JSONL-RPC** (`--rpc`).
 - 🌳 **Robuste Sessions:** baumstrukturiert mit Branching und Compaction, persistent als JSONL
   (Default) oder optional **SQLite** (`--features sqlite`).

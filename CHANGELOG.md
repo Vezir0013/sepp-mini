@@ -7,6 +7,44 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Behoben
+- **Ein überlasteter Anbieter kostete einen ganzen Turn.** Jeder Nicht-2xx brach den Prompt sofort
+  ab — ein `429` (Ratenlimit) oder ein `529` („overloaded", bei Anthropic unter Last regelmäßig)
+  beendete die Arbeit mit einer Fehlermeldung, und der Mensch musste von Hand erneut senden. Jetzt
+  wird bei `429`, `408` und `5xx` bis zu dreimal versucht: 1 s, dann 2 s mit Zufallsanteil, wobei
+  ein `Retry-After` des Servers Vorrang hat und auf 30 s gedeckelt wird — länger stillzustehen ist
+  von einem Hänger nicht zu unterscheiden. Wiederholt wird ausschließlich, solange **kein Byte des
+  Streams geflossen ist**; ein Abbruch mitten im Stream würde sonst Text verdoppeln. Ein
+  Transportfehler (Verbindung abgelehnt, DNS) wird nicht wiederholt: Dort ist die Adresse falsch
+  oder der Dienst aus. Und der Wiederanlauf ist **sichtbar** — in der TUI in der Statuszeile, im
+  One-shot auf stderr, im RPC als `notice`-Zeile —, damit die Verzögerung erklärt ist statt
+  rätselhaft.
+- **Ctrl+C wirkte nicht, bevor das erste Byte da war.** Der Abbruch wurde erst im laufenden Stream
+  beachtet; `send()` und das Lesen des Fehler-Bodys waren blind dafür. Bei einem toten Endpunkt
+  (falsche `OPENAI_BASE_URL`, LM Studio nicht gestartet) hing sepp am OS-Timeout, das Minuten
+  dauern kann. Jetzt ist der Verbindungsaufbau auf 10 s begrenzt und jede Wartephase abbrechbar,
+  auch der Backoff. Ein **Lese**-Timeout gibt es bewusst nicht: Reasoning-Modelle schweigen vor
+  dem ersten Token teils minutenlang, und ein Deckel darauf würde genau die langen, teuren
+  Antworten abschneiden.
+- **Der Fehler-Body eines Anbieters war ungedeckelt.** Eine Megabyte-Antwort auf einen abgelehnten
+  Request wanderte vollständig in die Fehlermeldung und damit ins Terminal und ins Kontextfenster.
+  Jetzt sind es höchstens 64 KiB; das Meldungsformat bleibt unverändert.
+- **Ein Abbruch während der Compaction galt als Erfolg.** `summarize()` prüfte den
+  `CancellationToken` nicht und lieferte die bis dahin gesammelte, abgeschnittene Zusammenfassung
+  zurück — die dann echte Nachrichten ersetzt hätte. Jetzt meldet sich der Abbruch als solcher.
+
+### Geändert
+- **RPC kennt ein weiteres Ereignis:** `{"type":"notice","text":…}` meldet einen Wiederanlauf.
+  Additiv wie alle bisherigen Erweiterungen — ein Client, der es nicht kennt, ignoriert die Zeile.
+  Die Stream-Invariante lautet jetzt `Notice* MessageStart … Usage? MessageStop`.
+
+### Tests
+- Sieben Fälle gegen lokale `TcpListener` (Wiederanlauf mit Hinweis vor `MessageStart`, dreimal
+  `503`, `401` ohne zweiten Versuch, Abbruch im Backoff und beim Warten auf die Antwort,
+  gedeckelter Fehler-Body, der geteilte OpenAI-Pfad) plus acht reine Funktionen für Backoff,
+  `Retry-After` (Sekunden und HTTP-Datum) und die Wahl der Statuscodes. Die Test-Server senden
+  `Retry-After: 0`, damit kein Test echte Sekunden verbringt.
+
 ## [0.5.2] - 2026-09-06
 
 Acht Befunde eines Reviews, ein gemeinsamer Nenner: Der Host hielt eine Zusage nur meistens. Der
