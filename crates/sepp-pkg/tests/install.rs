@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sepp_pkg::{
-    apply_install, check_collisions, check_rights, consent_lines, list, pack_dir, plan_install,
-    remove, resolve_rights, resolve_vars, trust_publisher, Installed, PkgArchive, Roots,
-    SigningKey, TrustStatus,
+    apply_install, check_collisions, check_rights, check_trust, consent_lines, list, pack_dir,
+    plan_install, remove, resolve_rights, resolve_vars, trust_publisher, untrust_publisher,
+    Installed, PkgArchive, Roots, SigningKey, TrustStatus,
 };
 use sepp_policy::{NetGrant, PolicyFile, ResolveCtx};
 
@@ -436,4 +436,61 @@ fn missing_vars_without_default_are_reported_and_a_tampered_package_is_refused()
     let res = PkgArchive::open(&bad).and_then(|a| plan_install(&fx.roots, &a).map(|_| ()));
     assert!(res.is_err());
     assert!(!fx.roots.package_dir("demo").exists());
+}
+
+#[test]
+fn untrust_removes_key_names_installed_and_trust_starts_over() {
+    let fx = fixture();
+    let (key, _) = SigningKey::generate().unwrap();
+    let pkg = pack(&fx, "demo", "1.0.0", RIGHTS, &key);
+    let archive = PkgArchive::open(&pkg).unwrap();
+    let mut plan = plan_install(&fx.roots, &archive).unwrap();
+    trust_publisher(&fx.roots, &plan.manifest().publisher, "test").unwrap();
+    let vals = resolve_vars(plan.manifest(), &vars("~/belege"), None)
+        .unwrap()
+        .values;
+    let rights = resolve_rights(plan.manifest(), &vals, &fx.ctx).unwrap();
+    plan.source = Some("registry:test".into());
+    apply_install(&fx.roots, &archive, &plan, &vals, &rights).unwrap();
+
+    // Der Nachweis kennt die Quelle.
+    let receipt = Installed::load(&fx.roots).unwrap();
+    assert_eq!(
+        receipt.packages["demo"].source.as_deref(),
+        Some("registry:test")
+    );
+
+    let key_path = fx.roots.trusted_keys_dir().join("acme.json");
+    assert!(key_path.exists());
+    let u = untrust_publisher(&fx.roots, "acme").unwrap();
+    assert_eq!(u.name, "acme");
+    assert_eq!(u.fingerprint, key.fingerprint());
+    assert_eq!(u.path, key_path);
+    assert_eq!(u.installed, vec!["demo".to_string()]);
+    assert!(!key_path.exists(), "Schlüsseldatei weg");
+    // Das Paket bleibt, das Vertrauen beginnt von vorn.
+    assert!(fx.roots.package_dir("demo").is_dir());
+    assert!(matches!(
+        check_trust(&fx.roots, &plan.manifest().publisher).unwrap(),
+        TrustStatus::New { .. }
+    ));
+    let e = untrust_publisher(&fx.roots, "acme")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("kein Schlüssel"), "{e}");
+    assert!(untrust_publisher(&fx.roots, "Acme").is_err());
+
+    // Ein Upgrade ohne eigene Quelle übernimmt die alte.
+    trust_publisher(&fx.roots, &plan.manifest().publisher, "test").unwrap();
+    let v2 = pack(&fx, "demo", "1.1.0", RIGHTS, &key);
+    let a2 = PkgArchive::open(&v2).unwrap();
+    let p2 = plan_install(&fx.roots, &a2).unwrap();
+    assert_eq!(p2.source, None);
+    let rights2 = resolve_rights(p2.manifest(), &vals, &fx.ctx).unwrap();
+    apply_install(&fx.roots, &a2, &p2, &vals, &rights2).unwrap();
+    let receipt = Installed::load(&fx.roots).unwrap();
+    assert_eq!(
+        receipt.packages["demo"].source.as_deref(),
+        Some("registry:test")
+    );
 }

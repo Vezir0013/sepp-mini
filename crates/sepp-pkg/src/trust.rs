@@ -80,16 +80,14 @@ pub fn check_trust(roots: &Roots, publisher: &Publisher) -> Result<TrustStatus> 
 }
 
 /// Speichert den Schlüssel eines Herausgebers (Verzeichnis 0700, Datei 0600). Überschreibt
-/// nie einen anderen Schlüssel — dafür muss der Nutzer die Datei selbst entfernen.
+/// nie einen anderen Schlüssel — dafür gibt es [`untrust_publisher`] (`sepp pkg untrust`).
 pub fn trust_publisher(roots: &Roots, publisher: &Publisher, via: &str) -> Result<TrustedKey> {
     if let Some(existing) = stored_key(roots, &publisher.name)? {
         if existing.key.trim() != publisher.key.trim() {
             return Err(SeppError::Config(format!(
                 "pkg: Herausgeber {} ist mit einem anderen Schlüssel bekannt ({}) — zum \
-                 Zurücknehmen {} löschen",
-                publisher.name,
-                existing.fingerprint,
-                key_file(roots, &publisher.name).display()
+                 Zurücknehmen `sepp pkg untrust {}`",
+                publisher.name, existing.fingerprint, publisher.name
             )));
         }
         return Ok(existing);
@@ -111,6 +109,44 @@ pub fn trust_publisher(roots: &Roots, publisher: &Publisher, via: &str) -> Resul
         Some(0o600),
     )?;
     Ok(entry)
+}
+
+/// Ergebnis von [`untrust_publisher`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Untrusted {
+    pub name: String,
+    pub fingerprint: String,
+    /// Die gelöschte Datei.
+    pub path: PathBuf,
+    /// Installierte Pakete dieses Herausgebers — sie bleiben, nur genannt.
+    pub installed: Vec<String>,
+}
+
+/// Nimmt das Vertrauen in einen Herausgeber zurück: löscht `trusted-keys/<name>.json`. Seine
+/// installierten Pakete bleiben unangetastet; beim nächsten Paket dieses Namens wird der
+/// Fingerprint wieder bestätigt.
+pub fn untrust_publisher(roots: &Roots, name: &str) -> Result<Untrusted> {
+    crate::validate_name(name)?;
+    let Some(stored) = stored_key(roots, name)? else {
+        return Err(SeppError::Config(format!(
+            "pkg: für Herausgeber {name} ist kein Schlüssel gespeichert"
+        )));
+    };
+    let installed: Vec<String> = crate::install::Installed::load(roots)?
+        .packages
+        .iter()
+        .filter(|(_, e)| e.publisher == name)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let path = key_file(roots, name);
+    std::fs::remove_file(&path)
+        .map_err(|e| SeppError::Config(format!("pkg: {}: {e}", path.display())))?;
+    Ok(Untrusted {
+        name: name.to_string(),
+        fingerprint: stored.fingerprint,
+        path,
+        installed,
+    })
 }
 
 /// Alle gespeicherten Herausgeber (für `sepp pkg list`).

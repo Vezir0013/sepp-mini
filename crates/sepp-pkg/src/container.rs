@@ -300,7 +300,7 @@ fn check_plugin_pairs(dir: &Path, manifest: &PkgManifest) -> Result<()> {
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut f =
         File::open(path).map_err(|e| SeppError::Config(format!("pkg: {}: {e}", path.display())))?;
     let mut h = Hasher::new();

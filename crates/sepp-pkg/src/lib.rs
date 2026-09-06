@@ -29,6 +29,11 @@
 //! `[rights]` gegen das Plugin-Manifest → Zustimmung → Kollisionen → Entpacken mit Hash je Datei
 //! (keine Datei ohne Eintrag, kein Eintrag ohne Datei, keine Symlinks, keine `..`).
 //!
+//! **Registry** ([`registry`]): `sepp pkg install <name>` holt ein Paket aus einem signierten
+//! Index (`index.toml` + `index.sig`, Schlüssel des Betreibers gepinnt in `settings.toml`
+//! `[[registries]]`). Ein Index nennt Pakete, er gewährt nichts — Herausgeber-TOFU und
+//! Zustimmung bleiben beim Paket. Netz gibt es nur über [`registry::Fetcher`], den das CLI stellt.
+//!
 //! Die Krypto kommt aus `ring` (liegt über `rustls` ohnehin im Baum): SHA-256, Ed25519,
 //! `SystemRandom`. Dieses Crate macht Datei-I/O, aber kein Netz und kein async.
 
@@ -36,6 +41,7 @@ pub mod container;
 pub mod crypto;
 pub mod install;
 pub mod manifest;
+pub mod registry;
 pub mod trust;
 pub mod vars;
 
@@ -47,7 +53,15 @@ pub use install::{
     Listed, RemoveReport, Roots,
 };
 pub use manifest::{Inventory, PkgManifest, Publisher, VarKind, VarSpec};
-pub use trust::{check_trust, trust_publisher, trusted_publishers, TrustStatus, TrustedKey};
+pub use registry::{
+    build_index, check_url_scheme, download_package, fetch_index, join_url, load_registries,
+    parse_registries, parse_spec, verify_index, Fetcher, Index, IndexBuild, IndexEntry, PkgSpec,
+    RegistryConfig,
+};
+pub use trust::{
+    check_trust, trust_publisher, trusted_publishers, untrust_publisher, TrustStatus, TrustedKey,
+    Untrusted,
+};
 pub use vars::{resolve_rights, resolve_vars, substitute, value_notes, Resolved};
 
 use sepp_core::{Result, SeppError};
@@ -123,6 +137,14 @@ pub fn validate_rel_path(path: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Der Text eines Fehlers ohne die Präfixe `config error: ` und `pkg: ` — zum Einbetten in eine
+/// Meldung, die selbst wieder ein `SeppError::Config` wird.
+pub(crate) fn plain(e: &SeppError) -> String {
+    let s = e.to_string();
+    let s = s.strip_prefix("config error: ").unwrap_or(&s);
+    s.strip_prefix("pkg: ").unwrap_or(s).to_string()
 }
 
 /// Kleines Hex ohne Extra-Crate — Hashes bleiben mit `sha256sum` vergleichbar.

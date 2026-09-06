@@ -59,6 +59,18 @@ impl Roots {
     pub fn key_files(&self) -> KeyFiles {
         KeyFiles::in_dir(&self.state_pkg_dir())
     }
+    /// Das Schlüsselpaar eines Registry-Betreibers (`registry.key`/`.pub`), getrennt vom
+    /// Herausgeber-Schlüssel.
+    pub fn registry_key_files(&self) -> KeyFiles {
+        KeyFiles::registry_in_dir(&self.state_pkg_dir())
+    }
+    /// `<state>/pkg/.downloads` — aus einer Registry geladene Pakete, nur für die Dauer der
+    /// Installation (0700). Mit Punkt-Präfix: Liegen `config` und `state` auf derselben Wurzel
+    /// (`~/.sepp`), ist das `<config>/pkg/`, und [`package_dirs_in`] darf das Verzeichnis nie
+    /// für ein Paket halten.
+    pub fn downloads_dir(&self) -> PathBuf {
+        self.state_pkg_dir().join(".downloads")
+    }
     /// `<state>/trusted-keys` — ein JSON je Herausgeber (0700/0600).
     pub fn trusted_keys_dir(&self) -> PathBuf {
         self.state.join("trusted-keys")
@@ -118,6 +130,12 @@ pub struct InstalledEntry {
     pub plugins: Vec<String>,
     #[serde(default)]
     pub hooks: Vec<String>,
+    /// Woher das Paket kam: `datei` oder `registry:<name>` — informativ.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Felder, die ein neueres `sepp` geschrieben hat: werden mitgeführt, nicht verworfen.
+    #[serde(default, flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl Installed {
@@ -153,6 +171,9 @@ pub struct InstallPlan {
     /// Die Plugin-Manifeste aus dem Archiv, je Stamm — die Selbstauskunft, gegen die
     /// `[rights]` geprüft wird.
     pub plugin_manifests: BTreeMap<String, Manifest>,
+    /// Woher das Paket kommt (`datei`, `registry:<name>`); setzt der Aufrufer vor
+    /// [`apply_install`], landet im Nachweis. `None` übernimmt beim Upgrade den alten Wert.
+    pub source: Option<String>,
 }
 
 impl InstallPlan {
@@ -212,6 +233,7 @@ pub fn plan_install(roots: &Roots, archive: &PkgArchive) -> Result<InstallPlan> 
         previous,
         trust,
         plugin_manifests,
+        source: None,
     })
 }
 
@@ -592,6 +614,11 @@ pub fn apply_install(
             files: report.files,
             plugins: plan.inventory.plugins.clone(),
             hooks: plan.inventory.hooks.clone(),
+            source: plan
+                .source
+                .clone()
+                .or_else(|| plan.previous.as_ref().and_then(|p| p.source.clone())),
+            unknown: BTreeMap::new(),
         },
     );
     installed.save(roots)?;
@@ -718,10 +745,22 @@ mod tests {
                 files: 3,
                 plugins: vec!["z".into()],
                 hooks: vec![],
+                source: Some("registry:test".into()),
+                unknown: BTreeMap::new(),
             },
         );
         i.save(&roots).unwrap();
         assert_eq!(Installed::load(&roots).unwrap(), i);
+        // Ein Nachweis ohne `source` (0.4.0) lädt; ein fremdes Feld überlebt `save`.
+        let old = r#"{"format":1,"packages":{"alt":{"version":"0.1.0","installed_at":1,"publisher":"acme","publisher_fp":"ab","zukunft":{"x":1}}}}"#;
+        std::fs::write(roots.installed_path(), old).unwrap();
+        let loaded = Installed::load(&roots).unwrap();
+        let alt = &loaded.packages["alt"];
+        assert_eq!(alt.source, None);
+        assert_eq!(alt.unknown["zukunft"]["x"], 1);
+        loaded.save(&roots).unwrap();
+        let text = std::fs::read_to_string(roots.installed_path()).unwrap();
+        assert!(text.contains("zukunft"), "{text}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

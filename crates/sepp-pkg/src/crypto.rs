@@ -148,6 +148,14 @@ impl KeyFiles {
             public: dir.join("publisher.pub"),
         }
     }
+
+    /// Das Schlüsselpaar eines Registry-Betreibers in `dir` (`registry.key`/`registry.pub`).
+    pub fn registry_in_dir(dir: &Path) -> Self {
+        KeyFiles {
+            secret: dir.join("registry.key"),
+            public: dir.join("registry.pub"),
+        }
+    }
 }
 
 /// Erzeugt ein neues Schlüsselpaar und schreibt es — nie über ein vorhandenes hinweg.
