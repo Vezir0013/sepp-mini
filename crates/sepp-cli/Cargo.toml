@@ -46,3 +46,5 @@ crossterm = { version = "=0.28.1", features = ["event-stream"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Prüft, dass die von `sepp plugin new` erzeugte Cargo.toml gültiges TOML ist.
+toml = "=0.8.23"

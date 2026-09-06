@@ -8,6 +8,7 @@
 //! Oberfläche zerstören).
 
 mod audit_cmd;
+mod plugin_cmd;
 mod policy_cmd;
 mod session;
 mod tui;
@@ -60,6 +61,8 @@ enum Cmd {
     Policy(policy_cmd::PolicyCmd),
     /// Die Spur einer Sitzung lesbar ausgeben (Prompts, Tools, Guard, Sub-Agenten).
     Audit(audit_cmd::AuditArgs),
+    /// `sepp plugin new <name>` — Gerüst für ein WASM-Plugin mit dem SDK `sepp-plugin`.
+    Plugin(plugin_cmd::PluginCmd),
     Run(RunOpts),
 }
 
@@ -102,6 +105,8 @@ fn main() -> ExitCode {
         Ok(Cmd::Policy(cmd)) => policy_cmd::run_policy(cmd),
         // Lesen einer Session ist reines fs+serde — kein Tokio-Runtime, kein Provider, kein Guard.
         Ok(Cmd::Audit(a)) => audit_cmd::run_audit(a),
+        // Ein Gerüst schreiben ist reines fs — ebenfalls ohne Runtime.
+        Ok(Cmd::Plugin(c)) => plugin_cmd::run_plugin(c),
         Ok(Cmd::Run(opts)) => run(opts),
         Err(e) => {
             eprintln!("Fehler: {e}\n");
@@ -143,6 +148,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         }
         Some("audit") => {
             return audit_cmd::parse_audit_args(&args[1..]).map(Cmd::Audit);
+        }
+        Some("plugin") => {
+            return plugin_cmd::parse_plugin_args(&args[1..]).map(Cmd::Plugin);
         }
         _ => {}
     }
@@ -321,6 +329,8 @@ fn print_help() {
          \x20                           (mit --global in die globale policy.toml)\n\
          \x20 sepp audit [id]           Spur einer Sitzung: Prompts, Tools, Guard-Entscheidungen,\n\
          \x20                           Sub-Agenten (ohne id: jüngste; --json, --no-children)\n\
+         \x20 sepp plugin new <name>    Gerüst für ein WASM-Plugin mit dem SDK sepp-plugin anlegen\n\
+         \x20                           (--dir <pfad>; --sdk-path <pfad> statt Git-Tag)\n\
          \x20 sepp uninstall [--purge]  Binary entfernen (mit --purge auch config+state-Root + projektlokale .sepp)\n\n\
          Optionen:\n\
          \x20 -p, --print <text>        One-shot-Prompt (sonst startet die TUI)\n\
@@ -1770,6 +1780,20 @@ mod tests {
         // Nicht erstes Token → Prompt, damit `sepp -p "audit die Logs"` weiter funktioniert.
         let cmd = parse(&args(&["-p", "audit"])).unwrap();
         assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "audit"));
+    }
+
+    #[test]
+    fn parse_plugin_subcommand_only_first_arg() {
+        assert!(matches!(
+            parse(&args(&["plugin", "new", "demo"])).unwrap(),
+            Cmd::Plugin(plugin_cmd::PluginCmd::New { name, dir: None, sdk_path: None }) if name == "demo"
+        ));
+        assert!(parse(&args(&["plugin"])).is_err());
+        assert!(parse(&args(&["plugin", "new"])).is_err());
+        assert!(parse(&args(&["plugin", "remove", "demo"])).is_err());
+        // Nicht erstes Token → Prompt, damit `sepp -p "plugin …"` weiter funktioniert.
+        let cmd = parse(&args(&["-p", "plugin"])).unwrap();
+        assert!(matches!(cmd, Cmd::Run(RunOpts { prompt: Some(p), .. }) if p == "plugin"));
     }
 
     #[test]
