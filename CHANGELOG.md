@@ -98,15 +98,6 @@ Nutzers gehören dem Nutzer (Pakete leben unter `pkg/`), Content in `config_root
   festen Host-Pfaden — auf macOS liegt `TMPDIR` unter `/var` → `/private/var` und `/home` ist
   ein Symlink, was den macOS-Lauf der CI rot gemacht hatte.
 
-### Geplant
-- Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern
-  nur Ports; für WASM-Plugins gilt der Filter seit `host_http` exakt)
-- Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
-- Registry und `sepp pkg install <name>` gegen einen signierten Index; `sepp pkg untrust`
-- OpenTelemetry-Export (optional aktivierbar)
-- OAuth-Login für Subscription-Provider
-- Google-Provider-Adapter
-
 ## [0.3.0] - 2026-09-06
 
 Der Autor eines Plugins schreibt eine Funktion, kein Protokoll. Das Beispiel-Plugin hatte 163

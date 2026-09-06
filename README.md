@@ -26,12 +26,6 @@ deklarieren — vom Kern auf OS-Ebene erzwungen.</strong></p>
 eingebauten Tools (`read`/`write`/`edit`/`bash`) und vier Erweiterungs-Tiers aus — als
 interaktive TUI, als One-shot-Kommando oder als JSONL-RPC zum Einbetten in andere Programme.
 
-> **Status:** v0.1 — funktional vollständig und getestet. Kernschleife, TUI, persistente
-> Baum-Sessions, Erweiterbarkeit (Resources/Hooks/MCP/WASM), **Sepp Guard** (Sandbox und
-> Regelwerk auch für den Agenten selbst, mit Rückfrage-Dialog), native Sub-Agenten,
-> Multi-Provider und Distribution sind umgesetzt. Offen: OpenTelemetry-Export, OAuth-Login und
-> der Host-Filter fürs Netz (siehe [Roadmap](#roadmap)).
-
 ---
 
 ## Highlights
@@ -611,20 +605,6 @@ just run -- -p "hi" # CLI ausführen
 Konventionen: kleine grüne Schritte, Conventional Commits, exakt gepinnte Dependencies,
 keine `unwrap`/`expect`/`panic` in Library-Crates. Siehe [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 Reine Code-Arbeit braucht keinen API-Key (Live-LLM-Tests sind per Default geskippt).
-
-## Roadmap
-
-- [ ] OpenTelemetry-Export (`tracing`), optional aktivierbar
-- [ ] OAuth-Login für Subscription-Provider
-- [ ] Google-Provider-Adapter
-- [x] Sepp Guard Phase 3: Guard-Entscheidungen als eigene Session-Einträge, Sub-Agenten als Kind-Sessions, `sepp audit`
-- [ ] Egress-Proxy für `net`-Hostfilter (die TCP-Sperre ist da: Landlock ≥ 6.7 / Seatbelt) samt Secret-Broker
-- [x] Plugin-ABI Version 1 festgezurrt, `host_fs_read` und `host_fs_read_bytes` gebaut
-- [x] `host_http` für WASM-Plugins als durchsetzender Proxy: Host-Allowlist je Anfrage, Secret-Broker, Audit, keine Redirects
-- [ ] Cookie-Jar und Credential-Lebenszyklus (OAuth-Refresh) im Host für Plugin-Konnektoren
-- [x] Plugin-SDK `sepp-plugin`, das Speicher und Zeiger kapselt; Vertrag `wit/sepp.wit`; `sepp plugin new`
-- [x] Paketformat `.seppkg` (signiert, Rechte als Zustimmung) und `sepp pkg keygen | pack | install | list | remove`
-- [ ] Registry: `sepp pkg install <name>` gegen einen signierten Index
 
 ## Mitwirken
 
