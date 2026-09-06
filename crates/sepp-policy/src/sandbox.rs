@@ -149,6 +149,34 @@ pub struct SandboxCapabilities {
     pub detail: String,
 }
 
+/// Härtet den eigenen Prozess: kein Core-Dump, und `/proc/<pid>/environ`, `maps`, `mem`
+/// gehören root — ein Kindprozess derselben UID kann die Umgebung von sepp (die API-Keys) nicht
+/// mehr über procfs lesen. Ergänzt Landlocks Ptrace-Schranke für die Fälle ohne Sandbox
+/// (`--mode yolo`, Plattformen ohne Adapter). Wirkt nur auf sepp selbst: `execve` setzt das Flag
+/// für jedes Kind zurück, `ps`, Debugger und `/proc/self` der Kinder laufen wie zuvor. Auf
+/// anderen Plattformen ein No-op. Liefert `false`, wenn der Kernel den Aufruf verweigert — kein
+/// Grund abzubrechen, nur zu wissen.
+pub fn harden_process() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` nimmt nur Integer-Argumente und berührt keinen
+        // Speicher; die übrigen Argumente sind für diese Option unbenutzt und müssen 0 sein.
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_DUMPABLE,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) == 0
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 /// Fragt ab, was die Plattform durchsetzen kann — ohne den eigenen Prozess zu beschränken.
 ///
 /// Linux: Wegwerf-Rulesets mit `CompatLevel::HardRequirement`; `create()` legt nur einen
@@ -812,6 +840,25 @@ mod seatbelt_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    /// 0.5.1: sepp selbst ist nicht dumpbar — `/proc/<sepp>/environ` gehört danach root, ein
+    /// Kind derselben UID kommt ohne Sandbox nicht mehr an die API-Keys.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn harden_process_makes_the_process_non_dumpable() {
+        assert!(super::harden_process());
+        // SAFETY: reine Abfrage ohne Speicherzugriff.
+        let dumpable = unsafe {
+            libc::prctl(
+                libc::PR_GET_DUMPABLE,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        assert_eq!(dumpable, 0);
+    }
+
     use super::*;
     use std::process::Stdio;
 

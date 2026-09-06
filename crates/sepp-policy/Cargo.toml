@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.5"
+libc = { workspace = true }   # prctl(PR_SET_DUMPABLE) in `harden_process`
 
 [dev-dependencies]
 tokio = { workspace = true }

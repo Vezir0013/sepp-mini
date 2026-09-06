@@ -34,8 +34,8 @@ use serde::Deserialize;
 use sepp_core::{Result, SeppError};
 
 use crate::{
-    canonicalize_lenient, resolve_path_with, system_read_paths, Capability, DenyOverlap, DenyRule,
-    Policy, ResolveCtx, Sandbox,
+    canonicalize_lenient, resolve_path_with, system_policy_paths, Capability, DenyOverlap,
+    DenyRule, Policy, ResolveCtx, Sandbox,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -145,7 +145,8 @@ impl TryFrom<ExecGrantRaw> for ExecGrant {
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default)]
 pub struct Grants {
-    /// Lesepräfixe; `"system"` expandiert zu den Systempfaden ([`system_read_paths`]).
+    /// Lesepräfixe; `"system"` expandiert zu den Systempfaden ohne `/proc`
+    /// ([`system_policy_paths`]) — die Sandbox gibt Kindprozessen `/proc` selbst dazu.
     pub fs_read: Vec<String>,
     pub fs_write: Vec<String>,
     pub exec: ExecGrant,
@@ -180,7 +181,7 @@ impl Grants {
         let mut granted = Vec::new();
         for raw in &self.fs_read {
             if raw == "system" {
-                for s in system_read_paths() {
+                for s in system_policy_paths() {
                     granted.push(Capability::FsRead {
                         prefix: PathBuf::from(s),
                     });
@@ -548,7 +549,7 @@ impl PolicySet {
     fn push_grants(&mut self, actor: &Actor, g: &Grants, source: &Source, ctx: &ResolveCtx) {
         for raw in &g.fs_read {
             if raw == "system" {
-                for s in system_read_paths() {
+                for s in system_policy_paths() {
                     self.push_entry(
                         actor,
                         Capability::FsRead {
@@ -1596,17 +1597,83 @@ fs_read = ["./"]
             None,
             &ctx(),
         );
-        for s in system_read_paths() {
+        for s in system_policy_paths() {
             assert!(set.entries.iter().any(|e| e.raw == "system"
                 && e.cap
                     == Capability::FsRead {
                         prefix: PathBuf::from(s)
                     }));
         }
+        // `/proc` gehört nicht zur In-Process-Bedeutung von „system" (K1, 0.5.1).
+        assert!(!set.entries.iter().any(|e| e.cap
+            == Capability::FsRead {
+                prefix: PathBuf::from("/proc")
+            }));
         assert!(set.entries.iter().any(|e| e.cap
             == Capability::FsWrite {
                 prefix: "/tmp/t/out".into()
             }));
+    }
+
+    /// 0.5.1: `read /proc/self/environ` lieferte die API-Keys ins Modell, weil der eingebaute
+    /// Grant „system" `/proc` enthielt und der eigene Prozess seine Umgebung immer lesen darf.
+    /// Für Kindprozesse (Landlock + Ptrace-Schranke) war der Weg schon zu; hier geht es um den
+    /// In-Process-Pfad von read/write/edit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_is_not_readable_in_process_even_with_the_system_grant() {
+        let set = PolicySet::merge(
+            Vec::new(),
+            &BuiltinDefaults::default(),
+            Some(Mode::Auto),
+            &ctx(),
+        );
+        let g = Guard::new(set, Box::new(NullSandbox));
+        assert!(matches!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsRead(PathBuf::from("/proc/self/environ"))
+            ),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsRead(PathBuf::from("/proc/meminfo"))
+            ),
+            Decision::Deny { .. }
+        ));
+        // Die übrigen Systempfade bleiben lesbar …
+        assert!(matches!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsRead(PathBuf::from("/etc/hostname"))
+            ),
+            Decision::Allow
+        ));
+        // … und wer `/proc` wirklich will, gewährt den Pfad ausdrücklich.
+        let f = PolicyFile::parse("[agent]\nfs_read = [\"/proc/meminfo\"]").unwrap();
+        let set = PolicySet::merge(
+            vec![file("/p", f)],
+            &BuiltinDefaults::default(),
+            Some(Mode::Auto),
+            &ctx(),
+        );
+        let g = Guard::new(set, Box::new(NullSandbox));
+        assert!(matches!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsRead(PathBuf::from("/proc/meminfo"))
+            ),
+            Decision::Allow
+        ));
+        assert!(matches!(
+            g.decide(
+                &Actor::Agent,
+                &Action::FsRead(PathBuf::from("/proc/self/environ"))
+            ),
+            Decision::Deny { .. }
+        ));
     }
 
     #[test]

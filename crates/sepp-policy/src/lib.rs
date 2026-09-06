@@ -30,8 +30,8 @@ pub use guard::{
 #[cfg(target_os = "linux")]
 pub use sandbox::LandlockSandbox;
 pub use sandbox::{
-    default_sandbox, kernel_capabilities, probe_sandbox, resolve_program, NullSandbox, Sandbox,
-    SandboxCapabilities,
+    default_sandbox, harden_process, kernel_capabilities, probe_sandbox, resolve_program,
+    NullSandbox, Sandbox, SandboxCapabilities,
 };
 pub use secrets::{placeholder_names, GateRefusal, SecretBroker};
 
@@ -598,6 +598,22 @@ pub fn system_read_paths() -> &'static [&'static str] {
     {
         &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc"]
     }
+}
+
+/// Was das Schlüsselwort `"system"` einer Policy-Datei für die **In-Process-Prüfung** bedeutet
+/// (`read`/`write`/`edit`, `host_fs_read`): die Systempfade ohne `/proc`.
+///
+/// `/proc` steht in [`system_read_paths`], weil Kindprozesse es zum Starten brauchen (glibc
+/// liest `/proc/self/maps`, `ps`/`nproc` lesen darunter) — und dort schützt Landlocks
+/// Ptrace-Schranke die Umgebung des sepp-Prozesses vor der Sandbox. Im eigenen Prozess gibt es
+/// diese Schranke nicht: `read /proc/self/environ` lieferte bis 0.5.0 die API-Keys ins
+/// Kontextfenster und in die Session-Datei. Ein Werkzeug des Modells braucht `/proc` nie; wer es
+/// doch will, gewährt den Pfad ausdrücklich (`fs_read = ["/proc/meminfo"]`).
+pub fn system_policy_paths() -> impl Iterator<Item = &'static str> {
+    system_read_paths()
+        .iter()
+        .copied()
+        .filter(|p| *p != "/proc")
 }
 
 /// Löst `~` (Home), `$TMPDIR` und relative `./`-Pfade (gegen cwd) auf und kanonisiert best-effort.

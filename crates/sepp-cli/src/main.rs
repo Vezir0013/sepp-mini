@@ -95,6 +95,9 @@ struct RunOpts {
 }
 
 fn main() -> ExitCode {
+    // Vor allem anderen und für jeden Unterbefehl: Die Umgebung dieses Prozesses trägt die
+    // API-Keys — kein Kind derselben UID soll sie über /proc lesen, kein Core-Dump sie enthalten.
+    sepp_policy::harden_process();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args) {
         Ok(Cmd::Version) => {
