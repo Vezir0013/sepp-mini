@@ -1294,10 +1294,18 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
     let resources = ResourceSet::load(&session::resource_roots(trusted)?);
     let system = format!("{SYSTEM_PROMPT}{}", resources.system_prompt_addition());
 
-    // Tier 1: Hooks (Rhai) aus den Hook-Verzeichnissen.
+    // Tier 1: Hooks (Rhai) aus den Hook-Verzeichnissen. Beim Laden geprüfte Handler (falsche
+    // Parameterzahl, vertippter Name) melden sich hier — zur Laufzeit wären sie von „Handler
+    // nicht definiert" nicht zu unterscheiden und würden den Hook stumm abschalten.
     let hooks: Option<Box<dyn HookHost>> =
         match RhaiHookHost::from_dirs(&session::hook_dirs(trusted)?) {
-            Ok(h) if !h.is_empty() => Some(Box::new(h)),
+            Ok(h) if !h.is_empty() => {
+                for note in h.drain_notices() {
+                    startup_notice(note);
+                }
+                startup_notice(format!("Hooks: {} Skript(e) geladen", h.script_count()));
+                Some(Box::new(h))
+            }
             Ok(_) => None,
             Err(e) => anyhow::bail!("Hooks laden fehlgeschlagen: {e}"),
         };

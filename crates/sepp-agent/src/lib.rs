@@ -352,6 +352,19 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Holt die Meldungen der Hooks ab und reicht sie an die Oberfläche.
+    ///
+    /// Ein Skriptfehler und ein `notify` erreichen den Menschen nur über diesen Weg: `tracing`
+    /// ist in der TUI ohne Subscriber wirkungslos und im One-shot unterhalb des Default-Filters.
+    /// Dasselbe Muster wie die [`AuditSource`] des Guard — der Loop fragt, der Host antwortet.
+    fn drain_hook_notices(&self, on_event: &(dyn Fn(AgentEvent) + Send + Sync)) {
+        if let Some(h) = self.hooks.as_deref() {
+            for n in h.drain_notices() {
+                on_event(AgentEvent::Notice(n));
+            }
+        }
+    }
+
     /// Ein Zusammenfassungs-Roundtrip über `messages`; leer, wenn das Modell nichts liefert.
     async fn summarize(
         &self,
@@ -435,20 +448,27 @@ impl AgentSession {
             if self.hooks.is_some() {
                 let mut sp = std::mem::take(&mut self.state.system_prompt);
                 if let Some(h) = self.hooks.as_deref() {
-                    h.dispatch(HookEvent::BeforeAgentStart {
+                    // Ein kaputtes Skript hat den System-Prompt nicht verändert; gemeldet wird
+                    // es unten, die Arbeit läuft weiter.
+                    let _ = h.dispatch(HookEvent::BeforeAgentStart {
                         system_prompt: &mut sp,
-                    })?;
+                    });
                 }
                 self.state.system_prompt = sp;
+                self.drain_hook_notices(on_event);
             }
         }
 
         // input-Hook: Eingabe transformieren oder direkt behandeln (ohne LLM).
         let mut input_text = text.to_string();
         if let Some(h) = self.hooks.as_deref() {
-            if let HookOutcome::Handled = h.dispatch(HookEvent::Input {
-                text: &mut input_text,
-            })? {
+            let outcome = h
+                .dispatch(HookEvent::Input {
+                    text: &mut input_text,
+                })
+                .unwrap_or(HookOutcome::Continue);
+            self.drain_hook_notices(on_event);
+            if let HookOutcome::Handled = outcome {
                 let user_msg = Message::user_text(input_text);
                 self.record(EntryPayload::Message {
                     message: user_msg.clone(),
@@ -599,6 +619,7 @@ impl AgentSession {
                     message: &assistant,
                 });
             }
+            self.drain_hook_notices(on_event);
             self.record(EntryPayload::Message {
                 message: assistant.clone(),
             })?;
@@ -729,6 +750,9 @@ impl AgentSession {
                     }
                     Ok(_) => {}
                     Err(e) => {
+                        // Der Hook hätte `block` sagen können — deshalb läuft das Werkzeug
+                        // nicht. Der Grund steht im Meldungspuffer und geht unten mit raus.
+                        self.drain_hook_notices(on_event);
                         on_event(AgentEvent::ToolEnd {
                             id: call.id.clone(),
                             is_error: true,
@@ -737,6 +761,7 @@ impl AgentSession {
                         continue;
                     }
                 }
+                self.drain_hook_notices(on_event);
             }
 
             let tool = self.tools_by_name.get(&call.name).cloned();
@@ -768,6 +793,7 @@ impl AgentSession {
                     name: &calls[i].name,
                     result: tr,
                 });
+                self.drain_hook_notices(on_event);
             }
             let is_error = match &r {
                 Ok(tr) => tr.is_error,

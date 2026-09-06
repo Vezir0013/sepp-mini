@@ -40,6 +40,11 @@ use crate::session;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Was `/reload` über die Hooks erfährt: der neue Host, die Zahl seiner Skripte und die
+/// Hinweise aus der Ladeprüfung. Zahl und Hinweise müssen **vor** dem Boxen abgegriffen
+/// werden — hinter `dyn HookHost` sind sie nicht mehr erreichbar.
+type ReloadedHooks = (Option<Box<dyn HookHost>>, usize, Vec<String>);
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
     User,
@@ -947,25 +952,31 @@ impl App {
         // EINEM Skript würde sonst via set_hooks(None) alle Hooks — auch intakte Policy-Guards
         // — kommentarlos deaktivieren. Konsistent zum Startup (main.rs bailt hart), für die
         // laufende TUI abgeschwächt: Fehler melden, bestehende Hooks unangetastet lassen.
-        let hooks_res: std::result::Result<Option<Box<dyn HookHost>>, String> =
+        // Die Zahl und die Ladehinweise werden **vor** dem Boxen abgegriffen — hinter
+        // `dyn HookHost` ist `script_count()` nicht mehr erreichbar. Vorher stand hier eine
+        // feste `1`, die auch bei zehn Skripten „1 Hook-Quelle(n)" meldete.
+        let hooks_res: std::result::Result<ReloadedHooks, String> =
             match session::hook_dirs(trusted) {
                 Ok(dirs) => match RhaiHookHost::from_dirs(&dirs) {
-                    Ok(h) if h.is_empty() => Ok(None),
-                    Ok(h) => Ok(Some(Box::new(h) as Box<dyn HookHost>)),
+                    Ok(h) if h.is_empty() => Ok((None, 0, Vec::new())),
+                    Ok(h) => {
+                        let n = h.script_count();
+                        let notes = h.drain_notices();
+                        Ok((Some(Box::new(h) as Box<dyn HookHost>), n, notes))
+                    }
                     Err(e) => Err(e.to_string()),
                 },
                 Err(e) => Err(e.to_string()),
             };
-        let (nhooks, hook_err) = match &hooks_res {
-            Ok(Some(_)) => (1, None),
-            Ok(None) => (0, None),
-            Err(e) => (0, Some(e.clone())),
+        let (nhooks, hook_notes, hook_err) = match &hooks_res {
+            Ok((_, n, notes)) => (*n, notes.clone(), None),
+            Err(e) => (0, Vec::new(), Some(e.clone())),
         };
 
         {
             let mut g = self.session.lock().await;
             g.set_system_prompt(system);
-            if let Ok(hooks) = hooks_res {
+            if let Ok((hooks, ..)) = hooks_res {
                 g.set_hooks(hooks);
             }
         }
@@ -980,6 +991,11 @@ impl App {
                  Skills/Templates wurden aktualisiert"
             ));
             return None;
+        }
+        // Handler mit falscher Parameterzahl oder vertipptem Namen: sichtbar machen, sonst
+        // wäre der Hook nach dem Neuladen still wirkungslos.
+        for note in hook_notes {
+            self.notify(note);
         }
         let mut summary = format!(
             "neu geladen · {nskills} Skills · {} Templates · {} Hook-Quelle(n)",

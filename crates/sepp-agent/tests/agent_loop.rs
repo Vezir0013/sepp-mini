@@ -429,6 +429,57 @@ async fn tool_call_hook_blocks_execution_end_to_end() {
 }
 
 #[tokio::test]
+async fn a_broken_hook_reaches_the_screen_and_lets_the_turn_finish() {
+    // Bis 0.5.2 war das der stille Fall: `handled` nimmt kein Argument, Rhai meldete
+    // „Funktion nicht gefunden", der Host las das als „kein Handler" — der Hook schaltete sich
+    // ab, und niemand erfuhr davon.
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![text_turn("hallo")])),
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("tippfehler.rhai"),
+        r#"fn on_input(text) { handled("erledigt") }"#,
+    )
+    .unwrap();
+    let hooks = Box::new(sepp_hooks::RhaiHookHost::from_dirs(&[tmp.path().to_path_buf()]).unwrap());
+
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![])
+        .hooks(hooks)
+        .build()
+        .unwrap();
+
+    let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = notices.clone();
+    let on_event = move |ev: AgentEvent| {
+        if let AgentEvent::Notice(n) = ev {
+            sink.lock().unwrap().push(n);
+        }
+    };
+    session
+        .prompt("sag hallo", &on_event, CancellationToken::new())
+        .await
+        .expect("ein kaputter Hook hält die Arbeit nicht auf");
+
+    let seen = notices.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].contains("tippfehler.rhai"), "{}", seen[0]);
+    assert!(seen[0].contains("on_input"), "{}", seen[0]);
+
+    // Der Turn lief normal weiter — die Antwort des Modells steht im Verlauf.
+    let answered = session.state().messages.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, sepp_core::ContentBlock::Text { text } if text == "hallo"))
+    });
+    assert!(answered, "der Hook-Fehler darf den Turn nicht verschlucken");
+}
+
+#[tokio::test]
 async fn compact_after_branch_keeps_summary_on_active_path() {
     // Zwei Turns, dann eine Compaction-Zusammenfassung.
     let provider = Arc::new(FakeProvider {

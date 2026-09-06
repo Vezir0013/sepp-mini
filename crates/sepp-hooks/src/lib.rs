@@ -49,4 +49,16 @@ pub enum HookOutcome {
 /// Quergriff in den Agent-Loop an definierten Punkten.
 pub trait HookHost: Send + Sync {
     fn dispatch(&self, event: HookEvent<'_>) -> Result<HookOutcome>;
+
+    /// Meldungen, die seit dem letzten Abruf entstanden sind: Skriptfehler und `notify`.
+    ///
+    /// Der Loop fragt danach nach jedem Hook-Punkt und reicht sie als `AgentEvent::Notice` an
+    /// die Oberfläche — dasselbe Muster wie die `AuditSource` des Guard. Ohne diesen Weg
+    /// erreichte eine Hook-Meldung den Menschen nirgends: `tracing` ist in der TUI ohne
+    /// Subscriber wirkungslos und im One-shot unterhalb des Default-Filters `warn`.
+    ///
+    /// Default leer — ein Host ohne eigene Meldungen muss nichts tun.
+    fn drain_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
