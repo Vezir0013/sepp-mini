@@ -8,7 +8,7 @@ authors.workspace = true
 description = "Built-in Tools und Tool-Helfer (Truncation, File-Mutation-Queue) für sepp mini"
 
 [dependencies]
-sepp-core = { path = "../sepp-core" }
+sepp-core = { path = "../sepp-core", features = ["schema"] }
 sepp-policy = { path = "../sepp-policy" }
 
 serde = { workspace = true }

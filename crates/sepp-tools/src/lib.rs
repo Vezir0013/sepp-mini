@@ -49,17 +49,9 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolResult>;
 }
 
-/// Erzeugt ein bereinigtes JSON-Schema für einen Parameter-Typ (`$schema`/`title` entfernt,
-/// da Anbieter wie Anthropic ein schlankes `input_schema` erwarten).
-pub fn schema_for<T: schemars::JsonSchema>() -> Value {
-    let mut v = serde_json::to_value(schemars::schema_for!(T))
-        .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
-    if let Some(obj) = v.as_object_mut() {
-        obj.remove("$schema");
-        obj.remove("title");
-    }
-    v
-}
+// Das Parameter-Schema entsteht in `sepp-core` (Feature `schema`), damit die eingebauten Tools
+// und das Plugin-SDK dieselbe Bereinigung teilen. Der Pfad `sepp_tools::schema_for` bleibt.
+pub use sepp_core::schema_for;
 
 /// Die eingebauten Tools als gemeinsames Toolset — **ohne** Guard (wie `--mode yolo`).
 /// Produktiv [`builtin_tools_with`] mit dem Guard des Agenten verwenden.

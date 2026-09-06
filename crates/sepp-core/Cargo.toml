@@ -7,7 +7,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Kerntypen und reine Logik für sepp mini (kein I/O, kein tokio)"
 
+[features]
+# JSON-Schema-Erzeugung für Tool-Parameter (`schema_for`). Optional, damit der Kern ohne
+# schemars auskommt; sepp-tools und das Plugin-SDK schalten es ein.
+schema = ["dep:schemars"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+schemars = { workspace = true, optional = true }

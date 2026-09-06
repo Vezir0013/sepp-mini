@@ -84,6 +84,22 @@ pub fn sanitize_tool_name(name: &str) -> String {
     out
 }
 
+/// Erzeugt ein bereinigtes JSON-Schema für einen Parameter-Typ: `$schema` und `title` werden
+/// entfernt, weil Anbieter wie Anthropic ein schlankes `input_schema` erwarten.
+///
+/// Die eingebauten Tools (`sepp-tools`) und das Plugin-SDK (`sepp-plugin`) erzeugen ihr Schema
+/// hierüber — eine Stelle, damit beide Wege dasselbe Ergebnis liefern.
+#[cfg(feature = "schema")]
+pub fn schema_for<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut v = serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +123,26 @@ mod tests {
         ] {
             assert!(!is_valid_tool_name(n), "{n}");
         }
+    }
+
+    /// Doc-Kommentare an den Feldern werden zu `description`; `$schema` und `title` fehlen,
+    /// weil Anbieter ein schlankes `input_schema` erwarten.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn schema_for_is_a_bare_object_schema() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Params {
+            /// Der Pfad.
+            path: String,
+            limit: Option<usize>,
+        }
+        let v = schema_for::<Params>();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["required"], serde_json::json!(["path"]));
+        assert_eq!(v["properties"]["path"]["description"], "Der Pfad.");
+        assert!(v.get("$schema").is_none(), "{v}");
+        assert!(v.get("title").is_none(), "{v}");
     }
 
     #[test]
