@@ -7,6 +7,17 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-06
+
+Acht Befunde eines Reviews, ein gemeinsamer Nenner: Der Host hielt eine Zusage nur meistens. Der
+Nachweis in der Spur gehörte ihm nur dann, wenn zufällig eine HTTP-Anfrage lief. Die
+Verbrauchsgrenzen eines Plugins schrieb dessen Autor selbst — und traf damit ausgerechnet den
+einen Punkt, an dem Ctrl+C geprüft wird. Ein Abbruch mitten im Werkzeug ließ die Sitzung in einem
+Zustand zurück, den kein Anbieter mehr annimmt. Und `--purge` löschte ungefragt, was `SEPP_HOME`
+gerade bedeutete, nachdem es die Binary schon entfernt hatte. Nichts davon ändert ein Format:
+Manifeste, die in 0.5.1 luden, laden weiter; die Session-JSONL, das Paketformat und das Plugin-ABI
+bleiben, wie sie sind. Was sich ändert, ist, dass die Zusagen jetzt immer gelten.
+
 ### Behoben
 - **`sepp uninstall --purge` löschte ungefragt, was die Wurzeln gerade bedeuten.** `SEPP_HOME`
   **ist** die Wurzel, nicht ihr Elternverzeichnis: `SEPP_HOME=$HOME` (die Variable heißt nun mal
@@ -1391,7 +1402,8 @@ Erste öffentliche Version. Funktional vollständig und getestet.
 - MCP- und WASM-Tool-Ausgaben werden vor dem Kontextfenster getrunkt; WASM-Rückgaben und der
   SSE-Decoder sind gegen unbegrenztes Speicherwachstum abgesichert.
 
-[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vezir0013/sepp-mini/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Vezir0013/sepp-mini/compare/v0.3.0...v0.4.0
