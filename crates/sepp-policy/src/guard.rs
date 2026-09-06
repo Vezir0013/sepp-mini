@@ -1324,8 +1324,10 @@ fs_read  = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.sepp"]
 
     #[test]
     fn defaults_apply_without_files() {
+        // Kein realer Host-Pfad: Frontend-Verbote werden kanonisiert, und auf macOS ist `/etc`
+        // ein Symlink auf `/private/etc` — die Erwartung `/etc/sepp` schlüge dort fehl.
         let defaults = BuiltinDefaults {
-            extra_deny: vec![PathBuf::from("/etc/sepp")],
+            extra_deny: vec![PathBuf::from("/nirgends/sepp-state")],
             extra_deny_write: Vec::new(),
             default_mode: Mode::Auto,
         };
@@ -1347,7 +1349,7 @@ fs_read  = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.sepp"]
         let deny = set.deny_rules();
         assert!(deny.contains(&DenyRule::read("/home/u/.ssh")));
         assert!(deny.contains(&DenyRule::read("/home/u/.sepp")));
-        assert!(deny.contains(&DenyRule::read("/etc/sepp")));
+        assert!(deny.contains(&DenyRule::read("/nirgends/sepp-state")));
         assert!(set
             .entries
             .iter()
