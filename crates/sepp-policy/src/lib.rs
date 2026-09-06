@@ -473,6 +473,27 @@ pub struct Limits {
 /// WASM-Hosts (`MAX_PLUGIN_BYTES`, 16 MiB); ein Test in `sepp-wasm` hält beide gleich.
 pub const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Obergrenze für [`Limits::fuel_slice`]. Zwei Gründe, ein Wert.
+///
+/// Der Yield-Punkt ist die **einzige** Stelle, an der der WASM-Host Abbruch und Wanduhr prüft —
+/// er muss nah bleiben, sonst wirkt Ctrl+C erst nach einer ganzen Scheibe. Und der Ladeweg tankt
+/// `START_FUEL.max(fuel_slice)` in die **nicht resumierbare** Start-Sektion: Ohne Deckel bläht
+/// ein Manifest das feste Einmal-Budget des Hosts auf und hängt den Start unterbrechungsfrei
+/// auf, bevor überhaupt ein Abbruchkanal existiert. Der Wert entspricht deshalb `START_FUEL`;
+/// ein Test in `sepp-wasm` hält beide beieinander.
+pub const MAX_FUEL_SLICE: u64 = 10_000_000;
+
+/// Obergrenze für [`Limits::max_memory_pages`] (4096 Pages = 256 MiB). Eine Instanz entsteht je
+/// Werkzeugaufruf, und Aufrufe laufen parallel — der Deckel multipliziert sich mit der Größe des
+/// Batches. 256 MiB ist das Sechzehnfache dessen, was das ABI überhaupt bewegen kann
+/// ([`MAX_HTTP_RESPONSE_BYTES`], 16 MiB).
+pub const MAX_MEMORY_PAGES: u32 = 4_096;
+
+/// Obergrenze für [`Limits::max_http_requests`]. Jede Anfrage schreibt ein Objekt in den
+/// Audit-Eintrag des Aufrufs und damit in die Session-Datei; der Deckel begrenzt, wie viel ein
+/// Plugin je Aufruf in die Spur schreiben kann. Wer mehr braucht, verteilt es auf Aufrufe.
+pub const MAX_HTTP_REQUESTS: u32 = 1_024;
+
 impl Default for Limits {
     fn default() -> Self {
         Limits {
@@ -492,7 +513,63 @@ impl Limits {
         self.max_memory_pages as usize * 64 * 1024
     }
 
+    /// Kappt Werte über den Deckeln des Hosts und meldet jede Kappung im Klartext.
+    ///
+    /// Anders als [`Limits::validate`] wird hier **nicht abgelehnt**: `manifest.toml` ist ein
+    /// stabiles Format, und was in 0.5.1 geladen hat, muss weiter laden. Die Decken hier wurden
+    /// einem ausgelieferten Format nachgerüstet; sie dürfen kein Manifest ungültig machen.
+    /// Gekappt wird nur nach oben, alle drei Werte sind monoton — der Host gewährt nie mehr, als
+    /// der Autor fordert, aber auch nie mehr, als er selbst verantworten kann. Die untere
+    /// Plausibilität (`0` und Unsinn) bleibt Sache von [`Limits::validate`].
+    ///
+    /// `max_wall_time_ms = 0` (unbegrenzt) bleibt unangetastet: Es ist genau dann sicher, wenn
+    /// Yield-Punkte garantiert sind — und die garantiert erst der Deckel auf `fuel_slice`.
+    pub fn clamped_to_host(&self) -> (Limits, Vec<String>) {
+        let mut out = self.clone();
+        let mut notes = Vec::new();
+        let mut note = |feld: &str, ist: u64, deckel: u64| {
+            notes.push(format!(
+                "[limits] {feld} = {ist} liegt über dem Deckel des Hosts ({deckel}) und wurde gekappt"
+            ));
+        };
+        if out.fuel_slice > MAX_FUEL_SLICE {
+            note("fuel_slice", out.fuel_slice, MAX_FUEL_SLICE);
+            out.fuel_slice = MAX_FUEL_SLICE;
+        }
+        if out.max_memory_pages > MAX_MEMORY_PAGES {
+            note(
+                "max_memory_pages",
+                out.max_memory_pages as u64,
+                MAX_MEMORY_PAGES as u64,
+            );
+            out.max_memory_pages = MAX_MEMORY_PAGES;
+        }
+        if out.max_http_requests > MAX_HTTP_REQUESTS {
+            note(
+                "max_http_requests",
+                out.max_http_requests as u64,
+                MAX_HTTP_REQUESTS as u64,
+            );
+            out.max_http_requests = MAX_HTTP_REQUESTS;
+        }
+        // Auch hier, obwohl `validate` es ablehnt: `WasmHost::load` ist öffentlich und nimmt
+        // Limits, die nie durch ein Manifest gingen.
+        if out.max_http_response_bytes > MAX_HTTP_RESPONSE_BYTES {
+            note(
+                "max_http_response_bytes",
+                out.max_http_response_bytes,
+                MAX_HTTP_RESPONSE_BYTES,
+            );
+            out.max_http_response_bytes = MAX_HTTP_RESPONSE_BYTES;
+        }
+        (out, notes)
+    }
+
     /// Weist unplausible Werte zurück — lieber gar nicht laden als unkontrolliert laufen.
+    ///
+    /// Nur untere Grenzen und `max_http_response_bytes`: Dessen Decke kam zusammen mit dem Feld
+    /// ins Format, es kann also kein Manifest in freier Wildbahn geben, das sie verletzt. Die
+    /// später nachgerüsteten Decken ([`Limits::clamped_to_host`]) kappen stattdessen.
     pub fn validate(&self) -> Result<()> {
         if self.fuel_slice == 0 {
             return Err(SeppError::Config(
@@ -1172,6 +1249,81 @@ mod tests {
         assert_eq!(got, real_c.join("b"));
         // Existierender Pfad → echtes canonicalize.
         assert_eq!(canonicalize_lenient(&link), real_c);
+    }
+
+    #[test]
+    fn clamped_to_host_caps_only_what_exceeds_the_host_limits() {
+        let (out, notes) = Limits::default().clamped_to_host();
+        assert_eq!(out, Limits::default(), "Defaults bleiben, wie sie sind");
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let (out, notes) = Limits {
+            fuel_slice: 1_000_000_000_000,
+            max_memory_pages: 65_536,
+            max_http_requests: 100_000,
+            max_http_response_bytes: MAX_HTTP_RESPONSE_BYTES * 4,
+            max_wall_time_ms: 1234,
+            http_timeout_ms: 5678,
+        }
+        .clamped_to_host();
+        assert_eq!(out.fuel_slice, MAX_FUEL_SLICE);
+        assert_eq!(out.max_memory_pages, MAX_MEMORY_PAGES);
+        assert_eq!(out.max_http_requests, MAX_HTTP_REQUESTS);
+        assert_eq!(out.max_http_response_bytes, MAX_HTTP_RESPONSE_BYTES);
+        assert_eq!(out.max_wall_time_ms, 1234, "unberührt");
+        assert_eq!(out.http_timeout_ms, 5678, "unberührt");
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        for feld in [
+            "fuel_slice",
+            "max_memory_pages",
+            "max_http_requests",
+            "max_http_response_bytes",
+        ] {
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains(feld) && n.contains("gekappt")),
+                "keine Meldung für {feld}: {notes:?}"
+            );
+        }
+    }
+
+    /// Die Design-Entscheidung als Test: unbegrenzte Wanduhr bleibt erlaubt. Sicher wird sie
+    /// durch den Deckel auf `fuel_slice`, nicht durch ein Verbot.
+    #[test]
+    fn clamped_to_host_keeps_unlimited_wall_time() {
+        let (out, notes) = Limits {
+            max_wall_time_ms: 0,
+            ..Limits::default()
+        }
+        .clamped_to_host();
+        assert_eq!(out.max_wall_time_ms, 0);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// Sonst bekäme jedes Plugin mit Standardwerten eine Startmeldung.
+    #[test]
+    fn host_caps_are_at_least_the_defaults() {
+        let d = Limits::default();
+        assert!(MAX_FUEL_SLICE >= d.fuel_slice);
+        assert!(MAX_MEMORY_PAGES >= d.max_memory_pages);
+        assert!(MAX_HTTP_REQUESTS >= d.max_http_requests);
+        assert!(MAX_HTTP_RESPONSE_BYTES >= d.max_http_response_bytes);
+    }
+
+    /// Die Stabilitätszusage als Test: Ein Manifest über dem Host-Deckel bleibt gültig — es wird
+    /// gekappt, nicht abgelehnt.
+    #[test]
+    fn manifest_with_limits_above_the_host_cap_still_parses() {
+        let m = Manifest::parse(
+            "name = \"x\"\nversion = \"1\"\nkind = \"wasm\"\nentry = \"x.wasm\"\n\
+             [limits]\nfuel_slice = 1000000000000\nmax_memory_pages = 65536\n",
+        )
+        .expect("muss weiter laden");
+        assert_eq!(m.limits.fuel_slice, 1_000_000_000_000);
+        let (clamped, notes) = m.limits.clamped_to_host();
+        assert_eq!(clamped.fuel_slice, MAX_FUEL_SLICE);
+        assert_eq!(notes.len(), 2);
     }
 
     #[test]

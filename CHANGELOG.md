@@ -8,6 +8,26 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 ## [Unreleased]
 
 ### Behoben
+- **Ein Plugin bestimmte seine Verbrauchsgrenzen selbst.** `[limits]` im Manifest kam ungeprüft
+  beim Host an. Das trifft die einzige Stelle, an der der WASM-Host Abbruch und Wanduhr prüft:
+  den Yield-Punkt des Fuel-Slicings. Mit `fuel_slice = u64::MAX` gibt es ihn nie — Ctrl+C wirkte
+  nicht mehr, der Rechen-Thread lief weiter. Schlimmer noch im Ladeweg: Dort tankt der Host
+  `START_FUEL.max(fuel_slice)` in die **nicht resumierbare** Start-Sektion, ein Manifest konnte
+  also den Start unterbrechungsfrei aufhängen, bevor überhaupt ein Abbruchkanal existiert. Und
+  `max_memory_pages` durfte bis 65 536 (4 GiB) fordern — je Aufruf, und Aufrufe laufen parallel.
+  Der Host kappt jetzt an einer Stelle (`Limits::clamped_to_host`, gerufen im einen Trichter
+  `load_named`): `fuel_slice` auf 10 000 000 (genau `START_FUEL`, damit das Einmal-Budget des
+  Ladewegs eine Konstante bleibt), `max_memory_pages` auf 4096 (256 MiB), `max_http_requests` auf
+  1024. Jede Kappung erscheint als Startmeldung, damit der Autor sie merkt. **Gekappt, nicht
+  abgelehnt:** `manifest.toml` ist ein stabiles Format, und was in 0.5.1 lud, muss weiter laden;
+  die Decken wurden nachgerüstet. `max_wall_time_ms = 0` (unbegrenzt) bleibt ausdrücklich
+  erlaubt — es ist genau dann sicher, wenn Yield-Punkte garantiert sind, und die garantiert erst
+  der Deckel auf `fuel_slice`.
+- **`host_log` sammelte im Host-Speicher.** Jede Log-Zeile eines Plugins wanderte zusätzlich in
+  einen `Vec` im `HostState`, den niemand je auslas. `StoreLimits` deckelt nur den Modulspeicher,
+  nicht die Puffer des Hosts: Eine Schleife aus `host_log` ließ den Host-RAM wachsen, bei
+  `max_wall_time_ms = 0` beliebig lange. Der tote Akkumulator ist weg, die Zeile geht nur noch
+  ins Log.
 - **Ein Werkzeug konnte sich seinen eigenen Nachweis schreiben.** Der Agent-Loop übernimmt ein
   Objekt unter `details["audit"]` mit einem `kind`-Feld als Session-Eintrag — das ist der
   Nachweis, was in einem Turn entschieden wurde. Ein WASM-Plugin und ein MCP-Server liefern ihr
@@ -85,6 +105,15 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   Platzhalter statt ein leeres Ergebnis zu liefern. Das Session-Format bleibt unverändert.
 
 ### Tests
+- `sepp-policy`: `clamped_to_host` kappt genau die Felder über den Decken und meldet jedes im
+  Klartext, lässt Defaults und `max_wall_time_ms = 0` in Ruhe; die Decken liegen nie unter den
+  Defaults (sonst bekäme jedes Plugin eine Startmeldung); ein Manifest über der Decke parst
+  weiterhin (die Stabilitätszusage als Test).
+- `sepp-wasm`: **die Verhaltensbeweise** — ein Endlosschleifen-Plugin mit `fuel_slice = u64::MAX`
+  lässt sich weiterhin nach 50 ms abbrechen (ohne die Kappung läuft derselbe Test in den
+  Timeout), eine Endlosschleife in der Start-Sektion hängt das Laden nicht mehr auf, und
+  `MAX_FUEL_SLICE <= START_FUEL` hält die beiden Konstanten beieinander; die Kappung erscheint in
+  den Ladehinweisen.
 - `sepp-core`: der reservierte Namensraum verschwindet aus fremden `details`, verschachtelte
   `audit`-Felder und alles, was kein Objekt ist, bleiben unberührt.
 - `sepp-wasm`: ein Plugin ohne HTTP-Anfrage, das `details["audit"]` mit `kind = "guard"` und

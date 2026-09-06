@@ -88,7 +88,6 @@ pub const HTTP_AUDIT_KIND: &str = "plugin_http";
 
 /// Pro-Instanz-Zustand (für Host-Funktionen und den Speicher-Limiter).
 struct HostState {
-    logs: Vec<String>,
     /// Speicher-Deckel dieses Stores: `memory.grow` über dem Limit liefert dem Plugin `-1`
     /// (regulär, kein Trap) — Host-RAM bleibt flach, egal was das Plugin versucht.
     limits: StoreLimits,
@@ -129,7 +128,6 @@ struct HostCtx<'a> {
 
 fn host_state(limits: &Limits, policy: Policy, ctx: HostCtx<'_>) -> HostState {
     HostState {
-        logs: Vec::new(),
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes())
             .build(),
@@ -458,7 +456,7 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
         .func_wrap(
             "env",
             HOST_LOG,
-            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
+            |caller: Caller<'_, HostState>, ptr: i32, len: i32| {
                 if let Some(Extern::Memory(mem)) = caller.get_export(MEMORY_EXPORT) {
                     // Über `read_input`, damit es im Linker genau einen Weg gibt, Modulspeicher
                     // zu lesen: Die Inline-Rechnung hier klemmte negative Werte nicht und lief
@@ -466,8 +464,11 @@ fn build_linker(engine: &Engine, policy: &Policy) -> Result<Linker<HostState>> {
                     let msg = read_input(&caller, &mem, ptr, len)
                         .map(|s| String::from_utf8_lossy(&s).into_owned());
                     if let Some(msg) = msg {
+                        // Nur ins Log, nicht in den Host-Speicher: Ein gesammelter `Vec` wuchs
+                        // unbegrenzt (`StoreLimits` deckelt nur den Modulspeicher) und wurde
+                        // nirgends gelesen — eine Schleife aus `host_log` ließ den Host-RAM
+                        // wachsen, bei `max_wall_time_ms = 0` beliebig lange.
                         tracing::info!(target: "wasm", "{msg}");
-                        caller.data_mut().logs.push(msg);
                     }
                 }
             },
@@ -969,6 +970,13 @@ impl WasmHost {
         limits: Limits,
         section: Option<&str>,
     ) -> Result<WasmPlugin> {
+        // Der eine Trichter: `load`, `load_file_with_grant` und `discover_with` kommen alle hier
+        // vorbei, und `PluginCore` bekommt genau diese Limits — es gibt keinen Pfad an den
+        // Host-Deckeln vorbei, auch nicht für Einbetter, die `load` direkt rufen. Ein Manifest
+        // ist die Selbstauskunft des Autors, auch beim Verbrauch: Ohne Deckel verschiebt ein
+        // riesiges `fuel_slice` den einzigen Yield-Punkt beliebig weit (Ctrl+C wirkt nicht mehr)
+        // und bläht das Einmal-Budget der nicht resumierbaren Start-Sektion auf.
+        let (limits, clamp_notes) = limits.clamped_to_host();
         let module = Module::new(&self.engine, wasm)
             .map_err(|e| SeppError::Tool(format!("wasm compile: {e}")))?;
         // Alle vier Exports schon hier prüfen, ohne Store und ohne Instanziierung. Vorher fehlten
@@ -1037,7 +1045,7 @@ impl WasmHost {
                 http: self.http.clone(),
             }),
             spec,
-            notes: Vec::new(),
+            notes: clamp_notes,
         })
     }
 
@@ -1098,6 +1106,9 @@ impl WasmHost {
             None => Policy::default(),
         };
         let mut plugin = self.load_named(&wasm, policy, limits, Some(name))?;
+        // Manifest-Hinweise zuerst, dann die des Ladewegs — `load_named` hat seine eigenen
+        // (gekappte Limits) bereits gesetzt, sie dürfen nicht verlorengehen.
+        notes.append(&mut plugin.notes);
         plugin.notes = notes;
         Ok(plugin)
     }
@@ -1823,6 +1834,104 @@ mod tests {
         .await
         .expect("Abbruch muss binnen Sekunden wirken");
         assert!(matches!(res, Err(SeppError::Aborted)), "war: {res:?}");
+    }
+
+    /// C3 (0.5.2): Der Yield-Punkt ist die einzige Stelle, an der Abbruch geprüft wird — ein
+    /// Manifest darf ihn nicht beliebig weit wegschieben können. Ohne den Host-Deckel yieldet
+    /// dieses Plugin nie, `cancel` bliebe wirkungslos und der Test liefe in den Timeout.
+    #[tokio::test]
+    async fn cancel_still_interrupts_a_plugin_with_a_huge_fuel_slice() {
+        let host = WasmHost::new();
+        let limits = Limits {
+            fuel_slice: u64::MAX,
+            max_wall_time_ms: 0,
+            ..Limits::default()
+        };
+        let plugin = host.load(&spin_wat(), Policy::default(), limits).unwrap();
+
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.cancel();
+        });
+        let res = tokio::time::timeout(
+            Duration::from_secs(20),
+            plugin.execute(serde_json::json!({}), cancel, None),
+        )
+        .await
+        .expect("Abbruch muss trotz riesigem fuel_slice binnen Sekunden wirken");
+        assert!(matches!(res, Err(SeppError::Aborted)), "war: {res:?}");
+    }
+
+    /// C3, zweite Hälfte: Der Ladeweg tankt `START_FUEL.max(fuel_slice)` in die **nicht
+    /// resumierbare** Start-Sektion. Ohne Deckel bliebe sepp dort unterbrechungsfrei hängen —
+    /// vor jedem Abbruchkanal, beim Start. Mit Deckel geht dem Modul das Fuel aus und das Laden
+    /// scheitert sauber.
+    #[tokio::test]
+    async fn a_huge_fuel_slice_cannot_inflate_the_start_budget() {
+        let spec =
+            r#"{"name":"slowstart","label":"S","description":"x","parameters":{"type":"object"}}"#;
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 8) "{spec}")
+  (func $s (loop $l (br $l)))
+  (start $s)
+  (func (export "sepp_alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "sepp_spec") (result i64)
+    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {len})))
+  (func (export "sepp_call") (param i32) (param i32) (result i64) (i64.const 0))
+)"#,
+            spec = esc(spec),
+            len = spec.len(),
+        );
+        let wasm = wat::parse_str(&wat).expect("start wat");
+        let limits = Limits {
+            fuel_slice: u64::MAX,
+            max_wall_time_ms: 0,
+            ..Limits::default()
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                WasmHost::new().load(&wasm, Policy::default(), limits)
+            }),
+        )
+        .await
+        .expect("das Laden darf nicht unterbrechungsfrei hängen")
+        .expect("join");
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("die Endlosschleife in der Start-Sektion muss auffallen"),
+        };
+        assert!(err.to_string().contains("instantiate"), "war: {err}");
+    }
+
+    /// Die beiden Konstanten gehören zusammen: Solange der Deckel nicht über `START_FUEL` liegt,
+    /// bleibt `START_FUEL.max(fuel_slice)` im Ladeweg das feste Einmal-Budget des Hosts.
+    #[test]
+    fn a_manifest_can_never_inflate_the_start_budget() {
+        const { assert!(sepp_policy::MAX_FUEL_SLICE <= START_FUEL) };
+    }
+
+    /// Der Autor soll die Kappung merken: Sie steht in den Ladehinweisen, die der Start zeigt.
+    #[tokio::test]
+    async fn clamped_limits_are_reported_as_load_notes() {
+        let limits = Limits {
+            fuel_slice: u64::MAX,
+            max_memory_pages: 65_536,
+            max_http_requests: 100_000,
+            ..Limits::default()
+        };
+        let mut plugin = WasmHost::new()
+            .load(&spin_wat(), Policy::default(), limits)
+            .unwrap();
+        let notes = plugin.take_notes().join("\n");
+        for feld in ["fuel_slice", "max_memory_pages", "max_http_requests"] {
+            assert!(notes.contains(feld), "{feld} fehlt in: {notes}");
+        }
+        assert!(notes.contains("gekappt"), "{notes}");
     }
 
     /// Spec-Test 3: Lange, aber legitime Rechnung läuft durch — Nachtanken funktioniert und
