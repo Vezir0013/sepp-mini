@@ -70,15 +70,21 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 - **Das Supply-Chain-Gate meldet auch transitive Befunde.** `cargo-deny` bewertet
   `unsound`- und `unmaintained`-Advisories seit einer Änderung seiner Standardwerte nur noch für
   Abhängigkeiten, die ein Workspace-Crate direkt nennt. Zwei Befunde zu `lru`
-  (RUSTSEC-2026-0002, RUSTSEC-2026-0253), die transitiv über ratatui hereinkommen, blieben
+  (RUSTSEC-2026-0002, RUSTSEC-2026-0253), die transitiv über ratatui hereinkamen, blieben
   deshalb in CI stumm, obwohl `cargo audit` sie nannte — ein Gate, das nur die erste Ebene
   ansieht, sagt nichts über die Lieferkette. `deny.toml` setzt beide Felder jetzt ausdrücklich
-  auf „all"; jede Kette zählt. Die zwei lru-Befunde sind bewertet und mit Begründung
-  eingetragen: Beide brauchen Code, den ratatui nicht ausführt — vom `LruCache` benutzt der
-  Layout-Cache nur `get_or_insert`, `resize` und `cap`, also weder `IterMut` noch
-  `LruCache::pop`, und sein Schlüssel `(Rect, Layout)` hat kein `Drop`, das panicken kann.
-  Jeder Ignore trägt seinen Grund jetzt maschinenlesbar, damit die Ausgabe des Gates ihn nennt
-  und nicht nur die Datei.
+  auf „all"; jede Kette zählt. Jeder Ignore trägt seinen Grund maschinenlesbar, damit die
+  Ausgabe des Gates ihn nennt und nicht nur die Datei.
+- **Die Oberfläche läuft auf ratatui 0.30.** Damit verschwinden die beiden `lru`-Befunde und die
+  unmaintained-Meldung zu `paste` nicht durch einen Ignore, sondern aus dem Abhängigkeitsbaum:
+  ratatui-core zieht `lru` 0.18.4 (beide Advisories dort behoben) und `paste` kommt gar nicht
+  mehr vor. `deny.toml` braucht deshalb nur noch **einen** Ignore (`smartstring`, transitiv über
+  rhai). Am Code der Oberfläche änderte das keine Zeile — die benutzten Bausteine (Layout,
+  Block, Paragraph, Line/Span, Style) sind dieselben geblieben. Aufgenommen sind nur die
+  Features, die sepp wirklich benutzt: ohne `all-widgets` (Kalender-Widget samt `time`) und ohne
+  die Makro-Crate; der Layout-Cache bleibt an. `crossterm` geht im selben Zug auf 0.29, damit
+  nicht zwei Fassungen desselben Terminal-Treibers im Binary landen. Unterm Strich sechs Crates
+  mehr im Baum, drei Advisories weniger.
 
 ### Tests
 - Neunzehn Fälle für die beiden Befunde oben: das Rhai-Verhalten beider „nicht gefunden"-Fälle
