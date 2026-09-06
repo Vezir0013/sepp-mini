@@ -23,8 +23,9 @@ impl Host {
     }
 
     /// HTTP über den Host — nur mit dem Feature `net`, das zugleich den Import `host_http`
-    /// freischaltet. Das Manifest muss `net` anfordern. **Provisorisch:** Der Host liefert heute
-    /// noch einen Fehler („noch nicht implementiert"); Stufe 3 setzt die Funktion um.
+    /// freischaltet. Das Manifest muss `net = ["<host>"]` anfordern, und die Policy des Nutzers
+    /// muss es gewähren; Secrets in Header-Werten (`$NAME`) brauchen zusätzlich `env = ["NAME"]`
+    /// in beiden. Der Host prüft das je Anfrage — Details in [`crate::http`].
     #[cfg(feature = "net")]
     pub fn http(&self) -> crate::http::Http {
         crate::http::Http::new()
