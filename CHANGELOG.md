@@ -94,6 +94,9 @@ Nutzers gehören dem Nutzer (Pakete leben unter `pkg/`), Content in `config_root
 - `sepp-cli`: Parser, Datum ohne Zeitbibliothek, `init` legt `pkg/` und `trusted-keys/` (0700)
   an; `#[ignore]`-Test packt das gebaute `textstat.wasm`, installiert es gegen Wurzeln im
   Temp-Verzeichnis, lädt es aus `pkg/demo/plugins` und zählt Wörter.
+- Pfad-Erwartungen in den Paket-Tests gehen vom kanonischen Temp-Verzeichnis aus statt von
+  festen Host-Pfaden — auf macOS liegt `TMPDIR` unter `/var` → `/private/var` und `/home` ist
+  ein Symlink, was den macOS-Lauf der CI rot gemacht hatte.
 
 ### Geplant
 - Egress-Proxy für `net`-Hostfilter bei `bash` und MCP-Kindprozessen (Landlock/Seatbelt filtern

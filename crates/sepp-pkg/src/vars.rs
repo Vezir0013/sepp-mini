@@ -173,6 +173,7 @@ pub fn value_notes(
 mod tests {
     use super::*;
     use crate::manifest::PkgManifest;
+    use std::path::PathBuf;
 
     fn manifest(rights: &str) -> PkgManifest {
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -186,12 +187,20 @@ mod tests {
         .unwrap()
     }
 
-    fn ctx(home: &str, cwd: &str) -> ResolveCtx {
-        ResolveCtx {
-            home: Some(home.into()),
-            cwd: cwd.into(),
-            tmpdir: "/tmp".into(),
-        }
+    /// Kanonisches Temp-Verzeichnis mit angelegtem `home` und nicht angelegtem `work` — feste
+    /// Host-Pfade taugen nicht, weil `canonicalize_lenient` sie auflöst (macOS: `/home` ist ein
+    /// Symlink nach `/System/Volumes/Data/home`, `/tmp` nach `/private/tmp`).
+    fn ctx(tmp: &tempfile::TempDir) -> (ResolveCtx, PathBuf, PathBuf) {
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let work = base.join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = ResolveCtx {
+            home: Some(home.clone()),
+            cwd: work.clone(),
+            tmpdir: base.join("tmp"),
+        };
+        (ctx, home, work)
     }
 
     #[test]
@@ -235,18 +244,21 @@ mod tests {
             ("BELEGE_DIR".to_string(), "~/belege".to_string()),
             ("MANDANT".to_string(), "acme".to_string()),
         ]);
-        let out = resolve_rights(&m, &values, &ctx("/home/anna", "/work")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, home, work) = ctx(&tmp);
+        let belege = home.join("belege").display().to_string();
+        let out = resolve_rights(&m, &values, &ctx).unwrap();
         assert_eq!(out.len(), 1);
         let (plugin, g) = &out[0];
         assert_eq!(plugin, "p");
         assert_eq!(
             g.fs_read,
-            vec!["/home/anna/belege".to_string(), "/work/rel".to_string()]
+            vec![belege.clone(), work.join("rel").display().to_string()]
         );
         assert_eq!(g.net, NetGrant::Hosts(vec!["api.acme.example".into()]));
         assert_eq!(g.env, vec!["TOKEN_acme".to_string()]);
-        let notes = value_notes(&m, &values, &ctx("/home/anna", "/work"));
+        let notes = value_notes(&m, &values, &ctx);
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("/home/anna/belege"), "{notes:?}");
+        assert!(notes[0].contains(&belege), "{notes:?}");
     }
 }

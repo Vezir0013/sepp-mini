@@ -50,7 +50,10 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
+    // Rechte werden kanonisch geschrieben; auf macOS liegt `TMPDIR` unter `/var` → `/private/var`,
+    // also muss auch die Erwartung vom kanonischen Pfad ausgehen.
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let roots = Roots {
         config: home.join(".sepp"),
@@ -66,7 +69,7 @@ fn fixture() -> Fixture {
     let ctx = ResolveCtx {
         home: Some(home.clone()),
         cwd: home.clone(),
-        tmpdir: tmp.path().join("tmp"),
+        tmpdir: base.join("tmp"),
     };
     Fixture {
         _tmp: tmp,
