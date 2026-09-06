@@ -16,6 +16,7 @@ members = [
     "crates/sepp-cli",
     "crates/sepp-plugin-macros",
     "crates/sepp-plugin",
+    "crates/sepp-pkg",
 ]
 # Die Doku-Quelle ist kein Cargo-Projekt; das Beispiel-Plugin wird für wasm32 gebaut und
 # gehört deshalb nicht in die Workspace-Tore (fmt, clippy, test, cargo-deny).
@@ -45,7 +46,14 @@ async-trait = "=0.1.89"
 # --- HTTP / Streaming (Provider) ---
 reqwest = { version = "=0.12.28", features = ["json", "stream", "rustls-tls"], default-features = false }
 bytes = "=1.11.1"
-base64 = "=0.22.1"     # host_http: binäre Bodies (Host und Plugin-SDK)
+base64 = "=0.22.1"     # host_http: binäre Bodies (Host und Plugin-SDK); Schlüssel/Signaturen in .seppkg
+
+# --- Paketformat .seppkg (sepp-pkg) ---
+# ring liegt über rustls ohnehin im Baum: SHA-256, Ed25519, SystemRandom — keine zweite Krypto.
+ring = "=0.17.14"
+semver = "=1.0.28"
+tar = "=0.4.46"
+zstd = { version = "=0.14.0", default-features = false }
 
 # --- Plattform (Prozess-Gruppen für bash-Tool, nur unix) ---
 libc = "=0.2.186"
