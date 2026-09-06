@@ -58,6 +58,20 @@ pub enum ImageSource {
     Url { url: String },
 }
 
+impl ImageSource {
+    /// Kurzbeschreibung für Anbieter oder Modelle, die das Bild nicht annehmen, und für
+    /// gekürzte Verläufe — das Modell erfährt so wenigstens, dass da ein Bild war.
+    pub fn describe(&self) -> String {
+        match self {
+            ImageSource::Base64 { media_type, data } => format!(
+                "[Bild: {media_type}, {} Bytes base64 — nicht übertragen]",
+                data.len()
+            ),
+            ImageSource::Url { url } => format!("[Bild: {url} — nicht übertragen]"),
+        }
+    }
+}
+
 /// Eine Nachricht im Gesprächsverlauf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

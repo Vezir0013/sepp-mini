@@ -8,7 +8,9 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use sepp_core::{ContentBlock, Message, Result, Role, SeppError, ThinkingLevel, Usage};
+use sepp_core::{
+    ContentBlock, ImageSource, Message, Result, Role, SeppError, ThinkingLevel, Usage,
+};
 
 use crate::sse::SseDecoder;
 use crate::{CompletionRequest, Provider, StopReason, StreamEvent};
@@ -205,10 +207,12 @@ impl AnthropicProvider {
         // have thinking enabled"). Betroffen sind sonst compact() (summarisiert mit Off),
         // /think off, --resume ohne --think und Modelle ohne supports_reasoning.
         let thinking_enabled = req.thinking != ThinkingLevel::Off && req.model.supports_reasoning;
+        // Bilder nur an Modelle, die sie annehmen — sonst Platzhalter statt 400.
+        let images_ok = req.model.supports_images;
         let messages = merge_consecutive_roles(
             req.messages
                 .iter()
-                .filter_map(|m| message_to_json(m, thinking_enabled))
+                .filter_map(|m| message_to_json(m, thinking_enabled, images_ok))
                 .collect(),
         );
         let mut body = json!({
@@ -266,7 +270,7 @@ fn merge_consecutive_roles(msgs: Vec<Value>) -> Vec<Value> {
     out
 }
 
-fn message_to_json(msg: &Message, thinking_enabled: bool) -> Option<Value> {
+fn message_to_json(msg: &Message, thinking_enabled: bool, images_ok: bool) -> Option<Value> {
     let role = match msg.role {
         Role::Assistant => "assistant",
         Role::User | Role::Tool => "user",
@@ -275,7 +279,7 @@ fn message_to_json(msg: &Message, thinking_enabled: bool) -> Option<Value> {
     let content: Vec<Value> = msg
         .content
         .iter()
-        .filter_map(|b| block_to_json(b, thinking_enabled))
+        .filter_map(|b| block_to_json(b, thinking_enabled, images_ok))
         .collect();
     if content.is_empty() {
         return None;
@@ -283,7 +287,25 @@ fn message_to_json(msg: &Message, thinking_enabled: bool) -> Option<Value> {
     Some(json!({ "role": role, "content": content }))
 }
 
-fn block_to_json(b: &ContentBlock, thinking_enabled: bool) -> Option<Value> {
+/// Ein Bild im Drahtformat der Messages API — oder, wenn das Modell keine Bilder annimmt, ein
+/// Textblock, der es benennt.
+fn image_to_json(source: &ImageSource, images_ok: bool) -> Value {
+    if !images_ok {
+        return json!({ "type": "text", "text": source.describe() });
+    }
+    match source {
+        ImageSource::Base64 { media_type, data } => json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
+        }),
+        ImageSource::Url { url } => json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }),
+    }
+}
+
+fn block_to_json(b: &ContentBlock, thinking_enabled: bool, images_ok: bool) -> Option<Value> {
     match b {
         ContentBlock::Text { text } if text.trim().is_empty() => None,
         // Signierte Thinking-Blöcke MÜSSEN unverändert zurück, solange der Request Thinking
@@ -305,6 +327,36 @@ fn block_to_json(b: &ContentBlock, thinking_enabled: bool) -> Option<Value> {
         // must have thinking enabled", 400) — sonst bräche jede Compaction (summarisiert
         // mit Off), /think off und --resume ohne --think nach einem Thinking-Turn.
         ContentBlock::Thinking { .. } => None,
+        // Bilder und Werkzeug-Ergebnisse explizit statt per serde: Das Session-Format taggt die
+        // Bildquelle mit `kind`, das Drahtformat verlangt `type` — durchgereicht kam 400, sobald
+        // ein MCP-Server ein Bild lieferte, und mit ihm blieb die Sitzung hängen. In einem
+        // Ergebnis sind nur Text und Bild erlaubt; alles andere gehört dort nicht hin.
+        ContentBlock::Image { source } => Some(image_to_json(source, images_ok)),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let inner: Vec<Value> = content
+                .iter()
+                .filter_map(|c| match c {
+                    ContentBlock::Text { text } if text.trim().is_empty() => None,
+                    ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+                    ContentBlock::Image { source } => Some(image_to_json(source, images_ok)),
+                    _ => None,
+                })
+                .collect();
+            let mut v = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": inner,
+            });
+            if *is_error {
+                v["is_error"] = json!(true);
+            }
+            Some(v)
+        }
+        // Text und ToolUse: Drahtformat = Session-Format.
         other => serde_json::to_value(other).ok(),
     }
 }
@@ -412,6 +464,7 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::{block_to_json, merge_consecutive_roles, AnthropicProvider};
     use crate::CompletionRequest;
+    use sepp_core::ImageSource;
     use sepp_core::{ContentBlock, Message, Model, Role, ThinkingLevel};
     use serde_json::json;
 
@@ -424,7 +477,7 @@ mod tests {
             signature: Some("sig123".into()),
         };
         assert_eq!(
-            block_to_json(&b, true),
+            block_to_json(&b, true, true),
             Some(json!({
                 "type": "thinking",
                 "thinking": "Denkprozess",
@@ -441,8 +494,8 @@ mod tests {
             text: "lokales Reasoning".into(),
             signature: None,
         };
-        assert_eq!(block_to_json(&b, true), None);
-        assert_eq!(block_to_json(&b, false), None);
+        assert_eq!(block_to_json(&b, true, true), None);
+        assert_eq!(block_to_json(&b, false, true), None);
     }
 
     #[test]
@@ -453,7 +506,7 @@ mod tests {
             text: "Denkprozess".into(),
             signature: Some("sig123".into()),
         };
-        assert_eq!(block_to_json(&b, false), None);
+        assert_eq!(block_to_json(&b, false, true), None);
     }
 
     fn reasoning_model() -> Model {
@@ -526,6 +579,79 @@ mod tests {
         let rendered = body["messages"].to_string();
         assert!(!rendered.contains("thinking"), "{rendered}");
         assert!(rendered.contains("Antwort")); // Text-Block bleibt
+    }
+
+    fn png() -> ContentBlock {
+        ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+        }
+    }
+
+    /// 0.5.2 (A3): Bis dahin ging `ContentBlock::Image` per serde mit `source.kind` über die
+    /// Leitung — die API verlangt `source.type` und lehnte den ganzen Request ab.
+    #[test]
+    fn image_blocks_use_the_wire_format_top_level_and_inside_tool_results() {
+        let v = block_to_json(&png(), false, true).unwrap();
+        assert_eq!(v["type"], "image");
+        assert_eq!(v["source"]["type"], "base64");
+        assert_eq!(v["source"]["media_type"], "image/png");
+        assert_eq!(v["source"]["data"], "AAAA");
+        assert!(v["source"].get("kind").is_none(), "{v}");
+
+        let url = ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://x.example/y.png".into(),
+            },
+        };
+        let v = block_to_json(&url, false, true).unwrap();
+        assert_eq!(v["source"]["type"], "url");
+        assert_eq!(v["source"]["url"], "https://x.example/y.png");
+
+        let tr = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::text("Screenshot:"),
+                png(),
+                ContentBlock::text("  "),
+            ],
+            is_error: false,
+        };
+        let v = block_to_json(&tr, false, true).unwrap();
+        assert_eq!(v["type"], "tool_result");
+        assert_eq!(v["tool_use_id"], "t1");
+        assert_eq!(v["content"].as_array().unwrap().len(), 2, "{v}");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][1]["type"], "image");
+        assert_eq!(v["content"][1]["source"]["type"], "base64");
+        assert!(v.get("is_error").is_none(), "{v}");
+
+        let err = ContentBlock::ToolResult {
+            tool_use_id: "t2".into(),
+            content: vec![ContentBlock::text("kaputt")],
+            is_error: true,
+        };
+        assert_eq!(block_to_json(&err, false, true).unwrap()["is_error"], true);
+    }
+
+    #[test]
+    fn images_become_a_text_placeholder_for_models_without_vision() {
+        let v = block_to_json(&png(), false, false).unwrap();
+        assert_eq!(v["type"], "text");
+        assert!(v["text"].as_str().unwrap().contains("image/png"), "{v}");
+        let tr = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![png()],
+            is_error: false,
+        };
+        let v = block_to_json(&tr, false, false).unwrap();
+        assert_eq!(v["content"][0]["type"], "text");
+        assert!(v["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nicht übertragen"));
     }
 
     #[test]

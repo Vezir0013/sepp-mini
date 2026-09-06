@@ -536,12 +536,18 @@ fn message_to_openai(msg: &Message) -> Vec<Value> {
 fn text_of(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
-        if let ContentBlock::Text { text } = b {
-            if !s.is_empty() {
-                s.push('\n');
-            }
-            s.push_str(text);
+        let piece = match b {
+            ContentBlock::Text { text } => text.as_str().to_string(),
+            // Chat Completions kennt Bilder nur als Nutzer-Eingabe, nicht in Werkzeug-
+            // Ergebnissen — ein Platzhalter sagt dem Modell wenigstens, dass da eines war,
+            // statt ein leeres Ergebnis zu liefern.
+            ContentBlock::Image { source } => source.describe(),
+            _ => continue,
+        };
+        if !s.is_empty() {
+            s.push('\n');
         }
+        s.push_str(&piece);
     }
     s
 }
@@ -753,6 +759,22 @@ fn dispatch(st: &mut DecodeState, payload: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_of_names_images_instead_of_dropping_them() {
+        let blocks = vec![
+            ContentBlock::text("Ergebnis:"),
+            ContentBlock::Image {
+                source: sepp_core::ImageSource::Base64 {
+                    media_type: "image/jpeg".into(),
+                    data: "QUJD".into(),
+                },
+            },
+        ];
+        let t = text_of(&blocks);
+        assert!(t.starts_with("Ergebnis:\n[Bild: image/jpeg"), "{t}");
+        assert_eq!(text_of(&[ContentBlock::text("nur Text")]), "nur Text");
+    }
 
     #[test]
     fn decodes_text_and_tool_call_stream() {
