@@ -474,7 +474,10 @@ bestätigt — und der Kern erzwingt sie an der jeweiligen Grenze:
 
 - **MCP/Subprozesse:** OS-Dateisystem-Sandbox — Linux via **Landlock**, macOS via **Seatbelt**
   (`sandbox_init`) — plus Environment-Scrubbing (nur gewährte `Env`-Vars + minimale Allowlist;
-  **keine** geerbten API-Keys). Lässt sich die Sandbox nicht durchsetzen (Kernel ohne Landlock,
+  **keine** geerbten API-Keys). Auf Linux zusätzlich Landlock-**Scopes** (Kernel ≥ 6.12): ein
+  Kindprozess kann sepp kein Signal schicken und keinen abstrakten Unix-Socket außerhalb der
+  Sandbox ansprechen; `$TMPDIR` ist ein privates Verzeichnis je Lauf, nicht `/tmp`. Getragene
+  Grenze: Unix-**Pfad**-Sockets (`docker.sock`, D-Bus) kann keiner der Adapter sperren. Lässt sich die Sandbox nicht durchsetzen (Kernel ohne Landlock,
   `sandbox_init`-Fehler), wird **fail-closed** verfahren. Auf Plattformen ohne Adapter
   (Windows/BSD) gibt es kein FS-Sandboxing — nur Env-Scrubbing, mit deutlicher Warnung.
 - **WASM:** Host-Funktionen werden nur registriert, wenn die Policy sie erlaubt — ein Plugin ohne

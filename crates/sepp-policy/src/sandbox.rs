@@ -145,6 +145,12 @@ pub struct SandboxCapabilities {
     pub fs_enforceable: bool,
     /// TCP-Verbot (Landlock ≥ ABI v4, Kernel 6.7 / Seatbelt).
     pub net_enforceable: bool,
+    /// Signale und abstrakte Unix-Sockets auf die Sandbox begrenzt: ein Kind kann sepp kein
+    /// `kill` schicken und keinen Socket außerhalb ansprechen (Landlock-Scopes ≥ ABI v6,
+    /// Kernel 6.12; Seatbelt deckt `signal` über Default-deny). Unix-**Pfad**-Sockets
+    /// (`docker.sock`, `/run/user/<uid>/bus`) kann keiner der Adapter sperren — das bleibt eine
+    /// getragene Grenze (Egress-Proxy/seccomp folgen).
+    pub scope_enforceable: bool,
     /// Menschenlesbare Begründung für `sepp policy` und Start-Hinweise.
     pub detail: String,
 }
@@ -187,7 +193,7 @@ pub fn kernel_capabilities() -> SandboxCapabilities {
     #[cfg(target_os = "linux")]
     {
         use landlock::{
-            Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, ABI,
+            Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset, RulesetAttr, Scope, ABI,
         };
         let fs = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
@@ -200,9 +206,22 @@ pub fn kernel_capabilities() -> SandboxCapabilities {
                 .handle_access(AccessNet::ConnectTcp)
                 .and_then(|r| r.create())
                 .is_ok();
-        let detail = match (fs, net) {
-            (true, true) => "Landlock: Dateisystem und TCP-Verbot durchsetzbar".to_string(),
-            (true, false) => {
+        let scope = fs
+            && Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .scope(Scope::Signal | Scope::AbstractUnixSocket)
+                .and_then(|r| r.create())
+                .is_ok();
+        let detail = match (fs, net, scope) {
+            (true, true, true) => {
+                "Landlock: Dateisystem, TCP-Verbot und Scopes (Signale, abstrakte Sockets) durchsetzbar"
+                    .to_string()
+            }
+            (true, true, false) => {
+                "Landlock: Dateisystem und TCP-Verbot durchsetzbar, Scopes nicht (Kernel < 6.12 oder ABI < 6)"
+                    .to_string()
+            }
+            (true, false, _) => {
                 "Landlock: Dateisystem durchsetzbar, TCP-Verbot nicht (Kernel < 6.7 oder ABI < 4)"
                     .to_string()
             }
@@ -211,6 +230,7 @@ pub fn kernel_capabilities() -> SandboxCapabilities {
         SandboxCapabilities {
             fs_enforceable: fs,
             net_enforceable: net,
+            scope_enforceable: scope,
             detail,
         }
     }
@@ -219,7 +239,9 @@ pub fn kernel_capabilities() -> SandboxCapabilities {
         SandboxCapabilities {
             fs_enforceable: true,
             net_enforceable: true,
-            detail: "Seatbelt (sandbox_init): Dateisystem und Netz durchsetzbar".to_string(),
+            scope_enforceable: true,
+            detail: "Seatbelt (sandbox_init): Dateisystem, Netz und Signale durchsetzbar"
+                .to_string(),
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -227,6 +249,7 @@ pub fn kernel_capabilities() -> SandboxCapabilities {
         SandboxCapabilities {
             fs_enforceable: false,
             net_enforceable: false,
+            scope_enforceable: false,
             detail: "kein OS-Sandbox-Adapter für diese Plattform (NullSandbox)".to_string(),
         }
     }
@@ -387,7 +410,7 @@ fn apply_landlock(
 ) -> std::result::Result<(), String> {
     use landlock::{
         Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
-        Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, ABI,
+        Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
     };
 
     fn add(
@@ -422,6 +445,14 @@ fn apply_landlock(
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| e.to_string())?;
+    // Scopes (ABI v6, Kernel 6.12): kein Signal an Prozesse außerhalb der Sandbox (`kill -9 $PPID`
+    // traf bisher sepp selbst), keine Verbindung zu abstrakten Unix-Sockets außerhalb. Innerhalb
+    // der Sandbox (eigene Kinder, Prozessgruppe) bleibt alles erlaubt; sepp als Elternprozess ist
+    // nicht eingeschränkt und beendet die Gruppe wie bisher. BestEffort: auf älteren Kerneln still
+    // nicht durchgesetzt — `kernel_capabilities().scope_enforceable` sagt es.
+    ruleset = ruleset
+        .scope(Scope::Signal | Scope::AbstractUnixSocket)
         .map_err(|e| e.to_string())?;
     if deny_net {
         // Netz-Rechte handhaben, aber KEINE NetPort-Regel eintragen ⇒ TCP verboten (ab v4).
@@ -503,6 +534,13 @@ const SEATBELT_SYSTEM_READ: &[&str] = &[
 /// Ausführen nur der `exec`-Programme, falls eine Liste vorliegt; `deny`-Zeilen zuletzt (SBPL:
 /// die letzte passende Regel gewinnt). Reine, testbare Funktion (plattformunabhängig).
 ///
+/// `sysctl-read` und `mach-lookup` sind breit erlaubt, weil jedes Programm beim Start
+/// Systemwerte liest und Dienste (Namensauflösung, Schlüsselbund, opendirectoryd) anspricht —
+/// zwei Ausnahmen stehen als Verbote am Ende: `kern.procargs*` (Argumente und **Umgebung**
+/// fremder Prozesse — `ps -Eww -p $PPID` zeigte sonst die API-Keys von sepp) und die Dienste, über
+/// die launchd Prozesse **außerhalb** der Sandbox startet (LaunchServices `open -a`, Apple
+/// Events `osascript`).
+///
 /// Hinweis zu Exec-Listen auf macOS: Apple-Shims (`/usr/bin/git` startet über `xcrun` das echte
 /// Binary unter `/Library/Developer/CommandLineTools`) machen `literal`-Regeln fragil; die
 /// Symlink-Ziele werden mit aufgenommen, Shims aber nicht aufgelöst.
@@ -579,8 +617,20 @@ fn build_seatbelt_profile(
             }
         }
     }
+    for line in SEATBELT_DENY_TAIL {
+        p.push_str(line);
+        p.push('\n');
+    }
     p
 }
+
+/// Verbote, die in jedem Profil zuletzt stehen (letzte Regel gewinnt): kein Blick in Argumente
+/// und Umgebung fremder Prozesse, kein Prozessstart über launchd.
+#[cfg(any(target_os = "macos", test))]
+const SEATBELT_DENY_TAIL: &[&str] = &[
+    "(deny sysctl-read (sysctl-name \"kern.procargs\") (sysctl-name \"kern.procargs2\") (sysctl-name-prefix \"kern.procargs\"))",
+    "(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.coreservices.appleevents\") (global-name \"com.apple.coreservices.quarantine-resolver\"))",
+];
 
 /// Löst Policy-Pfade zu ihrem kanonischen (realpath-)Pfad auf. Seatbelt matcht kanonisch, und auf
 /// macOS sind Verzeichnisse wie `/var` oder `/tmp` Symlinks (`/var` → `/private/var`) — ohne
@@ -739,6 +789,31 @@ mod seatbelt_profile_tests {
         assert!(p.contains("(deny file-write* (subpath \"/home/u/proj/.sepp\"))"));
     }
 
+    /// B2 (nach 0.5.1): `(allow sysctl-read)` und `(allow mach-lookup)` galten global —
+    /// `ps -Eww -p $PPID` las die Umgebung von sepp, `open -a`/`osascript` starteten über launchd
+    /// Prozesse außerhalb der Sandbox. Die Verbote stehen als letzte Zeilen, damit sie gewinnen.
+    #[test]
+    fn profile_denies_procargs_and_launchd_services_last() {
+        let p = build_seatbelt_profile(&[PathBuf::from("/home/u")], &[], &[], None, true);
+        let allow_sysctl = p.find("(allow sysctl-read)").unwrap();
+        let allow_mach = p.find("(allow mach-lookup)").unwrap();
+        let deny_sysctl = p
+            .find("(deny sysctl-read (sysctl-name \"kern.procargs\")")
+            .unwrap();
+        let deny_mach = p
+            .find("(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\")")
+            .unwrap();
+        assert!(deny_sysctl > allow_sysctl && deny_mach > allow_mach);
+        assert!(p.contains("(sysctl-name \"kern.procargs2\")"));
+        assert!(p.contains("(global-name \"com.apple.coreservices.appleevents\")"));
+        let last_allow = p.rfind("(allow ").unwrap();
+        assert!(
+            deny_sysctl > last_allow && deny_mach > last_allow,
+            "Verbote zuletzt"
+        );
+        assert!(p.trim_end().ends_with("))"));
+    }
+
     #[test]
     fn resolve_program_finds_first_executable_on_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -836,6 +911,42 @@ mod seatbelt_tests {
             "Seatbelt verhinderte den Schreibzugriff außerhalb des erlaubten Pfads NICHT"
         );
     }
+
+    /// B2: Die Umgebung des Elternprozesses (hier der Test, stellvertretend für sepp mit seinen
+    /// API-Keys) darf aus der Sandbox nicht per `ps -E` lesbar sein. Auf macOS 26.3 gibt
+    /// `KERN_PROCARGS2` fremde Umgebungen ohnehin nicht mehr preis; auf älteren Versionen trägt
+    /// das Verbot im Profil. Taucht der Marker auf, ist entweder das Verbot oder das System
+    /// durchlässig — beides wäre ein Befund.
+    #[tokio::test]
+    #[ignore = "braucht macOS-Seatbelt"]
+    async fn seatbelt_hides_the_parents_environment() {
+        std::env::set_var("SEPP_TEST_MARKER", "geheim-4711-marker");
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("ps.txt");
+        let policy = Policy::new(vec![Capability::FsWrite {
+            prefix: tmp.path().to_path_buf(),
+        }]);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "ps -Eww -p $PPID > '{}' 2>&1; echo EXIT=$? >> '{}'",
+                out.display(),
+                out.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = SeatbeltSandbox
+            .spawn(&mut cmd, &policy)
+            .unwrap()
+            .wait()
+            .await;
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            !text.contains("geheim-4711-marker"),
+            "Umgebung des Elternprozesses aus der Sandbox lesbar:\n{text}"
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -928,6 +1039,39 @@ mod tests {
             .wait()
             .await
             .expect("wait")
+    }
+
+    /// B1: Ein sandboxed Kind darf Prozessen außerhalb kein Signal schicken (bisher traf
+    /// `kill -9 $PPID` sepp selbst); seine eigenen Kinder darf es weiter beenden.
+    #[tokio::test]
+    #[ignore = "braucht durchsetzbares Landlock ≥ ABI v6 (Kernel 6.12) und sh"]
+    async fn landlock_scope_blocks_signals_outside_the_sandbox() {
+        if !kernel_capabilities().scope_enforceable {
+            eprintln!("übersprungen: Kernel ohne Landlock-Scopes");
+            return;
+        }
+        let mut outside = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep außerhalb");
+        let pid = outside.id().expect("pid");
+        let policy = Policy::default();
+        let status = run_sandboxed(&policy, "sh", &format!("kill -TERM {pid}")).await;
+        assert!(
+            !status.success(),
+            "Signal nach außen wurde nicht verhindert"
+        );
+        assert!(
+            outside.try_wait().expect("try_wait").is_none(),
+            "der Prozess außerhalb der Sandbox wurde beendet"
+        );
+        let _ = outside.kill().await;
+        // Eigene Kinder (gleiche Domäne) bleiben erreichbar — sonst bräche jedes `kill %1`.
+        let status = run_sandboxed(&policy, "sh", "sleep 30 & kill -TERM $!").await;
+        assert!(status.success(), "Signal an das eigene Kind schlug fehl");
     }
 
     #[tokio::test]

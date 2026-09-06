@@ -29,6 +29,35 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   `Compaction`-Eintrag, dessen `replaced_until` genau die letzte entfernte Nachricht ist —
   `path_messages()` und Speicher stimmen danach überein. Netz-, Schlüssel- und 5xx-Fehler
   kommen unverändert zurück; dort wäre ein Schnitt Datenverlust ohne Gewinn.
+- **Die Sandbox der Kindprozesse endete am Dateisystem.** Ein sandboxed `bash` konnte sepp
+  selbst mit `kill -9 $PPID` beenden, abstrakte Unix-Sockets anderer Prozesse ansprechen und —
+  weil der eingebaute Grant `$TMPDIR` das ganze `/tmp` freigab — die Sockets des ssh-agent
+  finden und mit den Schlüsseln des Nutzers signieren, obwohl `~/.ssh` verboten ist. Jetzt
+  setzt Landlock zusätzlich die Scopes `Signal` und `AbstractUnixSocket` (ABI v6, Kernel 6.12;
+  auf älteren Kerneln meldet der Start, dass sie fehlen), und `TMPDIR` zeigt auf Linux für sepp
+  und alle Kindprozesse auf ein **privates 0700-Verzeichnis je Lauf** (`/tmp/sepp-<pid>-<zufall>`),
+  das am Ende verschwindet; `$TMPDIR` in der Policy löst darauf auf. Programme, die `/tmp` fest
+  verdrahten, brauchen ein ausdrückliches Recht (`sepp policy allow agent fs_write /tmp`). Auf
+  macOS bleibt es beim `TMPDIR` des Nutzers (`/var/folders/…/T`, ohnehin je Nutzer und 0700): Die
+  Xcode-Shims (`git`, `python3`) schreiben ihren Cache fest dorthin und scheiterten mit einem
+  privaten Unterverzeichnis (auf macOS 26.3 nachgestellt); der ssh-agent-Socket liegt dort nicht
+  im `TMPDIR`.
+  Getragene Grenze, jetzt dokumentiert: Unix-**Pfad**-Sockets (`docker.sock`,
+  `/run/user/<uid>/bus`) kann keiner der Adapter sperren — das kommt mit Egress-Proxy oder
+  seccomp.
+- **Seatbelt (macOS): `sysctl-read` und `mach-lookup` galten global.** Der Verdacht aus dem
+  Review: ein sandboxed Prozess liest per `ps -Eww -p $PPID` die Umgebung von sepp samt
+  API-Keys, und `open -a` oder `osascript` lassen launchd Prozesse **außerhalb** der Sandbox
+  starten. Auf einem Mac mini mit macOS 26.3 nachgestellt (`sandbox-exec` mit dem Profil von
+  sepp): `KERN_PROCARGS2` liefert dort für fremde Prozesse nur noch den Programmpfad — auch ohne
+  Sandbox —, LaunchServices weist `open -a` aus jeder Sandbox zurück (−54), und ein Apple Event
+  an den Finder scheitert schon am Default-deny (−600). Auf dieser macOS-Version besteht das
+  Leck also nicht. Das Profil endet trotzdem mit zwei Verboten als Vorsorge für ältere
+  Versionen, als letzte Regeln (sie gewinnen): `kern.procargs*` und die Dienste
+  `com.apple.coreservices.launchservicesd`, `…appleevents`, `…quarantine-resolver`; `whoami`,
+  `python3`, Namensauflösung und Schlüsselbund bleiben erreichbar. Ein `#[ignore]`-Test auf macOS
+  (`seatbelt_hides_the_parents_environment`) hält fest, dass die Umgebung des Elternprozesses aus
+  der Sandbox nicht lesbar ist.
 - **Bilder in Werkzeug-Ergebnissen brachten bei Anthropic 400.** `ContentBlock::Image` ging
   per serde mit `source.kind` über die Leitung, die Messages API verlangt `source.type` —
   sobald ein MCP-Server (Screenshot-Werkzeug) ein Bild lieferte, wurde der ganze Request
@@ -46,6 +75,12 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
   scheitert, samt Gleichheit von `path_messages()` und Speicher; Einheiten: Überlauf-
   Heuristik, zeichensichere Kürzung, Kürzung erhält `tool_use`/`tool_result`-Paare,
   Schnittpunkt-Wahl, Zuordnung zum Store-Eintrag über Custom-Einträge und Compactions hinweg.
+- `sepp-policy`: Seatbelt-Profil endet mit den Verboten für `kern.procargs*` und die
+  launchd-Dienste (Position nach jedem Allow); Landlock-Scope-Test (`#[ignore]`, Kernel ≥ 6.12):
+  Signal an einen Prozess außerhalb scheitert, an das eigene Kind gelingt; macOS-Test
+  (`#[ignore]`): Umgebung des Elternprozesses aus der Sandbox nicht lesbar.
+- `sepp-cli`: privates `TMPDIR` je Lauf ist frisch, 0700, exportiert, und `$TMPDIR` in der Policy
+  löst darauf auf.
 - `sepp-provider`: Bild oben und im `tool_result` im Drahtformat (`source.type`, kein `kind`),
   `is_error` nur wenn gesetzt, leere Textblöcke gefiltert; Platzhalter ohne Bildverständnis;
   OpenAI `text_of` nennt Bilder.

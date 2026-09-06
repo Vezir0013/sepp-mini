@@ -687,7 +687,52 @@ fn uninstall(purge: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ein privates `TMPDIR` je Lauf (B1, Linux): Der eingebaute Agent-Grant `fs_write = ["$TMPDIR"]`
+/// gab bisher das ganze `/tmp` frei — dort liegen die Sockets des ssh-agent und Reste anderer
+/// Nutzer. Jetzt zeigt `TMPDIR` für sepp und alle Kindprozesse (bash, MCP-stdio, Sub-Agenten) auf
+/// ein 0700-Verzeichnis, das nur diesem Lauf gehört und am Ende verschwindet; `$TMPDIR` in der
+/// Policy löst darauf auf. Programme, die `/tmp` fest verdrahten, brauchen ein ausdrückliches
+/// Recht.
+///
+/// Auf macOS bleibt es beim `TMPDIR` des Nutzers (`/var/folders/…/T`, ohnehin 0700 und je Nutzer):
+/// Die Xcode-Shims (`git`, `python3` unter `/usr/bin`) schreiben ihren Cache fest dorthin
+/// (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, unabhängig von `TMPDIR`) — ein privates Unterverzeichnis
+/// ließe sie mit „couldn't create cache file" scheitern (auf macOS 26.3 nachgestellt). Der
+/// ssh-agent-Socket liegt dort unter `/private/tmp/com.apple.launchd.*`, nicht im `TMPDIR`.
+fn private_tmpdir() -> anyhow::Result<Option<PathBuf>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("sepp-{}-{nanos:08x}", std::process::id()));
+    sepp_policy::fsutil::ensure_private_dir(&dir)?;
+    std::env::set_var("TMPDIR", &dir);
+    Ok(Some(dir))
+}
+
 fn run(opts: RunOpts) -> ExitCode {
+    // Vor Runtime und Guard: die Kindprozesse und `ResolveCtx::from_env()` lesen `TMPDIR`.
+    let private_tmp = match private_tmpdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "Warnung: kein privates TMPDIR ({e}) — $TMPDIR bleibt {}",
+                std::env::temp_dir().display()
+            );
+            None
+        }
+    };
+    let code = run_with_runtime(opts);
+    if let Some(dir) = private_tmp {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    code
+}
+
+fn run_with_runtime(opts: RunOpts) -> ExitCode {
     // current_thread genügt (I/O-gebunden); spart Worker-Thread-Churn beim Start.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1051,6 +1096,13 @@ async fn run_async(opts: RunOpts) -> anyhow::Result<()> {
                  MCP-Server haben Netzzugriff.",
                 sandbox_caps.detail
             ));
+        }
+        if sandbox_caps.fs_enforceable && !sandbox_caps.scope_enforceable {
+            startup_notice(
+                "Hinweis: Signal-Scope für Kindprozesse nicht durchsetzbar (Kernel < 6.12) — \
+                 bash könnte sepp selbst Signale schicken."
+                    .to_string(),
+            );
         }
         let project_cfg = session::project_config_root_canon()?;
         for o in policy_set.deny_overlaps(&Actor::Agent) {
@@ -2085,5 +2137,40 @@ mod tests {
 
         // Die Quelle leert das Protokoll — sonst wüchse es über die Sitzung.
         assert!(src().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_tmpdir_is_fresh_private_and_exported() {
+        let before = std::env::var_os("TMPDIR");
+        let a = private_tmpdir().unwrap().unwrap();
+        assert!(a.is_dir());
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("sepp-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(std::env::var_os("TMPDIR").as_deref(), Some(a.as_os_str()));
+        // Der Grant `$TMPDIR` löst jetzt auf das private Verzeichnis auf, nicht auf /tmp.
+        assert_eq!(
+            sepp_policy::resolve_path_with("$TMPDIR/x", &sepp_policy::ResolveCtx::from_env()),
+            a.join("x")
+        );
+        let b = private_tmpdir().unwrap().unwrap();
+        assert_ne!(a, b, "je Aufruf ein eigenes Verzeichnis");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        match before {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
     }
 }

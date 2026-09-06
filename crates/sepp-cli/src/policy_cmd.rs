@@ -794,6 +794,7 @@ mod tests {
         SandboxCapabilities {
             fs_enforceable: true,
             net_enforceable: net,
+            scope_enforceable: true,
             detail: "Test-Sandbox".into(),
         }
     }
