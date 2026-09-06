@@ -7,6 +7,49 @@ und das Projekt folgt [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Behoben
+- **Ein Abbruch mitten im Werkzeug machte die Sitzung unbrauchbar.** Esc oder Ctrl+C während
+  `bash` lief, ließ die Assistant-Nachricht mit dem `tool_use` in der Session zurück, ohne ein
+  `tool_result` dazu — jeder Anbieter lehnt den nächsten Request damit ab (Anthropic 400
+  „tool_use ids were found without tool_result blocks"), bis `/new`. Jetzt bekommt jeder
+  offene Aufruf ein Fehler-Ergebnis „Abgebrochen …", das wie jedes andere aufgezeichnet und
+  durabel gesichert wird, und erst dann kommt der Abbruch. Ebenso reißt ein Werkzeug, dessen
+  Task stirbt (Panik), nicht mehr den ganzen Turn mit: Sein Platz wird zum Fehler-Ergebnis
+  „Tool-Task fehlgeschlagen", die übrigen Aufrufe des Batches behalten ihre Ergebnisse.
+- **Kontextüberlauf mitten im Werkzeug-Loop.** Die Auto-Compaction lief nur vor einem neuen
+  Prompt; bis zu 50 Turns mit je bis zu 50 KiB Ergebnis sprengten das Fenster lange davor, und
+  die Zusammenfassung selbst schickte den vollen Verlauf — zu groß, also 400, und jeder weitere
+  Prompt lief in dieselbe Wand. Jetzt prüft der Loop die Schwelle auch nach jedem
+  Werkzeug-Ergebnis (die einzige Stelle, an der ein Schnitt kein `tool_use` ohne Ergebnis
+  hinterlässt), und `compact` hat drei Stufen, jede nur nach einem Fehler, der nach Überlauf
+  aussieht (HTTP 400/413, „too long", „context length" …): voller Verlauf → Verlauf ohne
+  Thinking und mit in der Mitte gekürzten Ergebnissen → harter Schnitt: Die jüngsten
+  Nachrichten bleiben, geschnitten vor einer Assistant-Nachricht oder einem reinen
+  Nutzer-Prompt, ein Hinweis nimmt den Platz der entfernten ein, und der Store bekommt einen
+  `Compaction`-Eintrag, dessen `replaced_until` genau die letzte entfernte Nachricht ist —
+  `path_messages()` und Speicher stimmen danach überein. Netz-, Schlüssel- und 5xx-Fehler
+  kommen unverändert zurück; dort wäre ein Schnitt Datenverlust ohne Gewinn.
+- **Bilder in Werkzeug-Ergebnissen brachten bei Anthropic 400.** `ContentBlock::Image` ging
+  per serde mit `source.kind` über die Leitung, die Messages API verlangt `source.type` —
+  sobald ein MCP-Server (Screenshot-Werkzeug) ein Bild lieferte, wurde der ganze Request
+  abgelehnt. Bilder und Werkzeug-Ergebnisse werden jetzt explizit ins Drahtformat gebracht
+  (auch verschachtelt im `tool_result`; dort nur Text und Bild, `is_error` nur wenn gesetzt).
+  Ein Modell ohne Bildverständnis bekommt statt 400 einen Textplatzhalter, der das Bild nennt;
+  der OpenAI-Adapter, der Bilder in Werkzeug-Ergebnissen nicht senden kann, setzt denselben
+  Platzhalter statt ein leeres Ergebnis zu liefern. Das Session-Format bleibt unverändert.
+
+### Tests
+- `sepp-agent`: Abbruch im Werkzeug → Verlauf mit Fehler-Ergebnis vollständig, Store gleich,
+  nächster Prompt läuft; Panik im Werkzeug → Fehler-Ergebnis statt verlorenem Turn;
+  Compaction nach einem großen Werkzeug-Ergebnis mitten im Loop; Zusammenfassung mit
+  gekürztem Verlauf, wenn der volle scheitert; harter Schnitt, wenn auch der gekürzte
+  scheitert, samt Gleichheit von `path_messages()` und Speicher; Einheiten: Überlauf-
+  Heuristik, zeichensichere Kürzung, Kürzung erhält `tool_use`/`tool_result`-Paare,
+  Schnittpunkt-Wahl, Zuordnung zum Store-Eintrag über Custom-Einträge und Compactions hinweg.
+- `sepp-provider`: Bild oben und im `tool_result` im Drahtformat (`source.type`, kein `kind`),
+  `is_error` nur wenn gesetzt, leere Textblöcke gefiltert; Platzhalter ohne Bildverständnis;
+  OpenAI `text_of` nennt Bilder.
+
 ## [0.5.1] - 2026-09-06
 
 Drei Löcher im Zaun, alle an der Release-Binary nachgestellt, alle geschlossen. Gemeinsam ist

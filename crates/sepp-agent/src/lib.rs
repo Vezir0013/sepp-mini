@@ -33,6 +33,8 @@ use sepp_provider::{CompletionRequest, Provider, StreamEvent};
 use sepp_session::{summary_message, EntryPayload, SessionStore};
 use sepp_tools::Tool;
 
+mod compact;
+
 pub mod resources;
 pub mod subagent;
 pub use subagent::SubAgentTool;
@@ -81,6 +83,13 @@ struct PendingCall {
     name: String,
     input_json: String,
 }
+
+/// Ergebnistext eines Werkzeugs, das vor seinem Ergebnis gestoppt wurde (Esc/Ctrl+C).
+const ABORTED_TOOL_RESULT: &str = "Abgebrochen: das Werkzeug wurde vor seinem Ergebnis gestoppt.";
+
+const DEFAULT_COMPACT_INSTRUCTIONS: &str =
+    "Fasse das bisherige Gespräch knapp aber vollständig zusammen: Ziele, Entscheidungen, \
+     wichtige Dateiänderungen und offene Punkte. Gib nur die Zusammenfassung aus.";
 
 /// Absolute Obergrenze der Auto-Compaction-Schwelle, unabhängig vom Kontextfenster. 3/4 eines
 /// 1M-Fensters (Kimi K3: 786_432) wäre keine sinnvolle Arbeitsmenge: jeder Turn sendet den
@@ -274,6 +283,14 @@ impl AgentSession {
     ///
     /// `cancel` muss der Token des umgebenden Turns sein: Die Zusammenfassung ist ein voller
     /// Provider-Roundtrip, und ohne den Token säße der Nutzer ihn nach Ctrl+C komplett ab.
+    ///
+    /// **Überlaufsicher.** Die Zusammenfassung schickt den ganzen Verlauf — ist der schon zu
+    /// groß fürs Fenster, käme 400, und jeder weitere Prompt liefe in dieselbe Wand. Deshalb
+    /// drei Stufen, jede nur nach einem Fehler, der nach Überlauf aussieht
+    /// ([`compact::looks_like_context_overflow`]): voller Verlauf → Verlauf ohne Thinking und
+    /// mit gekürzten Ergebnissen ([`compact::reduce_for_summary`]) → harter Schnitt
+    /// ([`Self::hard_cut`]). Andere Fehler (Netz, Schlüssel, 5xx) kommen unverändert zurück —
+    /// dort wäre ein Schnitt Datenverlust ohne Gewinn.
     pub async fn compact(
         &mut self,
         instructions: Option<&str>,
@@ -282,32 +299,23 @@ impl AgentSession {
         if self.state.messages.is_empty() {
             return Ok(());
         }
-        let instr = instructions.unwrap_or(
-            "Fasse das bisherige Gespräch knapp aber vollständig zusammen: Ziele, Entscheidungen, \
-             wichtige Dateiänderungen und offene Punkte. Gib nur die Zusammenfassung aus.",
-        );
-        let mut msgs = self.state.messages.clone();
-        msgs.push(Message::user_text(instr));
-
-        let summary = {
-            let req = CompletionRequest {
-                model: &self.state.model,
-                system: Some("Du fasst Entwickler-Gespräche präzise und vollständig zusammen."),
-                messages: &msgs,
-                tools: &[],
-                thinking: ThinkingLevel::Off,
-                max_tokens: 1024,
-            };
-            let mut stream = self.provider.stream(req, cancel.clone()).await?;
-            let mut summary = String::new();
-            while let Some(ev) = stream.next().await {
-                match ev {
-                    StreamEvent::TextDelta { text } => summary.push_str(&text),
-                    StreamEvent::Error { message } => return Err(SeppError::Provider(message)),
-                    _ => {}
+        let instr = instructions.unwrap_or(DEFAULT_COMPACT_INSTRUCTIONS);
+        let full = self.state.messages.clone();
+        let summary = match self.summarize(&full, instr, cancel.clone()).await {
+            Ok(s) => s,
+            Err(SeppError::Provider(first)) if compact::looks_like_context_overflow(&first) => {
+                let reduced = compact::reduce_for_summary(&full);
+                match self.summarize(&reduced, instr, cancel.clone()).await {
+                    Ok(s) => s,
+                    Err(SeppError::Provider(second))
+                        if compact::looks_like_context_overflow(&second) =>
+                    {
+                        return self.hard_cut(&second).await;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            summary.trim().to_string()
+            Err(e) => return Err(e),
         };
         if summary.is_empty() {
             return Ok(());
@@ -327,6 +335,70 @@ impl AgentSession {
         self.state.messages = vec![summary_message(&summary)];
         // Budget nach der Verdichtung neu eichen (sonst bleibt should_compact() wegen des
         // alten last_usage dauerhaft true) und den Compaction-Eintrag dauerhaft sichern.
+        self.last_usage = None;
+        self.flush_session().await?;
+        Ok(())
+    }
+
+    /// Ein Zusammenfassungs-Roundtrip über `messages`; leer, wenn das Modell nichts liefert.
+    async fn summarize(
+        &self,
+        messages: &[Message],
+        instr: &str,
+        cancel: CancellationToken,
+    ) -> Result<String> {
+        let mut msgs = messages.to_vec();
+        msgs.push(Message::user_text(instr));
+        let req = CompletionRequest {
+            model: &self.state.model,
+            system: Some("Du fasst Entwickler-Gespräche präzise und vollständig zusammen."),
+            messages: &msgs,
+            tools: &[],
+            thinking: ThinkingLevel::Off,
+            max_tokens: 1024,
+        };
+        let mut stream = self.provider.stream(req, cancel).await?;
+        let mut summary = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                StreamEvent::TextDelta { text } => summary.push_str(&text),
+                StreamEvent::Error { message } => return Err(SeppError::Provider(message)),
+                _ => {}
+            }
+        }
+        Ok(summary.trim().to_string())
+    }
+
+    /// Letzte Stufe der Compaction: Die ältesten Nachrichten fallen weg, ein Hinweis nimmt
+    /// ihren Platz ein, die jüngsten bleiben — geschnitten an einer Stelle, die kein `tool_use`
+    /// ohne `tool_result` hinterlässt ([`compact::hard_cut_start`]). Der Store bekommt einen
+    /// `Compaction`-Eintrag, dessen `replaced_until` genau die letzte entfernte Nachricht ist,
+    /// damit `path_messages()` dasselbe liefert wie der Speicher.
+    async fn hard_cut(&mut self, reason: &str) -> Result<()> {
+        let Some(start) = compact::hard_cut_start(&self.state.messages, compact::KEEP_TAIL) else {
+            return Err(SeppError::Provider(format!(
+                "Verlauf zu lang, und eine Zusammenfassung ist nicht möglich: {reason}"
+            )));
+        };
+        let note = format!(
+            "Der bisherige Verlauf ließ sich nicht zusammenfassen ({reason}). {start} ältere \
+             Nachrichten wurden entfernt; frage nach, wenn dir Kontext fehlt."
+        );
+        let keep = self.state.messages.len() - start;
+        if let Some(store) = self.session.as_mut() {
+            let until = compact::replaced_until_for_tail(store.entries(), store.leaf(), keep);
+            if let Some(id) = until {
+                store.append(EntryPayload::Compaction {
+                    summary: note.clone(),
+                    replaced_until: id,
+                })?;
+            }
+        }
+        let tail = self.state.messages.split_off(start);
+        let mut msgs = Vec::with_capacity(tail.len() + 1);
+        msgs.push(summary_message(&note));
+        msgs.extend(tail);
+        self.state.messages = msgs;
         self.last_usage = None;
         self.flush_session().await?;
         Ok(())
@@ -519,10 +591,11 @@ impl AgentSession {
             }
 
             // Tool-Calls parallel ausführen, Reihenfolge erhalten.
-            let results = self.run_tools(&calls, &cancel, on_event).await?;
+            let results = self.run_tools(&calls, &cancel, on_event).await;
 
             let mut tr_content: Vec<ContentBlock> = Vec::with_capacity(results.len());
             let mut tool_audit: Vec<AuditRecord> = Vec::new();
+            let mut aborted = false;
             for (call, res) in calls.iter().zip(results) {
                 let (blocks, is_error) = match res {
                     Ok(r) => {
@@ -531,7 +604,15 @@ impl AgentSession {
                         }
                         (r.content, r.is_error)
                     }
-                    Err(SeppError::Aborted) => return Err(SeppError::Aborted),
+                    // Abbruch (Esc/Ctrl+C mitten im Werkzeug): NICHT sofort zurück. Die
+                    // Assistant-Nachricht mit dem tool_use ist schon aufgezeichnet — ohne ein
+                    // tool_result dazu lehnt jeder Anbieter den nächsten Request ab, und die
+                    // Sitzung wäre bis /new unbrauchbar. Also ein Fehler-Ergebnis wie für jeden
+                    // anderen Fehler; der Abbruch kommt nach dem Aufzeichnen.
+                    Err(SeppError::Aborted) => {
+                        aborted = true;
+                        (vec![ContentBlock::text(ABORTED_TOOL_RESULT)], true)
+                    }
                     Err(e) => (vec![ContentBlock::text(e.to_string())], true),
                 };
                 tr_content.push(ContentBlock::ToolResult {
@@ -555,6 +636,20 @@ impl AgentSession {
                 message: tool_msg.clone(),
             })?;
             self.state.messages.push(tool_msg);
+
+            if aborted || cancel.is_cancelled() {
+                // Der Verlauf ist vollständig (jedes tool_use hat sein tool_result) und damit
+                // fortsetzbar — erst jetzt den Abbruch melden, durabel gesichert.
+                let _ = self.flush_session().await;
+                return Err(SeppError::Aborted);
+            }
+            // Auto-Compaction auch mitten im Werkzeug-Loop: bis zu 50 Turns mit je bis zu
+            // 50 KiB Ergebnis sprengen das Fenster sonst lange vor dem nächsten Prompt — und
+            // hier, nach dem tool_result, ist die einzige Stelle im Loop, an der ein Schnitt
+            // kein tool_use ohne Ergebnis hinterlässt.
+            if self.should_compact() {
+                self.compact(None, cancel.clone()).await?;
+            }
         }
 
         Err(SeppError::Provider(format!(
@@ -563,12 +658,15 @@ impl AgentSession {
         )))
     }
 
+    /// Führt die Tool-Calls eines Turns parallel aus; ein Ergebnis je Aufruf, in Aufruf-
+    /// reihenfolge. Nie ein Fehler für den ganzen Batch: Ein Aufruf, dessen Task stirbt oder der
+    /// abgebrochen wird, bekommt ein Fehler-Ergebnis — der Verlauf muss vollständig bleiben.
     async fn run_tools(
         &self,
         calls: &[PendingCall],
         cancel: &CancellationToken,
         on_event: &(dyn Fn(AgentEvent) + Send + Sync),
-    ) -> Result<Vec<Result<sepp_core::ToolResult>>> {
+    ) -> Vec<Result<sepp_core::ToolResult>> {
         let mut set: JoinSet<(usize, Result<sepp_core::ToolResult>)> = JoinSet::new();
         let mut slots: Vec<Option<Result<sepp_core::ToolResult>>> =
             (0..calls.len()).map(|_| None).collect();
@@ -632,9 +730,17 @@ impl AgentSession {
             });
         }
 
+        // Ein Task, der stirbt (Panik im Werkzeug), reißt nicht den Batch mit: Sein Platz bleibt
+        // leer und wird unten zum Fehler-Ergebnis.
+        let mut join_failures: Vec<String> = Vec::new();
         while let Some(joined) = set.join_next().await {
-            let (i, mut r) =
-                joined.map_err(|e| SeppError::Tool(format!("tool task fehlgeschlagen: {e}")))?;
+            let (i, mut r) = match joined {
+                Ok(x) => x,
+                Err(e) => {
+                    join_failures.push(e.to_string());
+                    continue;
+                }
+            };
             // tool_result-Hook (beobachtend).
             if let (Some(h), Ok(tr)) = (self.hooks.as_deref(), r.as_mut()) {
                 let _ = h.dispatch(HookEvent::ToolResult {
@@ -653,10 +759,24 @@ impl AgentSession {
             slots[i] = Some(r);
         }
 
-        Ok(slots
+        let detail = if join_failures.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", join_failures.join("; "))
+        };
+        slots
             .into_iter()
-            .map(|o| o.unwrap_or_else(|| Err(SeppError::Tool("kein Tool-Ergebnis".into()))))
-            .collect())
+            .enumerate()
+            .map(|(i, o)| {
+                o.unwrap_or_else(|| {
+                    on_event(AgentEvent::ToolEnd {
+                        id: calls[i].id.clone(),
+                        is_error: true,
+                    });
+                    Err(SeppError::Tool(format!("Tool-Task fehlgeschlagen{detail}")))
+                })
+            })
+            .collect()
     }
 }
 

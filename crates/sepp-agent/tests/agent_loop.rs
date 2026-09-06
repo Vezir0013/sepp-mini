@@ -872,3 +872,390 @@ async fn without_audit_source_nothing_extra_is_written() {
         .unwrap();
     assert!(custom_entries(session.session().unwrap()).is_empty());
 }
+
+// ---- 0.5.2 · A1: Abbruch oder Panik im Tool-Batch lässt kein tool_use ohne tool_result zurück ----
+
+fn tool_use_turn(id: &str, name: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::MessageStart,
+        StreamEvent::ToolUseStart {
+            id: id.into(),
+            name: name.into(),
+        },
+        StreamEvent::ToolUseStop { id: id.into() },
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+        },
+    ]
+}
+
+fn every_tool_use_has_a_result(msgs: &[sepp_core::Message]) -> bool {
+    use sepp_core::ContentBlock;
+    let uses: Vec<&str> = msgs
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let results: Vec<&str> = msgs
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    uses.iter().all(|u| results.contains(u))
+}
+
+fn tool_result_texts(msgs: &[sepp_core::Message]) -> Vec<(bool, String)> {
+    use sepp_core::ContentBlock;
+    msgs.iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((
+                *is_error,
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Simuliert Esc/Ctrl+C mitten im Werkzeug: cancelt den Token und meldet Abbruch wie `bash`.
+struct AbortingTool;
+
+#[async_trait::async_trait]
+impl Tool for AbortingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "slow".into(),
+            label: "Tool".into(),
+            description: "hängt bis zum Abbruch".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        cancel: CancellationToken,
+        _on_update: Option<&(dyn Fn(ToolResult) + Send + Sync)>,
+    ) -> Result<ToolResult> {
+        cancel.cancel();
+        Err(sepp_core::SeppError::Aborted)
+    }
+}
+
+#[tokio::test]
+async fn abort_inside_a_tool_keeps_the_history_resumable() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![
+            tool_use_turn("t1", "slow"),
+            text_turn("weiter"),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![Arc::new(AbortingTool) as Arc<dyn Tool>])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    let noop = |_ev: AgentEvent| {};
+
+    let r = session.prompt("los", &noop, CancellationToken::new()).await;
+    assert!(matches!(r, Err(sepp_core::SeppError::Aborted)), "{r:?}");
+
+    // user, assistant(tool_use), user(tool_result: abgebrochen) — kein tool_use ohne Ergebnis,
+    // weder im Speicher noch im Store.
+    let msgs = session.messages();
+    assert_eq!(msgs.len(), 3, "{msgs:?}");
+    assert!(every_tool_use_has_a_result(msgs));
+    let results = tool_result_texts(msgs);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0, "als Fehler markiert");
+    assert!(results[0].1.contains("Abgebrochen"), "{results:?}");
+    let stored = session.session().unwrap().path_messages();
+    assert_eq!(stored.len(), 3);
+    assert!(every_tool_use_has_a_result(&stored));
+
+    // Und die Sitzung geht weiter, statt bis /new mit 400 zu enden.
+    session
+        .prompt("nochmal", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(session.messages().len(), 5);
+    assert!(every_tool_use_has_a_result(session.messages()));
+}
+
+struct PanickingTool;
+
+#[async_trait::async_trait]
+impl Tool for PanickingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "boom".into(),
+            label: "Tool".into(),
+            description: "stirbt".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cancel: CancellationToken,
+        _on_update: Option<&(dyn Fn(ToolResult) + Send + Sync)>,
+    ) -> Result<ToolResult> {
+        panic!("kaputt");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_tool_becomes_an_error_result_not_a_lost_turn() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![
+            tool_use_turn("t1", "boom"),
+            text_turn("ok"),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![Arc::new(PanickingTool) as Arc<dyn Tool>])
+        .build()
+        .unwrap();
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log2 = log.clone();
+    let on_event = move |ev: AgentEvent| log2.lock().unwrap().push(format!("{ev:?}"));
+
+    session
+        .prompt("los", &on_event, CancellationToken::new())
+        .await
+        .unwrap();
+    let msgs = session.messages();
+    assert_eq!(msgs.len(), 4);
+    assert!(every_tool_use_has_a_result(msgs));
+    let results = tool_result_texts(msgs);
+    assert!(results[0].0);
+    assert!(results[0].1.contains("fehlgeschlagen"), "{results:?}");
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.contains("ToolEnd") && s.contains("is_error: true")));
+}
+
+// ---- 0.5.2 · A2: Compaction mitten im Werkzeug-Loop und überlaufsicher ----
+
+/// Liefert ein großes Ergebnis (4000 Zeichen).
+struct BigTool;
+
+#[async_trait::async_trait]
+impl Tool for BigTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "big".into(),
+            label: "Tool".into(),
+            description: "groß".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cancel: CancellationToken,
+        _on_update: Option<&(dyn Fn(ToolResult) + Send + Sync)>,
+    ) -> Result<ToolResult> {
+        Ok(ToolResult::text("x".repeat(4_000)))
+    }
+}
+
+#[tokio::test]
+async fn compacts_inside_the_tool_loop_when_results_grow() {
+    let provider = Arc::new(FakeProvider {
+        scripts: Mutex::new(VecDeque::from(vec![
+            tool_use_turn("t1", "big"),
+            text_turn("ZUSAMMENFASSUNG"), // Compaction nach dem Werkzeug-Ergebnis
+            text_turn("Fertig"),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider)
+        .model(test_model())
+        .tools(vec![Arc::new(BigTool) as Arc<dyn Tool>])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .auto_compact_threshold(200) // „los" liegt darunter, 4000 Zeichen Ergebnis darüber
+        .build()
+        .unwrap();
+    let noop = |_ev: AgentEvent| {};
+    session
+        .prompt("los", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let msgs = session.messages();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert!(matches!(&msgs[0].content[0],
+        sepp_core::ContentBlock::Text { text } if text.contains("ZUSAMMENFASSUNG")));
+    assert!(matches!(&msgs[1].content[0],
+        sepp_core::ContentBlock::Text { text } if text == "Fertig"));
+    assert!(session
+        .session()
+        .unwrap()
+        .entries()
+        .iter()
+        .any(|e| matches!(e.payload, sepp_session::EntryPayload::Compaction { .. })));
+}
+
+/// Antwortet nach Skript — außer im strikten Modus, wenn der Verlauf mehr Zeichen hat als
+/// `limit`: dann der 400 eines Anbieters, dessen Fenster voll ist.
+struct OverflowProvider {
+    limit: usize,
+    strict: std::sync::atomic::AtomicBool,
+    scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
+}
+
+fn total_chars(msgs: &[sepp_core::Message]) -> usize {
+    use sepp_core::ContentBlock;
+    fn block(b: &ContentBlock) -> usize {
+        match b {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolResult { content, .. } => content.iter().map(block).sum(),
+            _ => 0,
+        }
+    }
+    msgs.iter().flat_map(|m| m.content.iter()).map(block).sum()
+}
+
+#[async_trait::async_trait]
+impl Provider for OverflowProvider {
+    fn name(&self) -> &str {
+        "overflow"
+    }
+    async fn stream<'a>(
+        &'a self,
+        req: CompletionRequest<'a>,
+        _cancel: CancellationToken,
+    ) -> Result<BoxStream<'a, StreamEvent>> {
+        if self.strict.load(SeqCst) && total_chars(req.messages) > self.limit {
+            return Err(sepp_core::SeppError::Provider(
+                "overflow: HTTP 400: prompt is too long".into(),
+            ));
+        }
+        let events = self
+            .scripts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .unwrap_or_default();
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn compaction_retries_with_a_reduced_history_on_overflow() {
+    let provider = Arc::new(OverflowProvider {
+        limit: 3_000,
+        strict: std::sync::atomic::AtomicBool::new(false),
+        scripts: Mutex::new(VecDeque::from(vec![
+            tool_use_turn("t1", "big"),
+            text_turn("Fertig"),
+            text_turn("ZUSAMMENFASSUNG"),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider.clone())
+        .model(test_model())
+        .tools(vec![Arc::new(BigTool) as Arc<dyn Tool>])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    let noop = |_ev: AgentEvent| {};
+    session
+        .prompt("los", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(session.messages().len(), 4);
+
+    // Ab jetzt ist das Fenster „voll": der volle Verlauf (4000+ Zeichen) scheitert, der
+    // gekürzte (Ergebnis auf ~1000 Zeichen) passt.
+    provider.strict.store(true, SeqCst);
+    session
+        .compact(None, CancellationToken::new())
+        .await
+        .unwrap();
+    let msgs = session.messages();
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(matches!(&msgs[0].content[0],
+        sepp_core::ContentBlock::Text { text } if text.contains("ZUSAMMENFASSUNG")));
+}
+
+#[tokio::test]
+async fn compaction_falls_back_to_a_hard_cut_when_even_the_reduced_history_overflows() {
+    let provider = Arc::new(OverflowProvider {
+        limit: 10,
+        strict: std::sync::atomic::AtomicBool::new(false),
+        scripts: Mutex::new(VecDeque::from(vec![
+            text_turn("Antwort 1"),
+            tool_use_turn("t1", "big"),
+            text_turn("Fertig"),
+        ])),
+    });
+    let mut session = AgentSession::builder()
+        .provider(provider.clone())
+        .model(test_model())
+        .tools(vec![Arc::new(BigTool) as Arc<dyn Tool>])
+        .session(Box::new(sepp_session::InMemorySessionStore::new()))
+        .build()
+        .unwrap();
+    let noop = |_ev: AgentEvent| {};
+    session
+        .prompt("eins", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    session
+        .prompt("zwei", &noop, CancellationToken::new())
+        .await
+        .unwrap();
+    // u1, a1, u2, a2(tool_use), u3(tool_result), a3
+    assert_eq!(session.messages().len(), 6);
+
+    provider.strict.store(true, SeqCst);
+    session
+        .compact(None, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // Hinweis + Tail ab der letzten Assistant-Nachricht mit tool_use: das Paar bleibt zusammen.
+    let msgs = session.messages();
+    assert_eq!(msgs.len(), 4, "{msgs:?}");
+    assert_eq!(msgs[0].role, Role::User);
+    assert!(matches!(&msgs[0].content[0],
+        sepp_core::ContentBlock::Text { text } if text.contains("ließ sich nicht zusammenfassen")));
+    assert_eq!(msgs[1].role, Role::Assistant);
+    assert!(every_tool_use_has_a_result(msgs));
+    assert!(matches!(&msgs[3].content[0],
+        sepp_core::ContentBlock::Text { text } if text == "Fertig"));
+
+    // Der Store liefert nach dem Schnitt genau denselben Verlauf wie der Speicher.
+    let stored = session.session().unwrap().path_messages();
+    assert_eq!(stored.len(), msgs.len());
+    for (a, b) in stored.iter().zip(msgs) {
+        assert_eq!(a.role, b.role);
+        assert_eq!(
+            serde_json::to_value(&a.content).unwrap(),
+            serde_json::to_value(&b.content).unwrap()
+        );
+    }
+}
